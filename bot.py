@@ -104,8 +104,8 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_jobs = []
 
     for job in jobs:
-        fields = job["fields"]
-	print(fields)
+    fields = job["fields"]
+    print(fields)
 
         # Lookup columns often appear as the selected name in Graph
         selected_engineer = fields.get("EngineerLookupValue") or fields.get("Engineer")
