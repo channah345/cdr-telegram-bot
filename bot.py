@@ -103,7 +103,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     found_jobs = []
 
-    for job in jobs:
+for job in jobs:
     fields = job["fields"]
     print(fields)
 
