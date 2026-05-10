@@ -84,32 +84,47 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engineers = get_list_items(site_id, engineers_list_id)
     jobs = get_list_items(site_id, jobs_list_id)
 
-    engineer_telegram_ids = {}
+    current_engineer_lookup_id = None
+    current_engineer_name = None
 
     for engineer in engineers:
         fields = engineer["fields"]
 
-        engineer_name = fields.get("EngineerName", "")
         telegram_id = str(fields.get("TelegramID", ""))
 
-        if engineer_name and telegram_id:
-            engineer_telegram_ids[engineer_name] = telegram_id
+        if telegram_id == user_id:
+            current_engineer_lookup_id = str(fields.get("id", ""))
+            current_engineer_name = fields.get("EngineerName", "")
+            break
+
+    if not current_engineer_lookup_id:
+        await update.message.reply_text(
+            "You are not set up as an engineer yet. Please ask the office to add your Telegram ID."
+        )
+        return
 
     found_jobs = []
 
     for job in jobs:
         fields = job["fields"]
 
-        selected_engineer = fields.get("EngineerName")
+        print(fields)
 
-        assigned_telegram_id = engineer_telegram_ids.get(selected_engineer)
+        engineer_lookup_id = fields.get("EngineerLookupId")
 
-        if assigned_telegram_id == user_id:
+        assigned_engineer_ids = []
+
+        if isinstance(engineer_lookup_id, list):
+            assigned_engineer_ids = [str(x) for x in engineer_lookup_id]
+        elif engineer_lookup_id:
+            assigned_engineer_ids = [str(engineer_lookup_id)]
+
+        if current_engineer_lookup_id in assigned_engineer_ids:
             found_jobs.append(
                 f"CDR Number: {fields.get('CDRNumber', '')}\n"
                 f"Date: {fields.get('Date', '')}\n"
                 f"Time: {fields.get('StartTime', '')}\n"
-                f"Engineer: {selected_engineer}\n"
+                f"Engineer: {current_engineer_name}\n"
                 f"Site: {fields.get('SiteName', '')}\n"
                 f"Address: {fields.get('Address', '')}\n"
                 f"Task: {fields.get('Task', '')}\n"
