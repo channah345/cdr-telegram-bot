@@ -108,16 +108,13 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in jobs:
         fields = job["fields"]
 
-        print(fields)
-
-        engineer_lookup_id = fields.get("EngineerLookupId")
+        engineer_lookup_values = fields.get("Engineer", [])
 
         assigned_engineer_ids = []
 
-        if isinstance(engineer_lookup_id, list):
-            assigned_engineer_ids = [str(x) for x in engineer_lookup_id]
-        elif engineer_lookup_id:
-            assigned_engineer_ids = [str(engineer_lookup_id)]
+        if isinstance(engineer_lookup_values, list):
+            for engineer in engineer_lookup_values:
+                assigned_engineer_ids.append(str(engineer.get("LookupId")))
 
         if current_engineer_lookup_id in assigned_engineer_ids:
             found_jobs.append(
