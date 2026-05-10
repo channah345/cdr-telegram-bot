@@ -107,27 +107,29 @@ for job in jobs:
     fields = job["fields"]
     print(fields)
 
-        # Lookup columns often appear as the selected name in Graph
-        selected_engineer = fields.get("EngineerLookupValue") or fields.get("Engineer")
+    selected_engineer = (
+        fields.get("EngineerLookupValue")
+        or fields.get("Engineer")
+    )
 
-        if not selected_engineer:
-            continue
+    if not selected_engineer:
+        continue
 
-        assigned_telegram_id = engineer_telegram_ids.get(selected_engineer)
+    assigned_telegram_id = engineer_telegram_ids.get(selected_engineer)
 
-        if assigned_telegram_id == user_id:
-            found_jobs.append(
-                f"CDR Number: {fields.get('CDRNumber', '')}\n"
-                f"Date: {fields.get('Date', '')}\n"
-                f"Time: {fields.get('StartTime', '')}\n"
-                f"Engineer: {selected_engineer}\n"
-                f"Site: {fields.get('SiteName', '')}\n"
-                f"Address: {fields.get('Address', '')}\n"
-                f"Task: {fields.get('Task', '')}\n"
-                f"Notes: {fields.get('Notes', '')}\n"
-                f"Contact: {fields.get('ContactName', '')}\n"
-                f"Phone: {fields.get('ContactNumber', '')}"
-            )
+    if assigned_telegram_id == user_id:
+        found_jobs.append(
+            f"CDR Number: {fields.get('CDRNumber', '')}\n"
+            f"Date: {fields.get('Date', '')}\n"
+            f"Time: {fields.get('StartTime', '')}\n"
+            f"Engineer: {selected_engineer}\n"
+            f"Site: {fields.get('SiteName', '')}\n"
+            f"Address: {fields.get('Address', '')}\n"
+            f"Task: {fields.get('Task', '')}\n"
+            f"Notes: {fields.get('Notes', '')}\n"
+            f"Contact: {fields.get('ContactName', '')}\n"
+            f"Phone: {fields.get('ContactNumber', '')}"
+        )
 
     if found_jobs:
         await update.message.reply_text(
