@@ -36,23 +36,17 @@ headers = {
 def get_site_id():
     site_hostname = SHAREPOINT_SITE.split("/")[2]
     site_path = "/" + "/".join(SHAREPOINT_SITE.split("/")[3:])
-
     site_url = f"https://graph.microsoft.com/v1.0/sites/{site_hostname}:{site_path}"
 
     response = requests.get(site_url, headers=headers)
-
     return response.json()["id"]
 
 
 def get_list_id(site_id, list_name):
-
     lists_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists"
-
     response = requests.get(lists_url, headers=headers)
 
-    lists = response.json()["value"]
-
-    for lst in lists:
+    for lst in response.json()["value"]:
         if lst["name"] == list_name:
             return lst["id"]
 
@@ -60,33 +54,26 @@ def get_list_id(site_id, list_name):
 
 
 def get_list_items(site_id, list_id):
-
     items_url = (
         f"https://graph.microsoft.com/v1.0/sites/"
         f"{site_id}/lists/{list_id}/items?expand=fields"
     )
 
     response = requests.get(items_url, headers=headers)
-
     return response.json()["value"]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "CDR Engineer Bot is online."
-    )
+    await update.message.reply_text("CDR Engineer Bot is online.")
 
 
 async def id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     await update.message.reply_text(
         f"Your Telegram ID is: {update.effective_user.id}"
     )
 
 
 async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user_id = str(update.effective_user.id)
 
     site_id = get_site_id()
@@ -100,33 +87,24 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engineer_telegram_ids = {}
 
     for engineer in engineers:
-
         fields = engineer["fields"]
 
         engineer_name = fields.get("EngineerName", "")
         telegram_id = str(fields.get("TelegramID", ""))
 
-        engineer_telegram_ids[engineer_name] = telegram_id
+        if engineer_name and telegram_id:
+            engineer_telegram_ids[engineer_name] = telegram_id
 
     found_jobs = []
 
     for job in jobs:
-
         fields = job["fields"]
 
-        print(fields)
+        selected_engineer = fields.get("EngineerName")
 
-        selected_engineer = (
-            fields.get("EngineerLookupValue")
-            or fields.get("Engineer")
-        )
-
-        assigned_telegram_id = engineer_telegram_ids.get(
-            selected_engineer
-        )
+        assigned_telegram_id = engineer_telegram_ids.get(selected_engineer)
 
         if assigned_telegram_id == user_id:
-
             found_jobs.append(
                 f"CDR Number: {fields.get('CDRNumber', '')}\n"
                 f"Date: {fields.get('Date', '')}\n"
@@ -141,17 +119,12 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     if found_jobs:
-
         await update.message.reply_text(
             "Today's jobs:\n\n"
             + "\n\n--------------------\n\n".join(found_jobs)
         )
-
     else:
-
-        await update.message.reply_text(
-            "No jobs assigned today."
-        )
+        await update.message.reply_text("No jobs assigned today.")
 
 
 telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
