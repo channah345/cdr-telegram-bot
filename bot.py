@@ -78,10 +78,17 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(fields.get("TelegramID", "")) == user_id:
 
             found_jobs.append(
-                f"{fields.get('StartTime', '')} - {fields.get('SiteName', '')}\n"
-                f"Task: {fields.get('Task', '')}\n"
-                f"CDR Number: {fields.get('CDRNumber', '')}"
-            )
+    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+    f"Date: {fields.get('Date', '')}\n"
+    f"Time: {fields.get('StartTime', '')}\n"
+    f"Engineer: {fields.get('EngineerName', '')}\n"
+    f"Site: {fields.get('SiteName', '')}\n"
+    f"Address: {fields.get('Address', '')}\n"
+    f"Task: {fields.get('Task', '')}\n"
+    f"Notes: {fields.get('Notes', '')}\n"
+    f"Contact: {fields.get('ContactName', '')}\n"
+    f"Phone: {fields.get('ContactNumber', '')}"
+	)
 
     if found_jobs:
 
