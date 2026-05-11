@@ -322,22 +322,31 @@ async def send_new_jobs(app):
         print(f"ERROR sending new jobs: {e}")
 
 
-telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def post_init(app):
+    scheduler = AsyncIOScheduler(timezone=UK_TZ)
+
+    scheduler.add_job(
+        send_new_jobs,
+        trigger="interval",
+        minutes=2,
+        args=[app],
+    )
+
+    scheduler.start()
+
+    print("Scheduler started.")
+
+
+telegram_app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .post_init(post_init)
+    .build()
+)
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
-
-scheduler = AsyncIOScheduler(timezone=UK_TZ)
-
-scheduler.add_job(
-    send_new_jobs,
-    trigger="interval",
-    minutes=2,
-    args=[telegram_app],
-)
-
-scheduler.start()
 
 print("Bot running...")
 
