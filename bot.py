@@ -32,6 +32,8 @@ PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 UK_TZ = ZoneInfo("Europe/London")
 
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Engineer Deployment"
+ASSIGNED_STATUS = "Assigned"
+COMPLETED_STATUS = "Completed"
 
 WORK_COMPLETED, MATERIALS_USED, FOLLOW_ON_REQUIRED, FOLLOW_ON_NOTES, ENGINEER_NOTES, PHOTOS, REVIEW = range(7)
 
@@ -143,6 +145,24 @@ def clear_engineer_assignment_payload():
     }
 
 
+def remove_current_engineer_assignment_payload(fields, current_lookup_id):
+    remaining_ids = []
+
+    engineer_values = fields.get("Engineer", [])
+
+    if isinstance(engineer_values, list):
+        for engineer in engineer_values:
+            lookup_id = str(engineer.get("LookupId"))
+
+            if lookup_id != str(current_lookup_id):
+                remaining_ids.append(int(lookup_id))
+
+    return {
+        "EngineerLookupId@odata.type": "Collection(Edm.Int32)",
+        "EngineerLookupId": remaining_ids,
+    }
+
+
 def append_engineer_log(fields, engineer_name, action, extra_text=""):
     existing_log = fields.get("EngineerVisitLog", "") or ""
 
@@ -155,6 +175,28 @@ def append_engineer_log(fields, engineer_name, action, extra_text=""):
         return existing_log.strip() + "\n" + line
 
     return line
+
+
+def engineer_has_logged(fields, engineer_name, action):
+    log = fields.get("EngineerVisitLog", "") or ""
+    search_text = f" - {engineer_name} - {action}"
+    return search_text in log
+
+
+def can_click_action(fields, engineer_name, action):
+    has_travelled = engineer_has_logged(fields, engineer_name, "Travelling")
+    has_on_site = engineer_has_logged(fields, engineer_name, "On Site")
+
+    if action == "Travelling":
+        return True, ""
+
+    if action == "On Site" and not has_travelled:
+        return False, "You need to click Travelling before clicking On Site."
+
+    if action in ["No Access", "Revisit Required", "Completed"] and not has_on_site:
+        return False, "You need to click On Site before selecting this option."
+
+    return True, ""
 
 
 def get_sharepoint_data():
@@ -428,6 +470,17 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "complete_help":
             cdr_number = fields.get("CDRNumber", "")
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                "Completed",
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
             await query.message.reply_text(
                 f"To complete this job and submit the worksheet, type:\n\n/complete {cdr_number}"
             )
@@ -435,6 +488,16 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "confirm_outcome":
             selected_outcome = data[2]
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                selected_outcome,
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
 
             confirm_buttons = InlineKeyboardMarkup([
                 [
@@ -466,6 +529,16 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if selected_status not in ["Travelling", "On Site"]:
                 await query.message.reply_text("Unknown status selected.")
+                return
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                selected_status,
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
                 return
 
             updated_log = append_engineer_log(
@@ -505,27 +578,55 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("Unknown outcome selected.")
                 return
 
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                selected_outcome,
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
             updated_log = append_engineer_log(
                 fields,
                 current_engineer["name"],
                 selected_outcome,
             )
 
+            assigned_ids = get_assigned_engineer_ids(fields)
+            is_final_engineer = len(assigned_ids) <= 1
+
             update_fields = {
-                "Status": AWAITING_DEPLOYMENT_STATUS,
                 "JobOutcome": selected_outcome,
                 "EngineerVisitLog": updated_log,
             }
 
-            update_fields.update(clear_engineer_assignment_payload())
+            if is_final_engineer:
+                update_fields["Status"] = AWAITING_DEPLOYMENT_STATUS
+                update_fields.update(clear_engineer_assignment_payload())
+            else:
+                update_fields.update(
+                    remove_current_engineer_assignment_payload(
+                        fields,
+                        current_engineer["lookup_id"],
+                    )
+                )
 
             update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
 
-            await query.message.reply_text(
-                f"Updated:\n\n"
-                f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
-                f"Job returned to Awaiting Engineer Deployment."
-            )
+            if is_final_engineer:
+                await query.message.reply_text(
+                    f"Updated:\n\n"
+                    f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
+                    f"Final engineer removed. Job returned to Awaiting Engineer Deployment."
+                )
+            else:
+                await query.message.reply_text(
+                    f"Updated:\n\n"
+                    f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
+                    f"You have been removed from this job. Other assigned engineer(s) remain."
+                )
 
             await notify_helpdesk(
                 context,
@@ -534,7 +635,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"CDR Number: {fields.get('CDRNumber', '')}\n"
                     f"Engineer: {current_engineer['name']}\n"
                     f"Outcome: {selected_outcome}\n"
-                    f"Status: {AWAITING_DEPLOYMENT_STATUS}\n"
+                    f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
                     f"Site: {fields.get('SiteName', '')}"
                 ),
             )
@@ -579,12 +680,23 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("You are not assigned to this job.")
             return ConversationHandler.END
 
+        allowed, reason = can_click_action(
+            fields,
+            current_engineer["name"],
+            "Completed",
+        )
+
+        if not allowed:
+            await update.message.reply_text(reason)
+            return ConversationHandler.END
+
         context.user_data["worksheet"] = {
             "cdr_number": cdr_number,
             "site_id": site_id,
             "jobs_list_id": jobs_list_id,
             "item_id": job["id"],
             "engineer_name": current_engineer["name"],
+            "engineer_lookup_id": current_engineer["lookup_id"],
             "fields": fields,
             "photo_links": [],
         }
@@ -719,8 +831,8 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jobs_list_id = worksheet["jobs_list_id"]
         item_id = worksheet["item_id"]
 
-        latest_job = get_list_items(site_id, jobs_list_id)
-        job = find_job_by_item_id(latest_job, item_id)
+        latest_jobs = get_list_items(site_id, jobs_list_id)
+        job = find_job_by_item_id(latest_jobs, item_id)
         fields = job["fields"] if job else worksheet["fields"]
 
         updated_log = append_engineer_log(
@@ -730,6 +842,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Worksheet submitted",
         )
 
+        assigned_ids = get_assigned_engineer_ids(fields)
+        is_final_engineer = len(assigned_ids) <= 1
+
         fields_to_update = {
             "WorkCompleted": worksheet.get("WorkCompleted", ""),
             "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
@@ -737,18 +852,33 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
             "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
             "WorksheetSubmitted": True,
-            "Status": AWAITING_DEPLOYMENT_STATUS,
             "JobOutcome": "Completed",
             "EngineerVisitLog": updated_log,
         }
 
-        fields_to_update.update(clear_engineer_assignment_payload())
+        if is_final_engineer:
+            fields_to_update["Status"] = COMPLETED_STATUS
+            fields_to_update.update(clear_engineer_assignment_payload())
+        else:
+            fields_to_update.update(
+                remove_current_engineer_assignment_payload(
+                    fields,
+                    worksheet["engineer_lookup_id"],
+                )
+            )
 
         update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
 
-        await update.message.reply_text(
-            f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
-        )
+        if is_final_engineer:
+            await update.message.reply_text(
+                f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
+            )
+        else:
+            await update.message.reply_text(
+                f"Worksheet submitted:\n\n"
+                f"{worksheet['cdr_number']}\n\n"
+                f"You have been removed from this job. Other assigned engineer(s) remain."
+            )
 
         await notify_helpdesk(
             context,
@@ -757,7 +887,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"CDR Number: {worksheet['cdr_number']}\n"
                 f"Engineer: {worksheet['engineer_name']}\n"
                 f"Outcome: Completed\n"
-                f"Status: {AWAITING_DEPLOYMENT_STATUS}\n"
+                f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
                 f"Photos uploaded: {len(worksheet.get('photo_links', []))}"
             ),
         )
@@ -813,7 +943,10 @@ async def send_new_jobs(app):
                 site_id,
                 jobs_list_id,
                 item_id,
-                {"TelegramNotified": True},
+                {
+                    "TelegramNotified": True,
+                    "Status": ASSIGNED_STATUS,
+                },
             )
 
     except Exception as e:
@@ -821,6 +954,12 @@ async def send_new_jobs(app):
 
 
 async def post_init(app):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook removed.")
+    except Exception as e:
+        print(f"Could not remove webhook: {e}")
+
     scheduler = AsyncIOScheduler(timezone=UK_TZ)
 
     scheduler.add_job(
@@ -866,4 +1005,7 @@ telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 print("Bot running...")
 
-telegram_app.run_polling(drop_pending_updates=True)
+telegram_app.run_polling(
+    drop_pending_updates=True,
+    close_loop=False,
+)
