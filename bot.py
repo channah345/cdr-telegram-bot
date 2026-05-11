@@ -58,6 +58,10 @@ def get_headers(content_type=True):
     return headers
 
 
+def now_sharepoint_time():
+    return datetime.now(UK_TZ).astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+
 def format_sharepoint_date(value):
     if not value:
         return ""
@@ -130,6 +134,13 @@ def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
         raise Exception(f"Could not update item {item_id}: {response.text}")
 
 
+def clear_engineer_assignment_payload():
+    return {
+        "EngineerLookupId@odata.type": "Collection(Edm.Int32)",
+        "EngineerLookupId": [],
+    }
+
+
 def get_sharepoint_data():
     site_id = get_site_id()
     engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
@@ -189,10 +200,7 @@ def get_job_buttons(item_id):
             InlineKeyboardButton("On Site", callback_data=f"status|{item_id}|On Site"),
         ],
         [
-            InlineKeyboardButton("Need Parts", callback_data=f"status|{item_id}|Need Parts"),
             InlineKeyboardButton("Revisit", callback_data=f"status|{item_id}|Revisit Required"),
-        ],
-        [
             InlineKeyboardButton("No Access", callback_data=f"status|{item_id}|No Access"),
         ],
         [
@@ -207,13 +215,11 @@ def format_job(fields, engineer_name=None):
         f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
         f"Time: {fields.get('StartTime', '')}\n"
         f"Engineer: {engineer_name or ''}\n"
-        f"Status: {fields.get('Status', 'Assigned')}\n"
         f"Site: {fields.get('SiteName', '')}\n"
         f"Address: {fields.get('Address', '')}\n"
         f"Task: {fields.get('Task', '')}\n"
         f"Notes: {fields.get('Notes', '')}\n"
-        f"Contact: {fields.get('ContactName', '')}\n"
-        f"Phone: {fields.get('ContactNumber', '')}"
+        f"Contact: {fields.get('ContactName', '')}"
     )
 
 
@@ -420,26 +426,58 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "status":
-            new_status = data[2]
+            selected_status = data[2]
+            update_fields = {}
+
+            if selected_status == "Travelling":
+                update_fields = {
+                    "Status": "Travelling",
+                    "TravellingTime": now_sharepoint_time(),
+                }
+
+            elif selected_status == "On Site":
+                update_fields = {
+                    "Status": "On Site",
+                    "OnSiteTime": now_sharepoint_time(),
+                }
+
+            elif selected_status == "No Access":
+                update_fields = {
+                    "Status": "Awaiting Engineer Deployment",
+                    "NoAccessTime": now_sharepoint_time(),
+                }
+                update_fields.update(clear_engineer_assignment_payload())
+
+            elif selected_status == "Revisit Required":
+                update_fields = {
+                    "Status": "Awaiting Engineer Deployment",
+                    "RevisitRequiredTime": now_sharepoint_time(),
+                }
+                update_fields.update(clear_engineer_assignment_payload())
 
             update_list_item_fields(
                 site_id,
                 jobs_list_id,
                 item_id,
-                {"Status": new_status},
+                update_fields,
             )
 
-            await query.message.reply_text(
-                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {new_status}"
-            )
+            if selected_status in ["No Access", "Revisit Required"]:
+                await query.message.reply_text(
+                    f"Updated:\n\n{fields.get('CDRNumber', '')} → Awaiting Engineer Deployment"
+                )
+            else:
+                await query.message.reply_text(
+                    f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}"
+                )
 
             await notify_helpdesk(
                 context,
                 (
-                    f"Job status updated\n\n"
+                    f"Job update\n\n"
                     f"CDR Number: {fields.get('CDRNumber', '')}\n"
                     f"Engineer: {current_engineer['name']}\n"
-                    f"Status: {new_status}\n"
+                    f"Update: {selected_status}\n"
                     f"Site: {fields.get('SiteName', '')}"
                 ),
             )
@@ -587,11 +625,6 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         worksheet["photo_links"].append(photo_link)
 
-        await update.message.reply_text(
-            f"Photo uploaded. Total photos: {len(worksheet['photo_links'])}\n\n"
-            f"Send another photo or type DONE."
-        )
-
         return PHOTOS
 
     await update.message.reply_text("Please send a photo or type DONE.")
@@ -631,7 +664,10 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
             "WorksheetSubmitted": True,
             "Status": "Completed",
+            "CompletedTime": now_sharepoint_time(),
         }
+
+        fields_to_update.update(clear_engineer_assignment_payload())
 
         update_list_item_fields(
             worksheet["site_id"],
@@ -758,4 +794,4 @@ telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 print("Bot running...")
 
-telegram_app.run_polling()
+telegram_app.run_polling(drop_pending_updates=True)
