@@ -31,6 +31,8 @@ PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 
 UK_TZ = ZoneInfo("Europe/London")
 
+AWAITING_DEPLOYMENT_STATUS = "Awaiting Engineer Deployment"
+
 WORK_COMPLETED, MATERIALS_USED, FOLLOW_ON_REQUIRED, FOLLOW_ON_NOTES, ENGINEER_NOTES, PHOTOS, REVIEW = range(7)
 
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
@@ -200,8 +202,8 @@ def get_job_buttons(item_id):
             InlineKeyboardButton("On Site", callback_data=f"status|{item_id}|On Site"),
         ],
         [
-            InlineKeyboardButton("Revisit", callback_data=f"status|{item_id}|Revisit Required"),
-            InlineKeyboardButton("No Access", callback_data=f"status|{item_id}|No Access"),
+            InlineKeyboardButton("Revisit", callback_data=f"outcome|{item_id}|Revisit Required"),
+            InlineKeyboardButton("No Access", callback_data=f"outcome|{item_id}|No Access"),
         ],
         [
             InlineKeyboardButton("Complete", callback_data=f"complete_help|{item_id}"),
@@ -364,10 +366,6 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
             assigned_ids = get_assigned_engineer_ids(fields)
-            status = fields.get("Status", "Assigned")
-
-            if status == "Completed":
-                continue
 
             if current_engineer["lookup_id"] in assigned_ids and job_date == today:
                 found_any = True
@@ -427,7 +425,6 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "status":
             selected_status = data[2]
-            update_fields = {}
 
             if selected_status == "Travelling":
                 update_fields = {
@@ -441,35 +438,15 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "OnSiteTime": now_sharepoint_time(),
                 }
 
-            elif selected_status == "No Access":
-                update_fields = {
-                    "Status": "Awaiting Engineer Deployment",
-                    "NoAccessTime": now_sharepoint_time(),
-                }
-                update_fields.update(clear_engineer_assignment_payload())
-
-            elif selected_status == "Revisit Required":
-                update_fields = {
-                    "Status": "Awaiting Engineer Deployment",
-                    "RevisitRequiredTime": now_sharepoint_time(),
-                }
-                update_fields.update(clear_engineer_assignment_payload())
-
-            update_list_item_fields(
-                site_id,
-                jobs_list_id,
-                item_id,
-                update_fields,
-            )
-
-            if selected_status in ["No Access", "Revisit Required"]:
-                await query.message.reply_text(
-                    f"Updated:\n\n{fields.get('CDRNumber', '')} → Awaiting Engineer Deployment"
-                )
             else:
-                await query.message.reply_text(
-                    f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}"
-                )
+                await query.message.reply_text("Unknown status selected.")
+                return
+
+            update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+
+            await query.message.reply_text(
+                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}"
+            )
 
             await notify_helpdesk(
                 context,
@@ -482,8 +459,49 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
 
+            return
+
+        if action == "outcome":
+            selected_outcome = data[2]
+
+            update_fields = {
+                "Status": AWAITING_DEPLOYMENT_STATUS,
+                "JobOutcome": selected_outcome,
+                "ActionSelectedTime": now_sharepoint_time(),
+            }
+
+            if selected_outcome == "No Access":
+                update_fields["NoAccessTime"] = now_sharepoint_time()
+
+            if selected_outcome == "Revisit Required":
+                update_fields["RevisitRequiredTime"] = now_sharepoint_time()
+
+            update_fields.update(clear_engineer_assignment_payload())
+
+            update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+
+            await query.message.reply_text(
+                f"Updated:\n\n"
+                f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
+                f"Job returned to Awaiting Engineer Deployment."
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job outcome selected\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Outcome: {selected_outcome}\n"
+                    f"Status: {AWAITING_DEPLOYMENT_STATUS}\n"
+                    f"Site: {fields.get('SiteName', '')}"
+                ),
+            )
+
+            return
+
     except Exception as e:
-        print(f"ERROR updating status: {e}")
+        print(f"ERROR updating status/outcome: {e}")
         await query.message.reply_text("There was an error updating the job status.")
 
 
@@ -663,8 +681,10 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
             "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
             "WorksheetSubmitted": True,
-            "Status": "Completed",
+            "Status": AWAITING_DEPLOYMENT_STATUS,
+            "JobOutcome": "Completed",
             "CompletedTime": now_sharepoint_time(),
+            "ActionSelectedTime": now_sharepoint_time(),
         }
 
         fields_to_update.update(clear_engineer_assignment_payload())
@@ -686,6 +706,8 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Worksheet submitted\n\n"
                 f"CDR Number: {worksheet['cdr_number']}\n"
                 f"Engineer: {worksheet['engineer_name']}\n"
+                f"Outcome: Completed\n"
+                f"Status: {AWAITING_DEPLOYMENT_STATUS}\n"
                 f"Photos uploaded: {len(worksheet.get('photo_links', []))}"
             ),
         )
