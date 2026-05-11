@@ -364,11 +364,14 @@ def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
 
 def get_item_attachments(site_id, list_id, item_id):
     url = (
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}"
-        f"/lists/{list_id}/items/{item_id}/attachments"
+        f"{SHAREPOINT_SITE}/_api/web/lists/getbytitle('{JOBS_LIST}')"
+        f"/items({item_id})/AttachmentFiles"
     )
 
-    response = requests.get(url, headers=get_headers())
+    headers = get_headers()
+    headers["Accept"] = "application/json;odata=nometadata"
+
+    response = requests.get(url, headers=headers)
 
     if response.status_code != 200:
         print(f"Could not get attachments for item {item_id}: {response.text}")
@@ -378,7 +381,10 @@ def get_item_attachments(site_id, list_id, item_id):
 
 
 def download_attachment(download_url):
-    response = requests.get(download_url)
+    response = requests.get(
+        download_url,
+        headers=get_headers(content_type=False),
+    )
 
     if response.status_code != 200:
         raise Exception(f"Could not download attachment: {response.text}")
@@ -393,11 +399,13 @@ async def send_job_attachments(app, chat_id, site_id, jobs_list_id, item_id):
         return
 
     for attachment in attachments:
-        file_name = attachment.get("name", "attachment")
-        download_url = attachment.get("contentUrl")
+        file_name = attachment.get("FileName", "attachment")
+        download_url = attachment.get("ServerRelativeUrl")
 
         if not download_url:
             continue
+
+        download_url = f"https://{SHAREPOINT_SITE.split('/')[2]}{download_url}"
 
         file_bytes = download_attachment(download_url)
 
@@ -1073,7 +1081,7 @@ telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
-print("Bot running...")
+print(f"Bot running... PID={os.getpid()}")
 
 telegram_app.run_polling(
     drop_pending_updates=True,
