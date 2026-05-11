@@ -154,7 +154,7 @@ def remove_current_engineer_assignment_payload(fields, current_lookup_id):
         for engineer in engineer_values:
             lookup_id = str(engineer.get("LookupId"))
 
-            if lookup_id != str(current_lookup_id):
+            if lookup_id and lookup_id != str(current_lookup_id):
                 remaining_ids.append(int(lookup_id))
 
     return {
@@ -362,76 +362,6 @@ def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
 
     return response.json().get("webUrl", "")
 
-def get_item_attachments(site_id, list_id, item_id):
-    url = (
-        f"{SHAREPOINT_SITE}/_api/web/lists/getbytitle('{JOBS_LIST}')"
-        f"/items({item_id})/AttachmentFiles"
-    )
-
-    headers = get_headers()
-    headers["Accept"] = "application/json;odata=nometadata"
-
-    response = requests.get(url, headers=headers)
-
-    if response.status_code != 200:
-        print(f"Could not get attachments for item {item_id}: {response.text}")
-        return []
-
-    return response.json().get("value", [])
-
-
-def download_attachment(download_url):
-    response = requests.get(
-        download_url,
-        headers=get_headers(content_type=False),
-    )
-
-    if response.status_code != 200:
-        raise Exception(f"Could not download attachment: {response.text}")
-
-    return response.content
-
-
-async def send_job_attachments(app, chat_id, site_id, jobs_list_id, item_id):
-    attachments = get_item_attachments(site_id, jobs_list_id, item_id)
-
-    if not attachments:
-        return
-
-    for attachment in attachments:
-        file_name = attachment.get("FileName", "attachment")
-        download_url = attachment.get("ServerRelativeUrl")
-
-        if not download_url:
-            continue
-
-        download_url = f"https://{SHAREPOINT_SITE.split('/')[2]}{download_url}"
-
-        file_bytes = download_attachment(download_url)
-
-        lower_name = file_name.lower()
-
-        if lower_name.endswith((".jpg", ".jpeg", ".png", ".webp")):
-            await app.bot.send_photo(
-                chat_id=chat_id,
-                photo=file_bytes,
-                caption=file_name,
-            )
-
-        elif lower_name.endswith((".mp4", ".mov", ".avi")):
-            await app.bot.send_video(
-                chat_id=chat_id,
-                video=file_bytes,
-                caption=file_name,
-            )
-
-        else:
-            await app.bot.send_document(
-                chat_id=chat_id,
-                document=file_bytes,
-                filename=file_name,
-                caption=file_name,
-            )
 
 def build_review_text(worksheet):
     return (
@@ -686,18 +616,11 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
 
-            if is_final_engineer:
-                await query.message.reply_text(
-                    f"Updated:\n\n"
-                    f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
-                    f"Final engineer removed. Job returned to Awaiting Engineer Deployment."
-                )
-            else:
-                await query.message.reply_text(
-                    f"Updated:\n\n"
-                    f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
-                    f"You have been removed from this job. Other assigned engineer(s) remain."
-                )
+            await query.message.reply_text(
+                f"Updated:\n\n"
+                f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
+                f"You have been removed from this job."
+            )
 
             await notify_helpdesk(
                 context,
@@ -940,16 +863,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
 
-        if is_final_engineer:
-            await update.message.reply_text(
-                f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
-            )
-        else:
-            await update.message.reply_text(
-                f"Worksheet submitted:\n\n"
-                f"{worksheet['cdr_number']}\n\n"
-                f"You have been removed from this job. Other assigned engineer(s) remain."
-            )
+        await update.message.reply_text(
+            f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
+        )
 
         await notify_helpdesk(
             context,
@@ -1005,13 +921,6 @@ async def send_new_jobs(app):
                     chat_id=engineer["telegram_id"],
                     text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
                     reply_markup=get_job_buttons(item_id),
-                )
-                await send_job_attachments(
-                    app,
-                    engineer["telegram_id"],
-                    site_id,
-                    jobs_list_id,
-                    item_id,
                 )
 
             sent_job_ids.add(item_id)
