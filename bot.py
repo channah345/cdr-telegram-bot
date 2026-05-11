@@ -1,10 +1,15 @@
 import os
+import base64
+import secrets
+import threading
 import requests
 import msal
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,6 +20,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+import uvicorn
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TENANT_ID = os.getenv("TENANT_ID")
@@ -22,12 +28,15 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
+SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
+PORT = int(os.getenv("PORT", "8000"))
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 
 PHOTO_LIBRARY = "Documents"
 PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
+SIGNATURE_BASE_FOLDER = "16 - CLIENT SIGNATURES"
 
 UK_TZ = ZoneInfo("Europe/London")
 
@@ -35,7 +44,15 @@ AWAITING_DEPLOYMENT_STATUS = "Awaiting Engineer Deployment"
 ASSIGNED_STATUS = "Assigned"
 COMPLETED_STATUS = "Completed"
 
-WORK_COMPLETED, MATERIALS_USED, FOLLOW_ON_REQUIRED, FOLLOW_ON_NOTES, ENGINEER_NOTES, PHOTOS, REVIEW = range(7)
+WORK_COMPLETED = 0
+MATERIALS_USED = 1
+FOLLOW_ON_REQUIRED = 2
+FOLLOW_ON_NOTES = 3
+ENGINEER_NOTES = 4
+PHOTOS = 5
+SIGNATURE_REQUIRED = 6
+SIGNATURE_WAITING = 7
+REVIEW = 8
 
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
 
@@ -44,6 +61,8 @@ msal_app = msal.ConfidentialClientApplication(
     authority=authority,
     client_credential=CLIENT_SECRET,
 )
+
+web_app = FastAPI()
 
 
 def get_headers(content_type=True):
@@ -64,6 +83,10 @@ def get_headers(content_type=True):
 
 def now_log_time():
     return datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M")
+
+
+def graph_datetime_now():
+    return datetime.now(UK_TZ).isoformat()
 
 
 def format_sharepoint_date(value):
@@ -147,7 +170,6 @@ def clear_engineer_assignment_payload():
 
 def remove_current_engineer_assignment_payload(fields, current_lookup_id):
     remaining_ids = []
-
     engineer_values = fields.get("Engineer", [])
 
     if isinstance(engineer_values, list):
@@ -165,7 +187,6 @@ def remove_current_engineer_assignment_payload(fields, current_lookup_id):
 
 def append_engineer_log(fields, engineer_name, action, extra_text=""):
     existing_log = fields.get("EngineerVisitLog", "") or ""
-
     line = f"{now_log_time()} - {engineer_name} - {action}"
 
     if extra_text:
@@ -310,7 +331,7 @@ def get_drive_id(site_id, drive_name):
     raise Exception(f"Document library not found: {drive_name}")
 
 
-def ensure_photo_folder(drive_id, folder_path):
+def ensure_folder(drive_id, folder_path):
     parts = folder_path.split("/")
     current_path = ""
 
@@ -345,7 +366,11 @@ def ensure_photo_folder(drive_id, folder_path):
             raise Exception(f"Could not create folder {current_path}: {create_response.text}")
 
 
-def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
+def upload_file_to_sharepoint(site_id, base_folder, cdr_number, file_name, file_bytes):
+    drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
+    folder_path = f"{base_folder}/{cdr_number}"
+    ensure_folder(drive_id, folder_path)
+
     url = (
         f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:"
         f"/{folder_path}/{file_name}:/content"
@@ -358,12 +383,84 @@ def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
     )
 
     if response.status_code not in [200, 201]:
-        raise Exception(f"Could not upload photo: {response.text}")
+        raise Exception(f"Could not upload file: {response.text}")
 
     return response.json().get("webUrl", "")
 
 
+def upload_photo_to_sharepoint(site_id, cdr_number, file_name, file_bytes):
+    return upload_file_to_sharepoint(
+        site_id,
+        PHOTO_BASE_FOLDER,
+        cdr_number,
+        file_name,
+        file_bytes,
+    )
+
+
+def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url):
+    if "," not in signature_data_url:
+        raise Exception("Invalid signature data")
+
+    image_base64 = signature_data_url.split(",", 1)[1]
+    image_bytes = base64.b64decode(image_base64)
+    file_name = f"{cdr_number}_client_signature_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.png"
+
+    return upload_file_to_sharepoint(
+        site_id,
+        SIGNATURE_BASE_FOLDER,
+        cdr_number,
+        file_name,
+        image_bytes,
+    )
+
+
+def get_job_by_cdr_and_token(cdr_number, token):
+    site_id = get_site_id()
+    jobs_list_id = get_list_id(site_id, JOBS_LIST)
+    jobs_data = get_list_items(site_id, jobs_list_id)
+
+    for job in jobs_data:
+        fields = job["fields"]
+        if (
+            str(fields.get("CDRNumber", "")).lower() == cdr_number.lower()
+            and str(fields.get("SignatureToken", "")) == str(token)
+        ):
+            return site_id, jobs_list_id, job
+
+    return None, None, None
+
+
+def bool_field(value):
+    return value in [True, "true", "True", "Yes", "yes", "1", 1]
+
+
+def create_signature_token_for_job(site_id, jobs_list_id, item_id):
+    token = secrets.token_urlsafe(24)
+    update_list_item_fields(
+        site_id,
+        jobs_list_id,
+        item_id,
+        {
+            "ClientSignatureRequired": True,
+            "ClientSignatureReceived": False,
+            "SignatureToken": token,
+        },
+    )
+    return token
+
+
+def build_signature_url(cdr_number, token):
+    if not SIGNATURE_BASE_URL:
+        raise Exception("SIGNATURE_BASE_URL Railway variable is missing")
+
+    return f"{SIGNATURE_BASE_URL.rstrip('/')}/sign/{cdr_number}?token={token}"
+
+
 def build_review_text(worksheet):
+    signature_required = "Yes" if worksheet.get("ClientSignatureRequired") else "No"
+    signature_received = "Yes" if worksheet.get("ClientSignatureReceived") else "No"
+
     return (
         f"Please review worksheet for {worksheet['cdr_number']}:\n\n"
         f"Work completed:\n{worksheet.get('WorkCompleted', '')}\n\n"
@@ -371,7 +468,9 @@ def build_review_text(worksheet):
         f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
         f"Follow-on notes:\n{worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
         f"Engineer notes:\n{worksheet.get('EngineerCompletionNotes', '')}\n\n"
-        f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n\n"
+        f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
+        f"Client signature required: {signature_required}\n"
+        f"Client signature received: {signature_received}\n\n"
         f"Type SUBMIT to complete the job.\n"
         f"Type RESTART to redo the worksheet.\n"
         f"Type CANCEL to abandon it."
@@ -384,6 +483,164 @@ async def notify_helpdesk(context, text):
             await context.bot.send_message(chat_id=HELPDESK_CHAT_ID, text=text)
         except Exception as e:
             print(f"Could not notify helpdesk: {e}")
+
+
+@web_app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse("CDR Engineer Bot signature portal is online.")
+
+
+@web_app.get("/sign/{cdr_number}", response_class=HTMLResponse)
+def signature_page(cdr_number: str, token: str):
+    site_id, jobs_list_id, job = get_job_by_cdr_and_token(cdr_number, token)
+
+    if not job:
+        return HTMLResponse("Invalid or expired signature link.", status_code=404)
+
+    fields = job["fields"]
+
+    if bool_field(fields.get("ClientSignatureReceived")):
+        return HTMLResponse("This job has already been signed.", status_code=200)
+
+    site = fields.get("SiteName", "")
+    address = fields.get("Address", "")
+    task = fields.get("Task", "")
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Client Signature - CDR M&E Services Ltd</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.6/dist/signature_pad.umd.min.js"></script>
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; margin: 0; }}
+            .container {{ max-width: 650px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.12); }}
+            h1 {{ color: #f58220; margin-bottom: 5px; }}
+            .job-box {{ background: #f7f7f7; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+            label {{ font-weight: bold; display: block; margin-top: 15px; }}
+            input[type="text"] {{ width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; }}
+            canvas {{ width: 100%; height: 230px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; }}
+            button {{ width: 100%; padding: 14px; margin-top: 15px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }}
+            .submit {{ background: #f58220; color: white; font-weight: bold; }}
+            .clear {{ background: #555; color: white; }}
+            .small {{ font-size: 13px; color: #555; margin-top: 15px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>CDR M&E Services Ltd</h1>
+            <h2>Client Signature</h2>
+            <div class="job-box">
+                <p><strong>CDR Number:</strong> {cdr_number}</p>
+                <p><strong>Site:</strong> {site}</p>
+                <p><strong>Address:</strong> {address}</p>
+                <p><strong>Task:</strong> {task}</p>
+            </div>
+            <form method="post" action="/submit-signature" onsubmit="return submitForm()">
+                <input type="hidden" name="cdr_number" value="{cdr_number}">
+                <input type="hidden" name="token" value="{token}">
+                <input type="hidden" name="signature_data" id="signature_data">
+
+                <label>Client name</label>
+                <input type="text" name="client_name" required placeholder="Enter client name">
+
+                <label>
+                    <input type="checkbox" required>
+                    I confirm the works/attendance have been completed as described.
+                </label>
+
+                <label>Signature</label>
+                <canvas id="signature-pad"></canvas>
+
+                <button type="button" class="clear" onclick="clearSignature()">Clear Signature</button>
+                <button type="submit" class="submit">Submit Signature</button>
+            </form>
+            <p class="small">This digital signature will be stored against the job record for audit and completion evidence.</p>
+        </div>
+        <script>
+            const canvas = document.getElementById("signature-pad");
+            const signaturePad = new SignaturePad(canvas);
+
+            function resizeCanvas() {{
+                const ratio = Math.max(window.devicePixelRatio || 1, 1);
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = rect.width * ratio;
+                canvas.height = rect.height * ratio;
+                canvas.getContext("2d").scale(ratio, ratio);
+                signaturePad.clear();
+            }}
+
+            window.addEventListener("resize", resizeCanvas);
+            resizeCanvas();
+
+            function clearSignature() {{
+                signaturePad.clear();
+            }}
+
+            function submitForm() {{
+                if (signaturePad.isEmpty()) {{
+                    alert("Please provide a signature.");
+                    return false;
+                }}
+                document.getElementById("signature_data").value = signaturePad.toDataURL("image/png");
+                return true;
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
+
+
+@web_app.post("/submit-signature", response_class=HTMLResponse)
+def submit_signature(
+    cdr_number: str = Form(...),
+    token: str = Form(...),
+    client_name: str = Form(...),
+    signature_data: str = Form(...),
+):
+    site_id, jobs_list_id, job = get_job_by_cdr_and_token(cdr_number, token)
+
+    if not job:
+        return HTMLResponse("Invalid or expired signature link.", status_code=404)
+
+    if bool_field(job["fields"].get("ClientSignatureReceived")):
+        return HTMLResponse("This job has already been signed.", status_code=200)
+
+    signature_link = upload_signature_to_sharepoint(site_id, cdr_number, signature_data)
+
+    update_list_item_fields(
+        site_id,
+        jobs_list_id,
+        job["id"],
+        {
+            "ClientSignatureReceived": True,
+            "ClientSignatureName": client_name,
+            "ClientSignatureDateTime": graph_datetime_now(),
+            "ClientSignatureLink": {
+                "Url": signature_link,
+                "Description": "Client Signature",
+            },
+        },
+    )
+
+    return HTMLResponse(
+        """
+        <html>
+            <body style="font-family: Arial; padding: 30px;">
+                <h2>Signature saved</h2>
+                <p>Thank you. The job has been signed successfully.</p>
+                <p>You can now hand the phone back to the engineer.</p>
+            </body>
+        </html>
+        """
+    )
+
+
+def run_signature_web_server():
+    uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="info")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -547,12 +804,15 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_status,
             )
 
-            update_fields = {
-                "Status": selected_status,
-                "EngineerVisitLog": updated_log,
-            }
-
-            update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {
+                    "Status": selected_status,
+                    "EngineerVisitLog": updated_log,
+                },
+            )
 
             await query.message.reply_text(
                 f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}"
@@ -693,6 +953,8 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "engineer_lookup_id": current_engineer["lookup_id"],
             "fields": fields,
             "photo_links": [],
+            "ClientSignatureRequired": False,
+            "ClientSignatureReceived": False,
         }
 
         await update.message.reply_text(
@@ -762,17 +1024,12 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worksheet = context.user_data["worksheet"]
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
-        await update.message.reply_text(build_review_text(worksheet))
-        return REVIEW
+        await update.message.reply_text("Is a client signature required? Reply Yes or No.")
+        return SIGNATURE_REQUIRED
 
     if update.message.photo:
         site_id = worksheet["site_id"]
         cdr_number = worksheet["cdr_number"]
-
-        drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
-
-        folder_path = f"{PHOTO_BASE_FOLDER}/{cdr_number}"
-        ensure_photo_folder(drive_id, folder_path)
 
         photo = update.message.photo[-1]
         telegram_file = await context.bot.get_file(photo.file_id)
@@ -782,18 +1039,97 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_name = f"{cdr_number}_{timestamp}_{photo.file_unique_id}.jpg"
 
         photo_link = upload_photo_to_sharepoint(
-            drive_id,
-            folder_path,
+            site_id,
+            cdr_number,
             file_name,
             bytes(file_bytes),
         )
 
         worksheet["photo_links"].append(photo_link)
-
         return PHOTOS
 
     await update.message.reply_text("Please send a photo or type DONE.")
     return PHOTOS
+
+
+async def worksheet_signature_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip().lower()
+    worksheet = context.user_data["worksheet"]
+
+    if answer not in ["yes", "no", "y", "n"]:
+        await update.message.reply_text("Please reply Yes or No.")
+        return SIGNATURE_REQUIRED
+
+    signature_required = answer in ["yes", "y"]
+    worksheet["ClientSignatureRequired"] = signature_required
+
+    if not signature_required:
+        await update.message.reply_text(build_review_text(worksheet))
+        return REVIEW
+
+    try:
+        token = create_signature_token_for_job(
+            worksheet["site_id"],
+            worksheet["jobs_list_id"],
+            worksheet["item_id"],
+        )
+
+        signature_url = build_signature_url(worksheet["cdr_number"], token)
+        worksheet["SignatureToken"] = token
+        worksheet["SignatureUrl"] = signature_url
+
+        await update.message.reply_text(
+            "Client signature required.\n\n"
+            "Open this link on your phone and ask the client to sign:\n\n"
+            f"{signature_url}\n\n"
+            "Once signed, type SIGNED.\n"
+            "If no client is available, type SKIP."
+        )
+
+        return SIGNATURE_WAITING
+
+    except Exception as e:
+        print(f"ERROR creating signature link: {e}")
+        await update.message.reply_text(
+            "There was an error creating the signature link. Type SKIP to continue without a signature."
+        )
+        return SIGNATURE_WAITING
+
+
+async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip().upper()
+    worksheet = context.user_data["worksheet"]
+
+    if answer == "SKIP":
+        worksheet["ClientSignatureReceived"] = False
+        await update.message.reply_text(build_review_text(worksheet))
+        return REVIEW
+
+    if answer != "SIGNED":
+        await update.message.reply_text("Please type SIGNED once the client has signed, or SKIP to continue without a signature.")
+        return SIGNATURE_WAITING
+
+    latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
+    job = find_job_by_item_id(latest_jobs, worksheet["item_id"])
+
+    if not job:
+        await update.message.reply_text("Could not check the signature. Please try SIGNED again or type SKIP.")
+        return SIGNATURE_WAITING
+
+    fields = job["fields"]
+
+    if bool_field(fields.get("ClientSignatureReceived")):
+        worksheet["ClientSignatureReceived"] = True
+        worksheet["ClientSignatureName"] = fields.get("ClientSignatureName", "")
+        worksheet["ClientSignatureLink"] = fields.get("ClientSignatureLink", "")
+        await update.message.reply_text("Signature received.")
+        await update.message.reply_text(build_review_text(worksheet))
+        return REVIEW
+
+    await update.message.reply_text(
+        "I cannot see the signature yet. Make sure the client pressed Submit Signature, then type SIGNED again."
+    )
+    return SIGNATURE_WAITING
 
 
 async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -812,6 +1148,8 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worksheet["FollowOnNotes"] = ""
         worksheet["EngineerCompletionNotes"] = ""
         worksheet["photo_links"] = []
+        worksheet["ClientSignatureRequired"] = False
+        worksheet["ClientSignatureReceived"] = False
 
         await update.message.reply_text(
             f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
@@ -848,6 +1186,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "WorksheetSubmitted": True,
             "JobOutcome": "Completed",
             "EngineerVisitLog": updated_log,
+            "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
         }
 
         if is_final_engineer:
@@ -875,7 +1214,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Engineer: {worksheet['engineer_name']}\n"
                 f"Outcome: Completed\n"
                 f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
-                f"Photos uploaded: {len(worksheet.get('photo_links', []))}"
+                f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
+                f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
+                f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
             ),
         )
 
@@ -979,6 +1320,8 @@ worksheet_handler = ConversationHandler(
             MessageHandler(filters.PHOTO, worksheet_photos),
             MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_photos),
         ],
+        SIGNATURE_REQUIRED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_required)],
+        SIGNATURE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_waiting)],
         REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_review)],
     },
     fallbacks=[CommandHandler("cancel", worksheet_cancel)],
@@ -990,10 +1333,13 @@ telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
-print(f"Bot running... PID={os.getpid()}")
+if __name__ == "__main__":
+    threading.Thread(target=run_signature_web_server, daemon=True).start()
+    print(f"Signature web server running on port {PORT}")
+    print(f"Bot running... PID={os.getpid()}")
 
-telegram_app.run_polling(
-    drop_pending_updates=True,
-    close_loop=False,
-    allowed_updates=Update.ALL_TYPES,
-)
+    telegram_app.run_polling(
+        drop_pending_updates=True,
+        close_loop=False,
+        allowed_updates=Update.ALL_TYPES,
+    )
