@@ -966,7 +966,7 @@ async def post_init(app):
     scheduler.add_job(
         send_new_jobs,
         trigger="interval",
-        minutes=2,
+        seconds=30,
         args=[app],
     )
 
