@@ -365,7 +365,7 @@ def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
 def get_item_attachments(site_id, list_id, item_id):
     url = (
         f"https://graph.microsoft.com/v1.0/sites/{site_id}"
-        f"/lists/{list_id}/items/{item_id}/driveItem/children"
+        f"/lists/{list_id}/items/{item_id}/attachments"
     )
 
     response = requests.get(url, headers=get_headers())
@@ -394,7 +394,7 @@ async def send_job_attachments(app, chat_id, site_id, jobs_list_id, item_id):
 
     for attachment in attachments:
         file_name = attachment.get("name", "attachment")
-        download_url = attachment.get("@microsoft.graph.downloadUrl")
+        download_url = attachment.get("contentUrl")
 
         if not download_url:
             continue
