@@ -1078,4 +1078,5 @@ print("Bot running...")
 telegram_app.run_polling(
     drop_pending_updates=True,
     close_loop=False,
+    allowed_updates=Update.ALL_TYPES,
 )
