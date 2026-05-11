@@ -619,10 +619,7 @@ def submit_signature(
             "ClientSignatureReceived": True,
             "ClientSignatureName": client_name,
             "ClientSignatureDateTime": graph_datetime_now(),
-            "ClientSignatureLink": {
-                "Url": signature_link,
-                "Description": "Client Signature",
-            },
+            "ClientSignatureLink": signature_link,
         },
     )
 
