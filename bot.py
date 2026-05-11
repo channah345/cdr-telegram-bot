@@ -467,7 +467,6 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_fields = {
                 "Status": AWAITING_DEPLOYMENT_STATUS,
                 "JobOutcome": selected_outcome,
-                "ActionSelectedTime": now_sharepoint_time(),
             }
 
             if selected_outcome == "No Access":
@@ -684,7 +683,6 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Status": AWAITING_DEPLOYMENT_STATUS,
             "JobOutcome": "Completed",
             "CompletedTime": now_sharepoint_time(),
-            "ActionSelectedTime": now_sharepoint_time(),
         }
 
         fields_to_update.update(clear_engineer_assignment_payload())
