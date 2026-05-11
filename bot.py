@@ -60,8 +60,8 @@ def get_headers(content_type=True):
     return headers
 
 
-def now_sharepoint_time():
-    return datetime.now(UK_TZ).astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+def now_log_time():
+    return datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M")
 
 
 def format_sharepoint_date(value):
@@ -143,6 +143,20 @@ def clear_engineer_assignment_payload():
     }
 
 
+def append_engineer_log(fields, engineer_name, action, extra_text=""):
+    existing_log = fields.get("EngineerVisitLog", "") or ""
+
+    line = f"{now_log_time()} - {engineer_name} - {action}"
+
+    if extra_text:
+        line += f" - {extra_text}"
+
+    if existing_log.strip():
+        return existing_log.strip() + "\n" + line
+
+    return line
+
+
 def get_sharepoint_data():
     site_id = get_site_id()
     engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
@@ -202,8 +216,8 @@ def get_job_buttons(item_id):
             InlineKeyboardButton("On Site", callback_data=f"status|{item_id}|On Site"),
         ],
         [
-            InlineKeyboardButton("Revisit", callback_data=f"outcome|{item_id}|Revisit Required"),
-            InlineKeyboardButton("No Access", callback_data=f"outcome|{item_id}|No Access"),
+            InlineKeyboardButton("Revisit", callback_data=f"confirm_outcome|{item_id}|Revisit Required"),
+            InlineKeyboardButton("No Access", callback_data=f"confirm_outcome|{item_id}|No Access"),
         ],
         [
             InlineKeyboardButton("Complete", callback_data=f"complete_help|{item_id}"),
@@ -283,11 +297,7 @@ def ensure_photo_folder(drive_id, folder_path):
             "@microsoft.graph.conflictBehavior": "replace",
         }
 
-        create_response = requests.post(
-            create_url,
-            headers=get_headers(),
-            json=body,
-        )
+        create_response = requests.post(create_url, headers=get_headers(), json=body)
 
         if create_response.status_code not in [200, 201]:
             raise Exception(f"Could not create folder {current_path}: {create_response.text}")
@@ -423,24 +433,51 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if action == "confirm_outcome":
+            selected_outcome = data[2]
+
+            confirm_buttons = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "Yes, confirm",
+                        callback_data=f"outcome|{item_id}|{selected_outcome}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Cancel",
+                        callback_data=f"cancel_outcome|{item_id}",
+                    ),
+                ],
+            ])
+
+            await query.message.reply_text(
+                f"Are you sure you want to mark this job as:\n\n{selected_outcome}?",
+                reply_markup=confirm_buttons,
+            )
+            return
+
+        if action == "cancel_outcome":
+            await query.message.reply_text("Cancelled. No changes made.")
+            return
+
         if action == "status":
             selected_status = data[2]
 
-            if selected_status == "Travelling":
-                update_fields = {
-                    "Status": "Travelling",
-                    "TravellingTime": now_sharepoint_time(),
-                }
-
-            elif selected_status == "On Site":
-                update_fields = {
-                    "Status": "On Site",
-                    "OnSiteTime": now_sharepoint_time(),
-                }
-
-            else:
+            if selected_status not in ["Travelling", "On Site"]:
                 await query.message.reply_text("Unknown status selected.")
                 return
+
+            updated_log = append_engineer_log(
+                fields,
+                current_engineer["name"],
+                selected_status,
+            )
+
+            update_fields = {
+                "Status": selected_status,
+                "EngineerVisitLog": updated_log,
+            }
 
             update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
 
@@ -464,16 +501,21 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "outcome":
             selected_outcome = data[2]
 
+            if selected_outcome not in ["No Access", "Revisit Required"]:
+                await query.message.reply_text("Unknown outcome selected.")
+                return
+
+            updated_log = append_engineer_log(
+                fields,
+                current_engineer["name"],
+                selected_outcome,
+            )
+
             update_fields = {
                 "Status": AWAITING_DEPLOYMENT_STATUS,
                 "JobOutcome": selected_outcome,
+                "EngineerVisitLog": updated_log,
             }
-
-            if selected_outcome == "No Access":
-                update_fields["NoAccessTime"] = now_sharepoint_time()
-
-            if selected_outcome == "Revisit Required":
-                update_fields["RevisitRequiredTime"] = now_sharepoint_time()
 
             update_fields.update(clear_engineer_assignment_payload())
 
@@ -673,6 +715,21 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WORK_COMPLETED
 
     if answer == "SUBMIT":
+        site_id = worksheet["site_id"]
+        jobs_list_id = worksheet["jobs_list_id"]
+        item_id = worksheet["item_id"]
+
+        latest_job = get_list_items(site_id, jobs_list_id)
+        job = find_job_by_item_id(latest_job, item_id)
+        fields = job["fields"] if job else worksheet["fields"]
+
+        updated_log = append_engineer_log(
+            fields,
+            worksheet["engineer_name"],
+            "Completed",
+            "Worksheet submitted",
+        )
+
         fields_to_update = {
             "WorkCompleted": worksheet.get("WorkCompleted", ""),
             "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
@@ -682,17 +739,12 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "WorksheetSubmitted": True,
             "Status": AWAITING_DEPLOYMENT_STATUS,
             "JobOutcome": "Completed",
-            "CompletedTime": now_sharepoint_time(),
+            "EngineerVisitLog": updated_log,
         }
 
         fields_to_update.update(clear_engineer_assignment_payload())
 
-        update_list_item_fields(
-            worksheet["site_id"],
-            worksheet["jobs_list_id"],
-            worksheet["item_id"],
-            fields_to_update,
-        )
+        update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
 
         await update.message.reply_text(
             f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
