@@ -6,14 +6,20 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
+HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -185,11 +191,26 @@ def get_assigned_engineer_ids(fields):
 
 def is_notified(fields):
     value = fields.get("TelegramNotified", False)
+    return value in [True, "true", "True", "Yes", "yes", "1", 1]
 
-    if value in [True, "true", "True", "Yes", "yes", "1", 1]:
-        return True
 
-    return False
+def get_job_buttons(item_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Travelling", callback_data=f"status|{item_id}|Travelling"),
+            InlineKeyboardButton("On Site", callback_data=f"status|{item_id}|On Site"),
+        ],
+        [
+            InlineKeyboardButton("Need Parts", callback_data=f"status|{item_id}|Need Parts"),
+            InlineKeyboardButton("Revisit", callback_data=f"status|{item_id}|Revisit Required"),
+        ],
+        [
+            InlineKeyboardButton("No Access", callback_data=f"status|{item_id}|No Access"),
+        ],
+        [
+            InlineKeyboardButton("Complete", callback_data=f"complete_help|{item_id}"),
+        ],
+    ])
 
 
 def format_job(fields, engineer_name=None):
@@ -198,6 +219,7 @@ def format_job(fields, engineer_name=None):
         f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
         f"Time: {fields.get('StartTime', '')}\n"
         f"Engineer: {engineer_name or ''}\n"
+        f"Status: {fields.get('Status', 'Assigned')}\n"
         f"Site: {fields.get('SiteName', '')}\n"
         f"Address: {fields.get('Address', '')}\n"
         f"Task: {fields.get('Task', '')}\n"
@@ -205,6 +227,24 @@ def format_job(fields, engineer_name=None):
         f"Contact: {fields.get('ContactName', '')}\n"
         f"Phone: {fields.get('ContactNumber', '')}"
     )
+
+
+def find_job_by_item_id(jobs_data, item_id):
+    for job in jobs_data:
+        if str(job.get("id")) == str(item_id):
+            return job
+    return None
+
+
+async def notify_helpdesk(context, text):
+    if HELPDESK_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=HELPDESK_CHAT_ID,
+                text=text,
+            )
+        except Exception as e:
+            print(f"Could not notify helpdesk: {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -233,34 +273,180 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        found_jobs = []
+        found_any = False
 
         for job in jobs_data:
             fields = job["fields"]
+            item_id = job["id"]
 
             job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
             assigned_ids = get_assigned_engineer_ids(fields)
+            status = fields.get("Status", "Assigned")
+
+            if status == "Completed":
+                continue
 
             if (
                 current_engineer["lookup_id"] in assigned_ids
                 and job_date == today
             ):
-                found_jobs.append(
-                    format_job(fields, current_engineer["name"])
+                found_any = True
+
+                await update.message.reply_text(
+                    "Today's job:\n\n" + format_job(fields, current_engineer["name"]),
+                    reply_markup=get_job_buttons(item_id),
                 )
 
-        if found_jobs:
-            await update.message.reply_text(
-                "Today's jobs:\n\n"
-                + "\n\n--------------------\n\n".join(found_jobs)
-            )
-        else:
+        if not found_any:
             await update.message.reply_text("No jobs assigned today.")
 
     except Exception as e:
         print(f"ERROR in /jobs: {e}")
         await update.message.reply_text(
             "There was an error getting your jobs. Please ask the office to check Railway logs."
+        )
+
+
+async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        data = query.data.split("|")
+        action = data[0]
+        item_id = data[1]
+
+        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        engineers_by_telegram, _ = build_engineer_maps(engineers)
+
+        user_id = str(query.from_user.id)
+        current_engineer = engineers_by_telegram.get(user_id)
+
+        if not current_engineer:
+            await query.edit_message_text(
+                "You are not set up as an engineer. Please ask the office to add your Telegram ID."
+            )
+            return
+
+        job = find_job_by_item_id(jobs_data, item_id)
+
+        if not job:
+            await query.edit_message_text("Could not find this job in SharePoint.")
+            return
+
+        fields = job["fields"]
+        assigned_ids = get_assigned_engineer_ids(fields)
+
+        if current_engineer["lookup_id"] not in assigned_ids:
+            await query.edit_message_text("You are not assigned to this job.")
+            return
+
+        if action == "complete_help":
+            cdr_number = fields.get("CDRNumber", "")
+            await query.message.reply_text(
+                f"To complete this job, type:\n\n/complete {cdr_number}"
+            )
+            return
+
+        if action == "status":
+            new_status = data[2]
+
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {"Status": new_status},
+            )
+
+            await query.message.reply_text(
+                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {new_status}"
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job status updated\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Status: {new_status}\n"
+                    f"Site: {fields.get('SiteName', '')}"
+                ),
+            )
+
+    except Exception as e:
+        print(f"ERROR updating status: {e}")
+        await query.message.reply_text(
+            "There was an error updating the job status. Please ask the office to check Railway logs."
+        )
+
+
+async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await update.message.reply_text(
+                "To complete a job, type:\n\n/complete CDR00001"
+            )
+            return
+
+        cdr_number_requested = context.args[0].strip()
+
+        user_id = str(update.effective_user.id)
+
+        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        engineers_by_telegram, _ = build_engineer_maps(engineers)
+
+        current_engineer = engineers_by_telegram.get(user_id)
+
+        if not current_engineer:
+            await update.message.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID."
+            )
+            return
+
+        for job in jobs_data:
+            fields = job["fields"]
+            item_id = job["id"]
+
+            if str(fields.get("CDRNumber", "")).lower() != cdr_number_requested.lower():
+                continue
+
+            assigned_ids = get_assigned_engineer_ids(fields)
+
+            if current_engineer["lookup_id"] not in assigned_ids:
+                await update.message.reply_text("You are not assigned to this job.")
+                return
+
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {"Status": "Completed"},
+            )
+
+            await update.message.reply_text(
+                f"Job completed:\n\n{fields.get('CDRNumber', '')}"
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job completed\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Site: {fields.get('SiteName', '')}"
+                ),
+            )
+
+            return
+
+        await update.message.reply_text(
+            f"No job found with CDR number: {cdr_number_requested}"
+        )
+
+    except Exception as e:
+        print(f"ERROR completing job: {e}")
+        await update.message.reply_text(
+            "There was an error completing the job. Please ask the office to check Railway logs."
         )
 
 
@@ -294,10 +480,8 @@ async def send_new_jobs(app):
 
                 await app.bot.send_message(
                     chat_id=telegram_id,
-                    text=(
-                        "New job assigned:\n\n"
-                        + format_job(fields, engineer_name)
-                    ),
+                    text="New job assigned:\n\n" + format_job(fields, engineer_name),
+                    reply_markup=get_job_buttons(item_id),
                 )
 
                 print(
@@ -347,6 +531,8 @@ telegram_app = (
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
+telegram_app.add_handler(CommandHandler("complete", complete))
+telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 print("Bot running...")
 
