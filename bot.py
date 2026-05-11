@@ -2,6 +2,10 @@ import os
 import requests
 import msal
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -14,6 +18,8 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 
+UK_TZ = ZoneInfo("Europe/London")
+
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
 
 msal_app = msal.ConfidentialClientApplication(
@@ -22,15 +28,42 @@ msal_app = msal.ConfidentialClientApplication(
     client_credential=CLIENT_SECRET,
 )
 
-token_result = msal_app.acquire_token_for_client(
-    scopes=["https://graph.microsoft.com/.default"]
-)
 
-access_token = token_result["access_token"]
+def get_headers():
+    token_result = msal_app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
 
-headers = {
-    "Authorization": f"Bearer {access_token}"
-}
+    if "access_token" not in token_result:
+        raise Exception(f"Could not get Microsoft token: {token_result}")
+
+    return {
+        "Authorization": f"Bearer {token_result['access_token']}",
+        "Content-Type": "application/json",
+    }
+
+
+def format_sharepoint_date(value):
+    if not value:
+        return ""
+
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        uk_time = dt.astimezone(UK_TZ)
+        return uk_time.strftime("%d/%m/%Y")
+    except Exception:
+        return value
+
+
+def sharepoint_date_to_uk_date(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(UK_TZ).date()
+    except Exception:
+        return None
 
 
 def get_site_id():
@@ -38,19 +71,32 @@ def get_site_id():
     site_path = "/" + "/".join(SHAREPOINT_SITE.split("/")[3:])
     site_url = f"https://graph.microsoft.com/v1.0/sites/{site_hostname}:{site_path}"
 
-    response = requests.get(site_url, headers=headers)
+    response = requests.get(site_url, headers=get_headers())
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Could not get SharePoint site. "
+            f"Status: {response.status_code}. Response: {response.text}"
+        )
+
     return response.json()["id"]
 
 
 def get_list_id(site_id, list_name):
     lists_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists"
-    response = requests.get(lists_url, headers=headers)
+    response = requests.get(lists_url, headers=get_headers())
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Could not get SharePoint lists. "
+            f"Status: {response.status_code}. Response: {response.text}"
+        )
 
     for lst in response.json()["value"]:
         if lst["name"] == list_name:
             return lst["id"]
 
-    return None
+    raise Exception(f"List not found: {list_name}")
 
 
 def get_list_items(site_id, list_id):
@@ -59,8 +105,106 @@ def get_list_items(site_id, list_id):
         f"{site_id}/lists/{list_id}/items?expand=fields"
     )
 
-    response = requests.get(items_url, headers=headers)
+    response = requests.get(items_url, headers=get_headers())
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Could not get list items. "
+            f"Status: {response.status_code}. Response: {response.text}"
+        )
+
     return response.json()["value"]
+
+
+def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
+    update_url = (
+        f"https://graph.microsoft.com/v1.0/sites/"
+        f"{site_id}/lists/{list_id}/items/{item_id}/fields"
+    )
+
+    response = requests.patch(
+        update_url,
+        headers=get_headers(),
+        json=fields_to_update,
+    )
+
+    if response.status_code not in [200, 204]:
+        raise Exception(
+            f"Could not update item {item_id}. "
+            f"Status: {response.status_code}. Response: {response.text}"
+        )
+
+
+def get_sharepoint_data():
+    site_id = get_site_id()
+
+    engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+    jobs_list_id = get_list_id(site_id, JOBS_LIST)
+
+    engineers = get_list_items(site_id, engineers_list_id)
+    jobs = get_list_items(site_id, jobs_list_id)
+
+    return site_id, engineers_list_id, jobs_list_id, engineers, jobs
+
+
+def build_engineer_maps(engineers):
+    by_telegram_id = {}
+    by_lookup_id = {}
+
+    for engineer in engineers:
+        fields = engineer["fields"]
+
+        lookup_id = str(fields.get("id", ""))
+        name = fields.get("EngineerName", "")
+        telegram_id = str(fields.get("TelegramID", ""))
+
+        if lookup_id and name and telegram_id:
+            by_lookup_id[lookup_id] = {
+                "name": name,
+                "telegram_id": telegram_id,
+            }
+
+            by_telegram_id[telegram_id] = {
+                "lookup_id": lookup_id,
+                "name": name,
+            }
+
+    return by_telegram_id, by_lookup_id
+
+
+def get_assigned_engineer_ids(fields):
+    engineer_lookup_values = fields.get("Engineer", [])
+    assigned_engineer_ids = []
+
+    if isinstance(engineer_lookup_values, list):
+        for engineer in engineer_lookup_values:
+            assigned_engineer_ids.append(str(engineer.get("LookupId")))
+
+    return assigned_engineer_ids
+
+
+def is_notified(fields):
+    value = fields.get("TelegramNotified", False)
+
+    if value in [True, "true", "True", "Yes", "yes", "1", 1]:
+        return True
+
+    return False
+
+
+def format_job(fields, engineer_name=None):
+    return (
+        f"CDR Number: {fields.get('CDRNumber', '')}\n"
+        f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
+        f"Time: {fields.get('StartTime', '')}\n"
+        f"Engineer: {engineer_name or ''}\n"
+        f"Site: {fields.get('SiteName', '')}\n"
+        f"Address: {fields.get('Address', '')}\n"
+        f"Task: {fields.get('Task', '')}\n"
+        f"Notes: {fields.get('Notes', '')}\n"
+        f"Contact: {fields.get('ContactName', '')}\n"
+        f"Phone: {fields.get('ContactNumber', '')}"
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,69 +218,108 @@ async def id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+    try:
+        user_id = str(update.effective_user.id)
+        today = datetime.now(UK_TZ).date()
 
-    site_id = get_site_id()
+        _, _, _, engineers, jobs_data = get_sharepoint_data()
+        engineers_by_telegram, _ = build_engineer_maps(engineers)
 
-    engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-    jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        current_engineer = engineers_by_telegram.get(user_id)
 
-    engineers = get_list_items(site_id, engineers_list_id)
-    jobs = get_list_items(site_id, jobs_list_id)
+        if not current_engineer:
+            await update.message.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID."
+            )
+            return
 
-    current_engineer_lookup_id = None
-    current_engineer_name = None
+        found_jobs = []
 
-    for engineer in engineers:
-        fields = engineer["fields"]
+        for job in jobs_data:
+            fields = job["fields"]
 
-        telegram_id = str(fields.get("TelegramID", ""))
+            job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
+            assigned_ids = get_assigned_engineer_ids(fields)
 
-        if telegram_id == user_id:
-            current_engineer_lookup_id = str(fields.get("id", ""))
-            current_engineer_name = fields.get("EngineerName", "")
-            break
+            if (
+                current_engineer["lookup_id"] in assigned_ids
+                and job_date == today
+            ):
+                found_jobs.append(
+                    format_job(fields, current_engineer["name"])
+                )
 
-    if not current_engineer_lookup_id:
+        if found_jobs:
+            await update.message.reply_text(
+                "Today's jobs:\n\n"
+                + "\n\n--------------------\n\n".join(found_jobs)
+            )
+        else:
+            await update.message.reply_text("No jobs assigned today.")
+
+    except Exception as e:
+        print(f"ERROR in /jobs: {e}")
         await update.message.reply_text(
-            "You are not set up as an engineer yet. Please ask the office to add your Telegram ID."
+            "There was an error getting your jobs. Please ask the office to check Railway logs."
         )
-        return
 
-    found_jobs = []
 
-    for job in jobs:
-        fields = job["fields"]
+async def send_new_jobs(app):
+    try:
+        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        _, engineers_by_lookup = build_engineer_maps(engineers)
 
-        engineer_lookup_values = fields.get("Engineer", [])
+        sent_job_ids = set()
 
-        assigned_engineer_ids = []
+        for job in jobs_data:
+            fields = job["fields"]
+            item_id = job["id"]
 
-        if isinstance(engineer_lookup_values, list):
-            for engineer in engineer_lookup_values:
-                assigned_engineer_ids.append(str(engineer.get("LookupId")))
+            if is_notified(fields):
+                continue
 
-        if current_engineer_lookup_id in assigned_engineer_ids:
-            found_jobs.append(
-                f"CDR Number: {fields.get('CDRNumber', '')}\n"
-                f"Date: {fields.get('Date', '')}\n"
-                f"Time: {fields.get('StartTime', '')}\n"
-                f"Engineer: {current_engineer_name}\n"
-                f"Site: {fields.get('SiteName', '')}\n"
-                f"Address: {fields.get('Address', '')}\n"
-                f"Task: {fields.get('Task', '')}\n"
-                f"Notes: {fields.get('Notes', '')}\n"
-                f"Contact: {fields.get('ContactName', '')}\n"
-                f"Phone: {fields.get('ContactNumber', '')}"
+            assigned_ids = get_assigned_engineer_ids(fields)
+
+            if not assigned_ids:
+                continue
+
+            for engineer_id in assigned_ids:
+                engineer = engineers_by_lookup.get(engineer_id)
+
+                if not engineer:
+                    continue
+
+                telegram_id = engineer["telegram_id"]
+                engineer_name = engineer["name"]
+
+                await app.bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "New job assigned:\n\n"
+                        + format_job(fields, engineer_name)
+                    ),
+                )
+
+                print(
+                    f"Sent job {fields.get('CDRNumber', '')} "
+                    f"to {engineer_name} ({telegram_id})"
+                )
+
+            sent_job_ids.add(item_id)
+
+        for item_id in sent_job_ids:
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {"TelegramNotified": True},
             )
 
-    if found_jobs:
-        await update.message.reply_text(
-            "Today's jobs:\n\n"
-            + "\n\n--------------------\n\n".join(found_jobs)
-        )
-    else:
-        await update.message.reply_text("No jobs assigned today.")
+        if sent_job_ids:
+            print(f"Marked {len(sent_job_ids)} job(s) as TelegramNotified.")
+
+    except Exception as e:
+        print(f"ERROR sending new jobs: {e}")
 
 
 telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -144,6 +327,17 @@ telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
+
+scheduler = AsyncIOScheduler(timezone=UK_TZ)
+
+scheduler.add_job(
+    send_new_jobs,
+    trigger="interval",
+    minutes=2,
+    args=[telegram_app],
+)
+
+scheduler.start()
 
 print("Bot running...")
 
