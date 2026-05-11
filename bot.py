@@ -520,7 +520,7 @@ def signature_page(cdr_number: str, token: str):
             .job-box {{ background: #f7f7f7; padding: 15px; border-radius: 8px; margin: 20px 0; }}
             label {{ font-weight: bold; display: block; margin-top: 15px; }}
             input[type="text"] {{ width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; }}
-            canvas {{ width: 100%; height: 230px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; }}
+            canvas {{ width: 100%; height: 230px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; touch-action: none; }}
             button {{ width: 100%; padding: 14px; margin-top: 15px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }}
             .submit {{ background: #f58220; color: white; font-weight: bold; }}
             .clear {{ background: #555; color: white; }}
