@@ -2,3 +2,7 @@ python-telegram-bot
 requests
 msal
 APScheduler
+fastapi
+uvicorn
+jinja2
+python-multipart
