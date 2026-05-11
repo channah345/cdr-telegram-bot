@@ -362,6 +362,68 @@ def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
 
     return response.json().get("webUrl", "")
 
+def get_item_attachments(site_id, list_id, item_id):
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{site_id}"
+        f"/lists/{list_id}/items/{item_id}/driveItem/children"
+    )
+
+    response = requests.get(url, headers=get_headers())
+
+    if response.status_code != 200:
+        print(f"Could not get attachments for item {item_id}: {response.text}")
+        return []
+
+    return response.json().get("value", [])
+
+
+def download_attachment(download_url):
+    response = requests.get(download_url)
+
+    if response.status_code != 200:
+        raise Exception(f"Could not download attachment: {response.text}")
+
+    return response.content
+
+
+async def send_job_attachments(app, chat_id, site_id, jobs_list_id, item_id):
+    attachments = get_item_attachments(site_id, jobs_list_id, item_id)
+
+    if not attachments:
+        return
+
+    for attachment in attachments:
+        file_name = attachment.get("name", "attachment")
+        download_url = attachment.get("@microsoft.graph.downloadUrl")
+
+        if not download_url:
+            continue
+
+        file_bytes = download_attachment(download_url)
+
+        lower_name = file_name.lower()
+
+        if lower_name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            await app.bot.send_photo(
+                chat_id=chat_id,
+                photo=file_bytes,
+                caption=file_name,
+            )
+
+        elif lower_name.endswith((".mp4", ".mov", ".avi")):
+            await app.bot.send_video(
+                chat_id=chat_id,
+                video=file_bytes,
+                caption=file_name,
+            )
+
+        else:
+            await app.bot.send_document(
+                chat_id=chat_id,
+                document=file_bytes,
+                filename=file_name,
+                caption=file_name,
+            )
 
 def build_review_text(worksheet):
     return (
@@ -935,6 +997,13 @@ async def send_new_jobs(app):
                     chat_id=engineer["telegram_id"],
                     text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
                     reply_markup=get_job_buttons(item_id),
+                )
+                await send_job_attachments(
+                    app,
+                    engineer["telegram_id"],
+                    site_id,
+                    jobs_list_id,
+                    item_id,
                 )
 
             sent_job_ids.add(item_id)
