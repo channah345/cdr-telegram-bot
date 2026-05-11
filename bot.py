@@ -7,8 +7,13 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, ConversationHandler, MessageHandler, filters
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -188,6 +193,9 @@ def get_job_buttons(item_id):
         [
             InlineKeyboardButton("No Access", callback_data=f"status|{item_id}|No Access"),
         ],
+        [
+            InlineKeyboardButton("Complete", callback_data=f"complete_help|{item_id}"),
+        ],
     ])
 
 
@@ -211,6 +219,14 @@ def find_job_by_cdr(jobs_data, cdr_number):
     for job in jobs_data:
         fields = job["fields"]
         if str(fields.get("CDRNumber", "")).lower() == cdr_number.lower():
+            return job
+
+    return None
+
+
+def find_job_by_item_id(jobs_data, item_id):
+    for job in jobs_data:
+        if str(job.get("id")) == str(item_id):
             return job
 
     return None
@@ -331,8 +347,8 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         data = query.data.split("|")
+        action = data[0]
         item_id = data[1]
-        new_status = data[2]
 
         site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
         engineers_by_telegram, _ = build_engineer_maps(engineers)
@@ -344,11 +360,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("You are not set up as an engineer.")
             return
 
-        job = None
-        for item in jobs_data:
-            if str(item.get("id")) == str(item_id):
-                job = item
-                break
+        job = find_job_by_item_id(jobs_data, item_id)
 
         if not job:
             await query.message.reply_text("Could not find this job.")
@@ -361,22 +373,38 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("You are not assigned to this job.")
             return
 
-        update_list_item_fields(site_id, jobs_list_id, item_id, {"Status": new_status})
+        if action == "complete_help":
+            cdr_number = fields.get("CDRNumber", "")
 
-        await query.message.reply_text(
-            f"Status updated:\n\n{fields.get('CDRNumber', '')} → {new_status}"
-        )
+            await query.message.reply_text(
+                f"To complete this job and submit the worksheet, type:\n\n/complete {cdr_number}"
+            )
+            return
 
-        await notify_helpdesk(
-            context,
-            (
-                f"Job status updated\n\n"
-                f"CDR Number: {fields.get('CDRNumber', '')}\n"
-                f"Engineer: {current_engineer['name']}\n"
-                f"Status: {new_status}\n"
-                f"Site: {fields.get('SiteName', '')}"
-            ),
-        )
+        if action == "status":
+            new_status = data[2]
+
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {"Status": new_status},
+            )
+
+            await query.message.reply_text(
+                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {new_status}"
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job status updated\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Status: {new_status}\n"
+                    f"Site: {fields.get('SiteName', '')}"
+                ),
+            )
 
     except Exception as e:
         print(f"ERROR updating status: {e}")
