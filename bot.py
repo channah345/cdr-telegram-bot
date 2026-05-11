@@ -604,6 +604,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if is_final_engineer:
                 update_fields["Status"] = AWAITING_DEPLOYMENT_STATUS
+                update_fields["TelegramNotified"] = False
                 update_fields.update(clear_engineer_assignment_payload())
             else:
                 update_fields.update(
