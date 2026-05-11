@@ -25,11 +25,13 @@ HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
-PHOTO_LIBRARY = "15 - ENGINEER JOB PHOTOS"
+
+PHOTO_LIBRARY = "Documents"
+PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 
 UK_TZ = ZoneInfo("Europe/London")
 
-WORK_COMPLETED, MATERIALS_USED, FOLLOW_ON_REQUIRED, FOLLOW_ON_NOTES, ENGINEER_NOTES, PHOTOS = range(6)
+WORK_COMPLETED, MATERIALS_USED, FOLLOW_ON_REQUIRED, FOLLOW_ON_NOTES, ENGINEER_NOTES, PHOTOS, REVIEW = range(7)
 
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
 
@@ -220,7 +222,6 @@ def find_job_by_cdr(jobs_data, cdr_number):
         fields = job["fields"]
         if str(fields.get("CDRNumber", "")).lower() == cdr_number.lower():
             return job
-
     return None
 
 
@@ -228,7 +229,6 @@ def find_job_by_item_id(jobs_data, item_id):
     for job in jobs_data:
         if str(job.get("id")) == str(item_id):
             return job
-
     return None
 
 
@@ -246,25 +246,49 @@ def get_drive_id(site_id, drive_name):
     raise Exception(f"Document library not found: {drive_name}")
 
 
-def ensure_photo_folder(drive_id, folder_name):
-    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
+def ensure_photo_folder(drive_id, folder_path):
+    parts = folder_path.split("/")
+    current_path = ""
 
-    body = {
-        "name": folder_name,
-        "folder": {},
-        "@microsoft.graph.conflictBehavior": "replace",
-    }
+    for part in parts:
+        current_path = f"{current_path}/{part}" if current_path else part
 
-    response = requests.post(url, headers=get_headers(), json=body)
+        check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{current_path}"
+        check_response = requests.get(check_url, headers=get_headers())
 
-    if response.status_code not in [200, 201]:
-        raise Exception(f"Could not create photo folder: {response.text}")
+        if check_response.status_code == 200:
+            continue
+
+        if check_response.status_code != 404:
+            raise Exception(f"Could not check folder {current_path}: {check_response.text}")
+
+        parent_path = "/".join(current_path.split("/")[:-1])
+
+        if parent_path:
+            create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{parent_path}:/children"
+        else:
+            create_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
+
+        body = {
+            "name": part,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "replace",
+        }
+
+        create_response = requests.post(
+            create_url,
+            headers=get_headers(),
+            json=body,
+        )
+
+        if create_response.status_code not in [200, 201]:
+            raise Exception(f"Could not create folder {current_path}: {create_response.text}")
 
 
-def upload_photo_to_sharepoint(drive_id, folder_name, file_name, file_bytes):
+def upload_photo_to_sharepoint(drive_id, folder_path, file_name, file_bytes):
     url = (
         f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:"
-        f"/{folder_name}/{file_name}:/content"
+        f"/{folder_path}/{file_name}:/content"
     )
 
     response = requests.put(
@@ -277,6 +301,21 @@ def upload_photo_to_sharepoint(drive_id, folder_name, file_name, file_bytes):
         raise Exception(f"Could not upload photo: {response.text}")
 
     return response.json().get("webUrl", "")
+
+
+def build_review_text(worksheet):
+    return (
+        f"Please review worksheet for {worksheet['cdr_number']}:\n\n"
+        f"Work completed:\n{worksheet.get('WorkCompleted', '')}\n\n"
+        f"Materials used:\n{worksheet.get('MaterialsUsed', '')}\n\n"
+        f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
+        f"Follow-on notes:\n{worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
+        f"Engineer notes:\n{worksheet.get('EngineerCompletionNotes', '')}\n\n"
+        f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n\n"
+        f"Type SUBMIT to complete the job.\n"
+        f"Type RESTART to redo the worksheet.\n"
+        f"Type CANCEL to abandon it."
+    )
 
 
 async def notify_helpdesk(context, text):
@@ -375,7 +414,6 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "complete_help":
             cdr_number = fields.get("CDRNumber", "")
-
             await query.message.reply_text(
                 f"To complete this job and submit the worksheet, type:\n\n/complete {cdr_number}"
             )
@@ -455,7 +493,9 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         await update.message.reply_text(
-            f"Starting worksheet for {cdr_number}.\n\nWhat work was completed?"
+            f"Starting worksheet for {cdr_number}.\n\n"
+            f"You can type /cancel at any point before submitting.\n\n"
+            f"What work was completed?"
         )
 
         return WORK_COMPLETED
@@ -507,7 +547,9 @@ async def worksheet_engineer_notes(update: Update, context: ContextTypes.DEFAULT
     context.user_data["worksheet"]["EngineerCompletionNotes"] = update.message.text
 
     await update.message.reply_text(
-        "Upload job photos now.\n\nSend one or more photos, then type DONE when finished."
+        "Upload job photos now.\n\n"
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
     )
 
     return PHOTOS
@@ -517,6 +559,70 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worksheet = context.user_data["worksheet"]
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
+        await update.message.reply_text(build_review_text(worksheet))
+        return REVIEW
+
+    if update.message.photo:
+        site_id = worksheet["site_id"]
+        cdr_number = worksheet["cdr_number"]
+
+        drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
+
+        folder_path = f"{PHOTO_BASE_FOLDER}/{cdr_number}"
+        ensure_photo_folder(drive_id, folder_path)
+
+        photo = update.message.photo[-1]
+        telegram_file = await context.bot.get_file(photo.file_id)
+        file_bytes = await telegram_file.download_as_bytearray()
+
+        timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
+        file_name = f"{cdr_number}_{timestamp}_{photo.file_unique_id}.jpg"
+
+        photo_link = upload_photo_to_sharepoint(
+            drive_id,
+            folder_path,
+            file_name,
+            bytes(file_bytes),
+        )
+
+        worksheet["photo_links"].append(photo_link)
+
+        await update.message.reply_text(
+            f"Photo uploaded. Total photos: {len(worksheet['photo_links'])}\n\n"
+            f"Send another photo or type DONE."
+        )
+
+        return PHOTOS
+
+    await update.message.reply_text("Please send a photo or type DONE.")
+    return PHOTOS
+
+
+async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip().upper()
+    worksheet = context.user_data["worksheet"]
+
+    if answer == "CANCEL":
+        context.user_data.pop("worksheet", None)
+        await update.message.reply_text("Worksheet cancelled. Nothing has been submitted.")
+        return ConversationHandler.END
+
+    if answer == "RESTART":
+        worksheet["WorkCompleted"] = ""
+        worksheet["MaterialsUsed"] = ""
+        worksheet["FollowOnRequired"] = False
+        worksheet["FollowOnNotes"] = ""
+        worksheet["EngineerCompletionNotes"] = ""
+        worksheet["photo_links"] = []
+
+        await update.message.reply_text(
+            f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
+            f"What work was completed?"
+        )
+
+        return WORK_COMPLETED
+
+    if answer == "SUBMIT":
         fields_to_update = {
             "WorkCompleted": worksheet.get("WorkCompleted", ""),
             "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
@@ -551,42 +657,13 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("worksheet", None)
         return ConversationHandler.END
 
-    if update.message.photo:
-        site_id = worksheet["site_id"]
-        cdr_number = worksheet["cdr_number"]
-
-        drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
-        ensure_photo_folder(drive_id, cdr_number)
-
-        photo = update.message.photo[-1]
-        telegram_file = await context.bot.get_file(photo.file_id)
-        file_bytes = await telegram_file.download_as_bytearray()
-
-        timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
-        file_name = f"{cdr_number}_{timestamp}_{photo.file_unique_id}.jpg"
-
-        photo_link = upload_photo_to_sharepoint(
-            drive_id,
-            cdr_number,
-            file_name,
-            bytes(file_bytes),
-        )
-
-        worksheet["photo_links"].append(photo_link)
-
-        await update.message.reply_text(
-            f"Photo uploaded. Total photos: {len(worksheet['photo_links'])}\n\nSend another photo or type DONE."
-        )
-
-        return PHOTOS
-
-    await update.message.reply_text("Please send a photo or type DONE.")
-    return PHOTOS
+    await update.message.reply_text("Please type SUBMIT, RESTART or CANCEL.")
+    return REVIEW
 
 
 async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("worksheet", None)
-    await update.message.reply_text("Worksheet cancelled.")
+    await update.message.reply_text("Worksheet cancelled. Nothing has been submitted.")
     return ConversationHandler.END
 
 
@@ -668,6 +745,7 @@ worksheet_handler = ConversationHandler(
             MessageHandler(filters.PHOTO, worksheet_photos),
             MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_photos),
         ],
+        REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_review)],
     },
     fallbacks=[CommandHandler("cancel", worksheet_cancel)],
 )
