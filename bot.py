@@ -1069,8 +1069,8 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
     start_day["question_index"] = 0
 
     await update.message.reply_text(
-        f"Start mileage recorded: {mileage}\\n\\n"
-        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:\\n"
+        f"Start mileage recorded: {mileage}\n\n"
+        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:\n"
         f"{VAN_CHECK_QUESTIONS[0]}"
     )
 
