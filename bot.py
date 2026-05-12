@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-reassign-job-v1"
+BUILD_VERSION = "helpdesk-find-job-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -131,6 +131,9 @@ REASSIGN_REMOVE_ENGINEERS = 42
 REASSIGN_ASSIGN_ENGINEERS = 43
 REASSIGN_REASON = 44
 REASSIGN_REVIEW = 45
+
+FINDJOB_SEARCH = 46
+FINDJOB_SELECT = 47
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -2464,6 +2467,12 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_LOG_JOB:
         return await logjob_start(update, context)
 
+    if text == MENU_REASSIGN_JOB:
+        return await reassign_start(update, context)
+
+    if text == MENU_FIND_JOB:
+        return await findjob_start(update, context)
+
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
@@ -3069,6 +3078,245 @@ async def reassign_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("reassign_job", None)
     await update.message.reply_text(
         "Reassign Job cancelled. Nothing has been changed.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+    )
+    return ConversationHandler.END
+
+
+def job_matches_search(fields, search_text):
+    needle = normalise_cdr(search_text)
+    loose_needle = str(search_text or "").strip().lower()
+
+    if not needle and not loose_needle:
+        return False
+
+    searchable_values = [
+        fields.get("CDRNumber", ""),
+        fields.get("Title", ""),
+        fields.get("CustomerName", ""),
+        fields.get("Customer Name", ""),
+        fields.get("SiteName", ""),
+        fields.get("Site Name", ""),
+        fields.get("Address", ""),
+        fields.get("Task", ""),
+        fields.get("Notes", ""),
+        fields.get("ContactName", ""),
+        fields.get("Contact Name", ""),
+        fields.get("CustomerOrderNumber", ""),
+        fields.get("Customer Order Number", ""),
+        fields.get("JobCategory", ""),
+        fields.get("Job Category", ""),
+        fields.get("Status", ""),
+        fields.get("JobOutcome", ""),
+    ]
+
+    for value in searchable_values:
+        text = str(value or "").lower()
+        if loose_needle and loose_needle in text:
+            return True
+        if needle and needle in normalise_cdr(value):
+            return True
+
+    return False
+
+
+def search_jobs_for_helpdesk(jobs_data, search_text, limit=10):
+    matches = []
+
+    # Exact CDR/Title matches first.
+    exact = find_job_by_cdr(jobs_data, search_text)
+    if exact:
+        matches.append(exact)
+
+    seen_ids = {str(item.get("id")) for item in matches}
+
+    for item in jobs_data:
+        if str(item.get("id")) in seen_ids:
+            continue
+        fields = item.get("fields", {})
+        if job_matches_search(fields, search_text):
+            matches.append(item)
+            seen_ids.add(str(item.get("id")))
+        if len(matches) >= limit:
+            break
+
+    return matches
+
+
+def format_job_search_results(matches):
+    lines = [f"Found {len(matches)} matching job(s):"]
+
+    for index, item in enumerate(matches, start=1):
+        fields = item.get("fields", {})
+        cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "No CDR"
+        site = get_field_value(fields, "SiteName", "Site Name") or "No site"
+        date = format_sharepoint_date(get_field_value(fields, "Date") or "") or "No date"
+        status = get_field_value(fields, "Status") or "No status"
+        outcome = get_field_value(fields, "JobOutcome", "Job Outcome") or ""
+        outcome_text = f" | {outcome}" if outcome else ""
+        lines.append(f"{index}. {cdr} | {site} | {date} | {status}{outcome_text}")
+
+    lines.append("\nReply with the number to view full details, or type SEARCH to search again.")
+    return "\n".join(lines)
+
+
+def format_helpdesk_job_detail(job, engineers):
+    fields = job.get("fields", {})
+    assigned = get_current_assigned_engineers_from_job(fields, engineers)
+    assigned_names = ", ".join(e["name"] for e in assigned) or "None"
+    visit_log = str(get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or "").strip()
+    visit_lines = [line for line in visit_log.splitlines() if line.strip()]
+    if visit_lines:
+        visit_text = "\n".join(visit_lines[-8:])
+    else:
+        visit_text = "No visit log yet."
+
+    worksheet_link = get_field_value(fields, "WorksheetLink", "Worksheet Link", "WorksheetPDF", "Worksheet PDF") or ""
+    signature_received = "Yes" if bool_field(get_field_value(fields, "ClientSignatureReceived", "Client Signature Received")) else "No"
+
+    return (
+        "Job details:\n\n"
+        f"CDR Number: {get_field_value(fields, 'CDRNumber', 'CDR Number', 'Title') or ''}\n"
+        f"Customer: {get_field_value(fields, 'CustomerName', 'Customer Name') or ''}\n"
+        f"Customer Address: {get_field_value(fields, 'CustomerAddress', 'Customer Address') or ''}\n"
+        f"Site: {get_field_value(fields, 'SiteName', 'Site Name') or ''}\n"
+        f"Address: {get_field_value(fields, 'Address') or ''}\n"
+        f"Date: {format_sharepoint_date(get_field_value(fields, 'Date') or '')}\n"
+        f"Time: {get_field_value(fields, 'StartTime', 'Start Time') or ''}\n"
+        f"Status: {get_field_value(fields, 'Status') or ''}\n"
+        f"Outcome: {get_field_value(fields, 'JobOutcome', 'Job Outcome') or ''}\n"
+        f"Assigned engineer(s): {assigned_names}\n"
+        f"Contact: {get_field_value(fields, 'ContactName', 'Contact Name') or ''}\n"
+        f"Task: {get_field_value(fields, 'Task') or ''}\n"
+        f"Notes: {get_field_value(fields, 'Notes') or ''}\n"
+        f"Order Number: {get_field_value(fields, 'CustomerOrderNumber', 'Customer Order Number') or ''}\n"
+        f"Category: {get_field_value(fields, 'JobCategory', 'Job Category') or ''}\n"
+        f"Telegram Notified: {'Yes' if is_notified(fields) else 'No'}\n"
+        f"Client Signature Received: {signature_received}\n"
+        f"Worksheet Link: {worksheet_link or 'None'}\n\n"
+        "Recent visit log:\n"
+        f"{visit_text}\n\n"
+        "Next actions:\n"
+        "- Use 🔁 Reassign Job to change/send engineers.\n"
+        "- Use 🔎 Find Job again to search another job."
+    )
+
+
+async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to find jobs.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+
+        context.user_data["find_job"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "role": role,
+        }
+
+        await update.message.reply_text(
+            "Find job.\n\nEnter a CDR number, site name, customer, address, order number, status, or keyword.\n\nExample: CDR012896 or Headquarters",
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return FINDJOB_SEARCH
+
+    except Exception as e:
+        print(f"ERROR opening Find Job: {e}")
+        await update.message.reply_text(
+            "There was an error opening Find Job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def findjob_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("find_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔎 Find Job.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if is_blank_or_skip(text):
+        await update.message.reply_text("Please enter a CDR number, site/customer name, address or keyword.")
+        return FINDJOB_SEARCH
+
+    try:
+        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        matches = search_jobs_for_helpdesk(jobs_data, text, limit=10)
+
+        if not matches:
+            await update.message.reply_text(
+                "No jobs found for that search. Try a CDR number, site name, customer name, address, order number or keyword."
+            )
+            return FINDJOB_SEARCH
+
+        data["matches"] = matches
+        data["last_search"] = text
+
+        if len(matches) == 1:
+            await update.message.reply_text(
+                format_helpdesk_job_detail(matches[0], data.get("engineers", [])),
+                reply_markup=get_helpdesk_menu(include_engineer_menu=(data.get("role", "").lower() == "admin")),
+            )
+            context.user_data.pop("find_job", None)
+            return ConversationHandler.END
+
+        await update.message.reply_text(format_job_search_results(matches))
+        return FINDJOB_SELECT
+
+    except Exception as e:
+        print(f"ERROR searching jobs: {e}")
+        await update.message.reply_text("There was an error searching jobs. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def findjob_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("find_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔎 Find Job.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip().lower()
+    if text in ["search", "new", "again", "restart"]:
+        await update.message.reply_text("Enter a new CDR number, site/customer name, address, order number or keyword.")
+        return FINDJOB_SEARCH
+
+    if not text.isdigit():
+        await update.message.reply_text("Reply with a job number from the list, or type SEARCH to search again.")
+        return FINDJOB_SELECT
+
+    index = int(text)
+    matches = data.get("matches", [])
+    if index < 1 or index > len(matches):
+        await update.message.reply_text("That number is not in the list. Reply with one of the job numbers shown.")
+        return FINDJOB_SELECT
+
+    selected_job = matches[index - 1]
+    role = data.get("role", "Helpdesk")
+    await update.message.reply_text(
+        format_helpdesk_job_detail(selected_job, data.get("engineers", [])),
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+    )
+    context.user_data.pop("find_job", None)
+    return ConversationHandler.END
+
+
+async def findjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("find_job", None)
+    await update.message.reply_text(
+        "Find Job cancelled.",
         reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
     )
     return ConversationHandler.END
@@ -5032,6 +5280,19 @@ reassign_handler = ConversationHandler(
 )
 
 
+findjob_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("findjob", findjob_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_FIND_JOB)}$"), findjob_start),
+    ],
+    states={
+        FINDJOB_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, findjob_search)],
+        FINDJOB_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, findjob_select)],
+    },
+    fallbacks=[CommandHandler("cancel", findjob_cancel)],
+)
+
+
 logjob_handler = ConversationHandler(
     entry_points=[
         CommandHandler("logjob", logjob_start),
@@ -5066,6 +5327,7 @@ telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(reassign_handler)
+telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_EMERGENCY_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
