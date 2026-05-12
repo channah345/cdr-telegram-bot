@@ -39,6 +39,7 @@ DAY_LOGS_LIST = "Engineer Day Logs"
 PHOTO_LIBRARY = "Documents"
 PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 SIGNATURE_BASE_FOLDER = "16 - CLIENT SIGNATURES"
+VAN_CHECK_PHOTO_BASE_FOLDER = "17 - VAN CHECK PHOTOS"
 
 DAY_ACTIVE_STATUS = "Active"
 DAY_CLOSED_STATUS = "Closed"
@@ -66,8 +67,19 @@ SIGNATURE_REQUIRED = 6
 SIGNATURE_WAITING = 7
 REVIEW = 8
 
-START_DAY_MILEAGE = 20
-END_DAY_MILEAGE = 21
+START_DAY_VAN_REG = 20
+START_DAY_VAN_CHECK = 21
+START_DAY_VAN_PHOTOS = 22
+END_DAY_MILEAGE = 23
+
+VAN_CHECK_QUESTIONS = [
+    "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
+    "Are all lights working? Reply Yes or No.",
+    "Are windscreen, mirrors and wipers okay? Reply Yes or No.",
+    "Is there any new visible damage to the van? Reply No, or describe the damage.",
+    "Is the van clean, tidy and safe to work from? Reply Yes or No.",
+    "Any defects or issues to report? Reply No, or describe the issue.",
+]
 
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
 
@@ -300,6 +312,22 @@ def get_main_menu():
 
 def get_today_iso():
     return datetime.now(UK_TZ).date().isoformat()
+
+
+def safe_folder_name(value):
+    cleaned = "".join(ch for ch in str(value).strip().upper() if ch.isalnum() or ch in ["-", "_"])
+    return cleaned or "UNKNOWN"
+
+
+def upload_van_check_photo_to_sharepoint(site_id, work_date, van_reg, file_name, file_bytes):
+    folder_name = f"{work_date}/{safe_folder_name(van_reg)}"
+    return upload_file_to_sharepoint(
+        site_id,
+        VAN_CHECK_PHOTO_BASE_FOLDER,
+        folder_name,
+        file_name,
+        file_bytes,
+    )
 
 
 def get_engineer_for_telegram_id(telegram_id):
@@ -773,13 +801,15 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "engineer_name": current_engineer["name"],
             "engineer_lookup_id": current_engineer["lookup_id"],
             "engineer_telegram_id": user_id,
+            "work_date": get_today_iso(),
+            "van_check_answers": [],
+            "van_photo_links": [],
         }
 
         await update.message.reply_text(
-            "Starting your day. Please enter your start mileage.\n\n"
-            "If you do not need to record mileage, type 0."
+            "Starting your day. Please enter the van registration."
         )
-        return START_DAY_MILEAGE
+        return START_DAY_VAN_REG
 
     except Exception as e:
         print(f"ERROR starting day: {e}")
@@ -790,45 +820,136 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 
-async def startday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_day = context.user_data.get("start_day")
+
+    if not start_day:
+        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    van_reg = update.message.text.strip().upper()
+
+    if not van_reg:
+        await update.message.reply_text("Please enter the van registration.")
+        return START_DAY_VAN_REG
+
+    start_day["van_reg"] = van_reg
+    start_day["question_index"] = 0
+
+    await update.message.reply_text(
+        f"Van registration recorded: {van_reg}\n\n"
+        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:\n"
+        f"{VAN_CHECK_QUESTIONS[0]}"
+    )
+    return START_DAY_VAN_CHECK
+
+
+async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_day = context.user_data.get("start_day")
+
+    if not start_day:
+        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    answer = update.message.text.strip()
+    question_index = start_day.get("question_index", 0)
+    question = VAN_CHECK_QUESTIONS[question_index]
+
+    if not answer:
+        await update.message.reply_text("Please enter an answer.")
+        return START_DAY_VAN_CHECK
+
+    start_day["van_check_answers"].append(f"{question}\nAnswer: {answer}")
+    question_index += 1
+    start_day["question_index"] = question_index
+
+    if question_index < len(VAN_CHECK_QUESTIONS):
+        await update.message.reply_text(
+            f"Van check {question_index + 1} of {len(VAN_CHECK_QUESTIONS)}:\n"
+            f"{VAN_CHECK_QUESTIONS[question_index]}"
+        )
+        return START_DAY_VAN_CHECK
+
+    await update.message.reply_text(
+        "Van check questions complete. Upload van photos now.\n\n"
+        "Send one or more photos, then type DONE when finished."
+    )
+    return START_DAY_VAN_PHOTOS
+
+
+async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        mileage = update.message.text.strip()
         start_day = context.user_data.get("start_day")
 
         if not start_day:
             await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
             return ConversationHandler.END
 
-        item = create_list_item_fields(
-            start_day["site_id"],
-            start_day["day_logs_list_id"],
-            {
-                "Title": f"{start_day['engineer_name']} - {get_today_iso()}",
-                "EngineerName": start_day["engineer_name"],
-                "EngineerTelegramID": start_day["engineer_telegram_id"],
-                "EngineerLookupID": start_day["engineer_lookup_id"],
-                "WorkDate": get_today_iso(),
-                "StartTime": graph_datetime_now(),
-                "StartMileage": mileage,
-                "Status": DAY_ACTIVE_STATUS,
-            },
-        )
+        if update.message.text and update.message.text.strip().upper() == "DONE":
+            item = create_list_item_fields(
+                start_day["site_id"],
+                start_day["day_logs_list_id"],
+                {
+                    "Title": f"{start_day['engineer_name']} - {start_day['work_date']}",
+                    "EngineerName": start_day["engineer_name"],
+                    "EngineerTelegramID": start_day["engineer_telegram_id"],
+                    "EngineerLookupID": start_day["engineer_lookup_id"],
+                    "WorkDate": start_day["work_date"],
+                    "StartTime": graph_datetime_now(),
+                    "VanRegistration": start_day.get("van_reg", ""),
+                    "VanCheckCompleted": True,
+                    "VanCheckAnswers": "\n\n".join(start_day.get("van_check_answers", [])),
+                    "VanPhotoLinks": "\n".join(start_day.get("van_photo_links", [])),
+                    "Status": DAY_ACTIVE_STATUS,
+                },
+            )
 
-        context.user_data.pop("start_day", None)
+            context.user_data.pop("start_day", None)
 
-        await update.message.reply_text(
-            "Day started. Your jobs are now unlocked. Tap 📋 My Jobs to view today's work.",
-            reply_markup=get_main_menu(),
-        )
-        return ConversationHandler.END
+            await update.message.reply_text(
+                "Van check completed and day started. Your jobs are now unlocked. Tap 📋 My Jobs to view today's work.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        if update.message.photo:
+            photo = update.message.photo[-1]
+            telegram_file = await context.bot.get_file(photo.file_id)
+            file_bytes = await telegram_file.download_as_bytearray()
+
+            timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
+            file_name = f"{safe_folder_name(start_day.get('van_reg', 'VAN'))}_{timestamp}_{photo.file_unique_id}.jpg"
+
+            photo_link = upload_van_check_photo_to_sharepoint(
+                start_day["site_id"],
+                start_day["work_date"],
+                start_day.get("van_reg", "VAN"),
+                file_name,
+                bytes(file_bytes),
+            )
+
+            start_day["van_photo_links"].append(photo_link)
+            await update.message.reply_text(
+                f"Photo uploaded ({len(start_day['van_photo_links'])}). Send another photo or type DONE."
+            )
+            return START_DAY_VAN_PHOTOS
+
+        await update.message.reply_text("Please send a photo or type DONE.")
+        return START_DAY_VAN_PHOTOS
 
     except Exception as e:
-        print(f"ERROR saving start day: {e}")
+        print(f"ERROR saving van check/start day: {e}")
         await update.message.reply_text(
-            "There was an error saving your start day record. Please ask the office to check Railway logs.",
+            "There was an error saving the van check. Please ask the office to check Railway logs.",
             reply_markup=get_main_menu(),
         )
         return ConversationHandler.END
+
+
+async def startday_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("start_day", None)
+    await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu())
+    return ConversationHandler.END
 
 
 async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1655,9 +1776,14 @@ startday_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{MENU_START_DAY}$"), startday_start),
     ],
     states={
-        START_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_mileage)],
+        START_DAY_VAN_REG: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_reg)],
+        START_DAY_VAN_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_check)],
+        START_DAY_VAN_PHOTOS: [
+            MessageHandler(filters.PHOTO, startday_van_photos),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_photos),
+        ],
     },
-    fallbacks=[CommandHandler("cancel", worksheet_cancel)],
+    fallbacks=[CommandHandler("cancel", startday_cancel)],
 )
 
 endday_handler = ConversationHandler(
