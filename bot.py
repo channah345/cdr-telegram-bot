@@ -755,11 +755,40 @@ def should_auto_send_job(fields):
     return True
 
 
+
+def normalise_cdr(value):
+    """
+    Makes CDR matching forgiving:
+    - ignores case
+    - trims spaces
+    - removes common prefixes like CDR:
+    - ignores spaces/hyphens/underscores
+    """
+    value = str(value or "").strip().lower()
+
+    for prefix in ["cdr:", "cdr number:", "cdrnumber:"]:
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+
+    value = value.replace(" ", "").replace("-", "").replace("_", "")
+    return value
+
+
 def find_job_by_cdr(jobs_data, cdr_number):
-    for job in jobs_data:
-        fields = job["fields"]
-        if str(fields.get("CDRNumber", "")).lower() == cdr_number.lower():
-            return job
+    target = normalise_cdr(cdr_number)
+
+    for item in jobs_data:
+        fields = item.get("fields", {})
+        possible_values = [
+            fields.get("CDRNumber", ""),
+            fields.get("Title", ""),
+            fields.get("JobTitle", ""),
+        ]
+
+        for value in possible_values:
+            if normalise_cdr(value) == target:
+                return item
+
     return None
 
 
@@ -876,7 +905,7 @@ def get_job_by_cdr_and_token(cdr_number, token):
     for job in jobs_data:
         fields = job["fields"]
         if (
-            str(fields.get("CDRNumber", "")).lower() == cdr_number.lower()
+            normalise_cdr(fields.get("CDRNumber", "")) == normalise_cdr(cdr_number)
             and str(fields.get("SignatureToken", "")) == str(token)
         ):
             return site_id, jobs_list_id, job
@@ -2058,6 +2087,28 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("There was an error updating the job status.")
 
 
+
+def can_start_completion(fields, engineer_name):
+    status = str(fields.get("Status", "") or "").strip()
+    outcome = str(fields.get("JobOutcome", "") or "").strip()
+
+    if outcome in ["Completed", "No Access", "Revisit Required"]:
+        return False, "This job has already been closed or returned to the office. No further action is required."
+
+    if status in ["Completed", "No Access", "Revisit Required"]:
+        return False, "This job has already been closed or returned to the office. No further action is required."
+
+    # Completion is allowed from On Site. Also allow Travelling as a fallback,
+    # but the normal path should still be Travelling > On Site > Complete.
+    if status not in ["On Site", "Travelling", ASSIGNED_STATUS, AWAITING_DEPLOYMENT_STATUS, LEGACY_AWAITING_DEPLOYMENT_STATUS, ""]:
+        return False, f"This job is currently marked as {status}. It cannot be completed from this status."
+
+    if not engineer_has_logged(fields, engineer_name, "On Site"):
+        return False, "You need to click On Site before completing this job."
+
+    return True, ""
+
+
 async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not context.args:
@@ -2089,7 +2140,7 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job = find_job_by_cdr(jobs_data, cdr_number)
 
         if not job:
-            await update.message.reply_text(f"No job found with CDR number: {cdr_number}")
+            await update.message.reply_text(f"No job found with CDR number: {cdr_number}. Check the CDR number exactly as shown on the job card.")
             return ConversationHandler.END
 
         fields = job["fields"]
