@@ -67,10 +67,12 @@ SIGNATURE_REQUIRED = 6
 SIGNATURE_WAITING = 7
 REVIEW = 8
 
+START_DAY_CONFIRM = 19
 START_DAY_VAN_REG = 20
 START_DAY_VAN_CHECK = 21
 START_DAY_VAN_PHOTOS = 22
-END_DAY_MILEAGE = 23
+END_DAY_CONFIRM = 23
+END_DAY_MILEAGE = 24
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -431,6 +433,58 @@ def get_active_day_for_engineer(site_id, telegram_id):
 def engineer_has_active_day(site_id, telegram_id):
     _, active_day = get_active_day_for_engineer(site_id, telegram_id)
     return active_day is not None
+
+
+def normalise_mileage(value):
+    mileage = str(value or "").strip().replace(",", "")
+
+    try:
+        number = float(mileage)
+    except Exception:
+        return None
+
+    if number < 0:
+        return None
+
+    if number.is_integer():
+        return str(int(number))
+
+    return str(number)
+
+
+def get_open_jobs_for_engineer_today(jobs_data, engineer_lookup_id):
+    today = datetime.now(UK_TZ).date()
+    open_jobs = []
+
+    for job in jobs_data:
+        fields = job.get("fields", {})
+        job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
+        assigned_ids = get_assigned_engineer_ids(fields)
+
+        if str(engineer_lookup_id) in assigned_ids and job_date == today:
+            status = str(fields.get("Status", ""))
+            outcome = str(fields.get("JobOutcome", ""))
+
+            if status != COMPLETED_STATUS and outcome not in ["Completed", "No Access", "Revisit Required"]:
+                open_jobs.append(job)
+
+    return open_jobs
+
+
+def format_open_jobs_for_end_day(open_jobs):
+    lines = []
+
+    for job in open_jobs[:8]:
+        fields = job.get("fields", {})
+        cdr = fields.get("CDRNumber", "")
+        site = fields.get("SiteName", "")
+        status = fields.get("Status", "")
+        lines.append(f"- {cdr} | {site} | {status}")
+
+    if len(open_jobs) > 8:
+        lines.append(f"...and {len(open_jobs) - 8} more")
+
+    return "\n".join(lines)
 
 
 def get_assigned_engineer_ids(fields):
@@ -864,9 +918,9 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         await update.message.reply_text(
-            "Starting your day. Please enter the van registration."
+            "Are you sure you want to start your day? Reply Yes or No."
         )
-        return START_DAY_VAN_REG
+        return START_DAY_CONFIRM
 
     except Exception as e:
         print(f"ERROR starting day: {e}")
@@ -875,6 +929,22 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_menu(),
         )
         return ConversationHandler.END
+
+
+async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip().lower()
+
+    if answer not in ["yes", "no", "y", "n"]:
+        await update.message.reply_text("Please reply Yes or No.")
+        return START_DAY_CONFIRM
+
+    if answer in ["no", "n"]:
+        context.user_data.pop("start_day", None)
+        await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    await update.message.reply_text("Starting your day. Please enter the van registration.")
+    return START_DAY_VAN_REG
 
 
 async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1056,18 +1126,30 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
+        _, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        open_jobs = get_open_jobs_for_engineer_today(jobs_data, current_engineer["lookup_id"])
+
+        if open_jobs:
+            await update.message.reply_text(
+                "You cannot end your day while you still have job(s) assigned for today. "
+                "Complete them, mark No Access, or mark Revisit Required first.\n\n"
+                f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
         context.user_data["end_day"] = {
             "site_id": site_id,
             "day_logs_list_id": day_logs_list_id,
             "day_log_item_id": active_day["id"],
             "engineer_name": current_engineer["name"],
+            "engineer_lookup_id": current_engineer["lookup_id"],
         }
 
         await update.message.reply_text(
-            "Ending your day. Please enter your end mileage.\n\n"
-            "If you do not need to record mileage, type 0."
+            "Are you sure you want to end your day? Reply Yes or No."
         )
-        return END_DAY_MILEAGE
+        return END_DAY_CONFIRM
 
     except Exception as e:
         print(f"ERROR ending day: {e}")
@@ -1078,13 +1160,53 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 
+async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.message.text.strip().lower()
+
+    if answer not in ["yes", "no", "y", "n"]:
+        await update.message.reply_text("Please reply Yes or No.")
+        return END_DAY_CONFIRM
+
+    if answer in ["no", "n"]:
+        context.user_data.pop("end_day", None)
+        await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Please enter your end mileage as a number.\n\n"
+        "If you do not need to record mileage, type 0."
+    )
+    return END_DAY_MILEAGE
+
+
 async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        mileage = update.message.text.strip()
+        mileage = normalise_mileage(update.message.text)
+
+        if mileage is None:
+            await update.message.reply_text(
+                "Please enter mileage as numbers only. Example: 15234 or 0."
+            )
+            return END_DAY_MILEAGE
+
         end_day = context.user_data.get("end_day")
 
         if not end_day:
             await update.message.reply_text("Please try /endday again.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        # Re-check assigned jobs before closing the day in case one was added while the engineer was in the end-day flow.
+        site_id, _, _, engineers, jobs_data = get_sharepoint_data()
+        open_jobs = get_open_jobs_for_engineer_today(jobs_data, end_day["engineer_lookup_id"])
+
+        if open_jobs:
+            context.user_data.pop("end_day", None)
+            await update.message.reply_text(
+                "Your day has not been ended because you still have job(s) assigned for today. "
+                "Complete them, mark No Access, or mark Revisit Required first.\n\n"
+                f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}",
+                reply_markup=get_main_menu(),
+            )
             return ConversationHandler.END
 
         end_day_fields = build_field_payload_for_list(
@@ -1867,6 +1989,7 @@ startday_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{MENU_START_DAY}$"), startday_start),
     ],
     states={
+        START_DAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_confirm)],
         START_DAY_VAN_REG: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_reg)],
         START_DAY_VAN_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_check)],
         START_DAY_VAN_PHOTOS: [
@@ -1883,6 +2006,7 @@ endday_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{MENU_END_DAY}$"), endday_start),
     ],
     states={
+        END_DAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_confirm)],
         END_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_mileage)],
     },
     fallbacks=[CommandHandler("cancel", worksheet_cancel)],
