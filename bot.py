@@ -58,6 +58,8 @@ UK_TZ = ZoneInfo("Europe/London")
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
 LEGACY_AWAITING_DEPLOYMENT_STATUS = "Awaiting Deployment"
 ASSIGNED_STATUS = "Assigned"
+TRAVELLING_STATUS = "Travelling"
+ON_SITE_STATUS = "On Site"
 COMPLETED_STATUS = "Completed"
 
 WORK_COMPLETED = 0
@@ -652,8 +654,8 @@ def is_closed_job(fields):
         AWAITING_DEPLOYMENT_STATUS,
         LEGACY_AWAITING_DEPLOYMENT_STATUS,
         ASSIGNED_STATUS,
-        TRAVELLING_STATUS,
-        ON_SITE_STATUS,
+        "Travelling",
+        "On Site",
     }
 
     closed_statuses = {
