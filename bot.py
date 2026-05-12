@@ -2,6 +2,7 @@ import os
 import base64
 import secrets
 import threading
+import warnings
 import requests
 import msal
 from datetime import datetime
@@ -11,6 +12,16 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+try:
+    from telegram.warnings import PTBUserWarning
+except Exception:
+    PTBUserWarning = Warning
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*CallbackQueryHandler will not be tracked for every message.*",
+    category=PTBUserWarning,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -552,7 +563,9 @@ def get_open_jobs_for_engineer_today(jobs_data, engineer_lookup_id):
             status = str(fields.get("Status", ""))
             outcome = str(fields.get("JobOutcome", ""))
 
-            if status != COMPLETED_STATUS and outcome not in ["Completed", "No Access", "Revisit Required"]:
+            # A previous No Access/Revisit outcome must not stop a re-dispatched job
+            # being treated as open once the office has assigned an engineer again.
+            if status != COMPLETED_STATUS and outcome != "Completed":
                 open_jobs.append(job)
 
     return open_jobs
@@ -650,7 +663,6 @@ def format_job(fields, engineer_name=None):
 def is_closed_job(fields):
     status = str(fields.get("Status", "") or "").strip()
     outcome = str(fields.get("JobOutcome", "") or "").strip()
-    worksheet_submitted = bool_field(fields.get("WorksheetSubmitted"))
 
     open_statuses = {
         "",
@@ -661,28 +673,17 @@ def is_closed_job(fields):
         "On Site",
     }
 
-    closed_statuses = {
-        COMPLETED_STATUS,
-        "No Access",
-        "Revisit Required",
-    }
+    # Completed is always final, even if SharePoint still shows an old live status.
+    if status == COMPLETED_STATUS or outcome == "Completed":
+        return True
 
-    closed_outcomes = {
-        "Completed",
-        "No Access",
-        "Revisit Required",
-    }
-
-    # Multi-engineer logic:
-    # WorksheetSubmitted can be true when ONE engineer has completed
-    # their worksheet, but the overall job must remain active for
-    # the remaining assigned engineers.
-    #
-    # Therefore WorksheetSubmitted must NOT close the entire job.
-    if status in open_statuses and outcome not in closed_outcomes:
+    # No Access/Revisit are only final while the job is sitting back with the office.
+    # If the office reassigns the job, the status becomes an open/dispatch status again
+    # and the previous outcome remains as audit history, not a blocker.
+    if status in open_statuses:
         return False
 
-    return status in closed_statuses or outcome in closed_outcomes
+    return status in ["No Access", "Revisit Required"] or outcome in ["No Access", "Revisit Required"]
 
 
 def has_engineer_action(fields, engineer_name, action):
@@ -756,7 +757,10 @@ def should_auto_send_job(fields):
     if status not in allowed_statuses:
         return False
 
-    if outcome in ["Completed", "No Access", "Revisit Required"]:
+    # Only Completed blocks automatic dispatch permanently.
+    # No Access/Revisit may be previous outcomes and must allow re-dispatch
+    # once the office assigns an engineer again and TelegramNotified is False.
+    if outcome == "Completed":
         return False
 
     return True
@@ -2216,7 +2220,10 @@ def can_start_completion(fields, engineer_name):
     status = str(fields.get("Status", "") or "").strip()
     outcome = str(fields.get("JobOutcome", "") or "").strip()
 
-    if outcome in ["Completed", "No Access", "Revisit Required"]:
+    # Only Completed blocks automatic dispatch permanently.
+    # No Access/Revisit may be previous outcomes and must allow re-dispatch
+    # once the office assigns an engineer again and TelegramNotified is False.
+    if outcome == "Completed":
         return False, "This job has already been closed or returned to the office. No further action is required."
 
     if status in ["Completed", "No Access", "Revisit Required"]:
