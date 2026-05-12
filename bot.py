@@ -647,11 +647,13 @@ def is_closed_job(fields):
     outcome = str(fields.get("JobOutcome", "") or "").strip()
     worksheet_submitted = bool_field(fields.get("WorksheetSubmitted"))
 
-    dispatch_statuses = {
+    open_statuses = {
         "",
         AWAITING_DEPLOYMENT_STATUS,
         LEGACY_AWAITING_DEPLOYMENT_STATUS,
         ASSIGNED_STATUS,
+        TRAVELLING_STATUS,
+        ON_SITE_STATUS,
     }
 
     closed_statuses = {
@@ -666,9 +668,9 @@ def is_closed_job(fields):
         "Revisit Required",
     }
 
-    # If the office has put the job back into dispatch, it is open even if
-    # WorksheetSubmitted is still true from a previous attendance.
-    if status in dispatch_statuses and outcome not in closed_outcomes:
+    # Active/open statuses must stay usable even if WorksheetSubmitted
+    # is still true from an old attendance or reopened job.
+    if status in open_statuses and outcome not in closed_outcomes:
         return False
 
     return status in closed_statuses or outcome in closed_outcomes or worksheet_submitted
@@ -1948,6 +1950,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {
                     "Status": selected_status,
                     "EngineerVisitLog": updated_log,
+                    "WorksheetSubmitted": False,
                 },
             )
 
