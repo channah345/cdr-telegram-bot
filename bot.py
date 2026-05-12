@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -33,10 +33,22 @@ PORT = int(os.getenv("PORT", "8000"))
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
+DAY_LOGS_LIST = "Engineer Day Logs"
+
 
 PHOTO_LIBRARY = "Documents"
 PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 SIGNATURE_BASE_FOLDER = "16 - CLIENT SIGNATURES"
+
+DAY_ACTIVE_STATUS = "Active"
+DAY_CLOSED_STATUS = "Closed"
+
+MENU_START_DAY = "🟢 Start Day"
+MENU_MY_JOBS = "📋 My Jobs"
+MENU_END_DAY = "🏁 End Day"
+MENU_MY_STATUS = "📊 My Status"
+MENU_MY_ID = "🆔 My ID"
+
 
 UK_TZ = ZoneInfo("Europe/London")
 
@@ -53,6 +65,9 @@ PHOTOS = 5
 SIGNATURE_REQUIRED = 6
 SIGNATURE_WAITING = 7
 REVIEW = 8
+
+START_DAY_MILEAGE = 20
+END_DAY_MILEAGE = 21
 
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
 
@@ -161,6 +176,21 @@ def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
         raise Exception(f"Could not update item {item_id}: {response.text}")
 
 
+def create_list_item_fields(site_id, list_id, fields_to_create):
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
+
+    response = requests.post(
+        url,
+        headers=get_headers(),
+        json={"fields": fields_to_create},
+    )
+
+    if response.status_code not in [200, 201]:
+        raise Exception(f"Could not create list item: {response.text}")
+
+    return response.json()
+
+
 def clear_engineer_assignment_payload():
     return {
         "EngineerLookupId@odata.type": "Collection(Edm.Int32)",
@@ -254,6 +284,60 @@ def build_engineer_maps(engineers):
             }
 
     return by_telegram_id, by_lookup_id
+
+
+def get_main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [MENU_START_DAY, MENU_MY_JOBS],
+            [MENU_END_DAY, MENU_MY_STATUS],
+            [MENU_MY_ID],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def get_today_iso():
+    return datetime.now(UK_TZ).date().isoformat()
+
+
+def get_engineer_for_telegram_id(telegram_id):
+    site_id = get_site_id()
+    engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+    engineers = get_list_items(site_id, engineers_list_id)
+    engineers_by_telegram, _ = build_engineer_maps(engineers)
+    return site_id, engineers_list_id, engineers, engineers_by_telegram.get(str(telegram_id))
+
+
+def find_active_day_log(day_logs, telegram_id, work_date=None):
+    work_date = work_date or get_today_iso()
+
+    for log in day_logs:
+        fields = log.get("fields", {})
+        log_date = str(fields.get("WorkDate", ""))[:10]
+        status = str(fields.get("Status", ""))
+        log_telegram_id = str(fields.get("EngineerTelegramID", ""))
+
+        if (
+            log_telegram_id == str(telegram_id)
+            and log_date == work_date
+            and status == DAY_ACTIVE_STATUS
+        ):
+            return log
+
+    return None
+
+
+def get_active_day_for_engineer(site_id, telegram_id):
+    day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+    day_logs = get_list_items(site_id, day_logs_list_id)
+    return day_logs_list_id, find_active_day_log(day_logs, telegram_id)
+
+
+def engineer_has_active_day(site_id, telegram_id):
+    _, active_day = get_active_day_for_engineer(site_id, telegram_id)
+    return active_day is not None
 
 
 def get_assigned_engineer_ids(fields):
@@ -488,6 +572,8 @@ async def notify_helpdesk(context, text):
 @web_app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse("CDR Engineer Bot signature portal is online.")
+
+
 @web_app.get("/logo.png")
 def logo():
     return FileResponse("cdr-logo.png")
@@ -564,18 +650,6 @@ def signature_page(cdr_number: str, token: str):
         <script>
             const canvas = document.getElementById("signature-pad");
             const signaturePad = new SignaturePad(canvas);
-
-            canvas.addEventListener("touchstart", function (event) {{
-                event.preventDefault();
-            }}, {{ passive: false }});
-
-            canvas.addEventListener("touchmove", function (event) {{
-                event.preventDefault();
-            }}, {{ passive: false }});
-
-            canvas.addEventListener("touchend", function (event) {{
-                event.preventDefault();
-            }}, {{ passive: false }});
 
             function resizeCanvas() {{
                 const ratio = Math.max(window.devicePixelRatio || 1, 1);
@@ -656,7 +730,232 @@ def run_signature_web_server():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("CDR Engineer Bot is online.")
+    await update.message.reply_text(
+        "CDR Engineer Bot is online. Use the menu below.",
+        reply_markup=get_main_menu(),
+    )
+
+
+async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = str(update.effective_user.id)
+        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+
+        if not current_engineer:
+            await update.message.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+        day_logs = get_list_items(site_id, day_logs_list_id)
+        active_day = find_active_day_log(day_logs, user_id)
+
+        if active_day:
+            await update.message.reply_text(
+                "Your day is already active. You can now use 📋 My Jobs.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        context.user_data["start_day"] = {
+            "site_id": site_id,
+            "day_logs_list_id": day_logs_list_id,
+            "engineer_name": current_engineer["name"],
+            "engineer_lookup_id": current_engineer["lookup_id"],
+            "engineer_telegram_id": user_id,
+        }
+
+        await update.message.reply_text(
+            "Starting your day. Please enter your start mileage.\n\n"
+            "If you do not need to record mileage, type 0."
+        )
+        return START_DAY_MILEAGE
+
+    except Exception as e:
+        print(f"ERROR starting day: {e}")
+        await update.message.reply_text(
+            "There was an error starting your day. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+
+async def startday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        mileage = update.message.text.strip()
+        start_day = context.user_data.get("start_day")
+
+        if not start_day:
+            await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        item = create_list_item_fields(
+            start_day["site_id"],
+            start_day["day_logs_list_id"],
+            {
+                "Title": f"{start_day['engineer_name']} - {get_today_iso()}",
+                "EngineerName": start_day["engineer_name"],
+                "EngineerTelegramID": start_day["engineer_telegram_id"],
+                "EngineerLookupID": start_day["engineer_lookup_id"],
+                "WorkDate": get_today_iso(),
+                "StartTime": graph_datetime_now(),
+                "StartMileage": mileage,
+                "Status": DAY_ACTIVE_STATUS,
+            },
+        )
+
+        context.user_data.pop("start_day", None)
+
+        await update.message.reply_text(
+            "Day started. Your jobs are now unlocked. Tap 📋 My Jobs to view today's work.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR saving start day: {e}")
+        await update.message.reply_text(
+            "There was an error saving your start day record. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+
+async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = str(update.effective_user.id)
+        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+
+        if not current_engineer:
+            await update.message.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        day_logs_list_id, active_day = get_active_day_for_engineer(site_id, user_id)
+
+        if not active_day:
+            await update.message.reply_text(
+                "You do not have an active day to end. Tap 🟢 Start Day when you begin work.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        context.user_data["end_day"] = {
+            "site_id": site_id,
+            "day_logs_list_id": day_logs_list_id,
+            "day_log_item_id": active_day["id"],
+            "engineer_name": current_engineer["name"],
+        }
+
+        await update.message.reply_text(
+            "Ending your day. Please enter your end mileage.\n\n"
+            "If you do not need to record mileage, type 0."
+        )
+        return END_DAY_MILEAGE
+
+    except Exception as e:
+        print(f"ERROR ending day: {e}")
+        await update.message.reply_text(
+            "There was an error ending your day. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+
+async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        mileage = update.message.text.strip()
+        end_day = context.user_data.get("end_day")
+
+        if not end_day:
+            await update.message.reply_text("Please try /endday again.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        update_list_item_fields(
+            end_day["site_id"],
+            end_day["day_logs_list_id"],
+            end_day["day_log_item_id"],
+            {
+                "EndTime": graph_datetime_now(),
+                "EndMileage": mileage,
+                "Status": DAY_CLOSED_STATUS,
+            },
+        )
+
+        context.user_data.pop("end_day", None)
+
+        await update.message.reply_text(
+            "Day ended. Your job buttons are now locked until you start your next day.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR saving end day: {e}")
+        await update.message.reply_text(
+            "There was an error saving your end day record. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+
+async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = str(update.effective_user.id)
+        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+
+        if not current_engineer:
+            await update.message.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(),
+            )
+            return
+
+        _, active_day = get_active_day_for_engineer(site_id, user_id)
+
+        if active_day:
+            fields = active_day["fields"]
+            await update.message.reply_text(
+                f"Status: Day active\n"
+                f"Engineer: {current_engineer['name']}\n"
+                f"Start time: {format_sharepoint_date(fields.get('StartTime', ''))} {str(fields.get('StartTime', ''))[11:16] if fields.get('StartTime') else ''}",
+                reply_markup=get_main_menu(),
+            )
+        else:
+            await update.message.reply_text(
+                "Status: No active day. Tap 🟢 Start Day before using job buttons.",
+                reply_markup=get_main_menu(),
+            )
+
+    except Exception as e:
+        print(f"ERROR getting status: {e}")
+        await update.message.reply_text("There was an error checking your status.", reply_markup=get_main_menu())
+
+
+async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    if text == MENU_START_DAY:
+        return await startday_start(update, context)
+
+    if text == MENU_MY_JOBS:
+        await jobs(update, context)
+        return
+
+    if text == MENU_END_DAY:
+        return await endday_start(update, context)
+
+    if text == MENU_MY_STATUS:
+        await mystatus(update, context)
+        return
+
+    if text == MENU_MY_ID:
+        await id(update, context)
+        return
 
 
 async def id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -668,14 +967,22 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         today = datetime.now(UK_TZ).date()
 
-        _, _, _, engineers, jobs_data = get_sharepoint_data()
+        site_id, _, _, engineers, jobs_data = get_sharepoint_data()
         engineers_by_telegram, _ = build_engineer_maps(engineers)
 
         current_engineer = engineers_by_telegram.get(user_id)
 
         if not current_engineer:
             await update.message.reply_text(
-                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID."
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(),
+            )
+            return
+
+        if not engineer_has_active_day(site_id, user_id):
+            await update.message.reply_text(
+                "Please start your day first using 🟢 Start Day or /startday. Your jobs are locked until your day has started.",
+                reply_markup=get_main_menu(),
             )
             return
 
@@ -722,6 +1029,12 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not current_engineer:
             await query.message.reply_text("You are not set up as an engineer.")
+            return
+
+        if not engineer_has_active_day(site_id, user_id):
+            await query.message.reply_text(
+                "Please start your day first using 🟢 Start Day or /startday. Job buttons are locked until your day has started."
+            )
             return
 
         job = find_job_by_item_id(jobs_data, item_id)
@@ -929,7 +1242,15 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not current_engineer:
             await update.message.reply_text(
-                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID."
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        if not engineer_has_active_day(site_id, user_id):
+            await update.message.reply_text(
+                "Please start your day first using 🟢 Start Day or /startday before completing jobs.",
+                reply_markup=get_main_menu(),
             )
             return ConversationHandler.END
 
@@ -1320,6 +1641,29 @@ telegram_app = (
     .build()
 )
 
+startday_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("startday", startday_start),
+        MessageHandler(filters.Regex(f"^{MENU_START_DAY}$"), startday_start),
+    ],
+    states={
+        START_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_mileage)],
+    },
+    fallbacks=[CommandHandler("cancel", worksheet_cancel)],
+)
+
+endday_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("endday", endday_start),
+        MessageHandler(filters.Regex(f"^{MENU_END_DAY}$"), endday_start),
+    ],
+    states={
+        END_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_mileage)],
+    },
+    fallbacks=[CommandHandler("cancel", worksheet_cancel)],
+)
+
+
 worksheet_handler = ConversationHandler(
     entry_points=[CommandHandler("complete", complete_start)],
     states={
@@ -1342,7 +1686,11 @@ worksheet_handler = ConversationHandler(
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
+telegram_app.add_handler(CommandHandler("mystatus", mystatus))
+telegram_app.add_handler(startday_handler)
+telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_MY_STATUS}|{MENU_MY_ID})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
