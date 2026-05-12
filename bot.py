@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 try:
     from telegram.warnings import PTBUserWarning
@@ -1014,7 +1014,20 @@ def home():
 
 @web_app.get("/logo.png")
 def logo():
-    return FileResponse("cdr-logo.png")
+    logo_path = "cdr-logo.png"
+
+    if os.path.exists(logo_path):
+        return FileResponse(logo_path)
+
+    fallback_svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" width="640" height="180" viewBox="0 0 640 180">
+        <rect width="640" height="180" fill="white"/>
+        <text x="320" y="82" text-anchor="middle" font-family="Arial, sans-serif" font-size="58" font-weight="700" fill="#f58220">CDR</text>
+        <text x="320" y="125" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="600" fill="#333333">M&amp;E Services Ltd</text>
+    </svg>
+    """
+
+    return Response(content=fallback_svg.strip(), media_type="image/svg+xml")
 
 
 @web_app.get("/sign/{cdr_number}", response_class=HTMLResponse)
@@ -1041,13 +1054,14 @@ def signature_page(cdr_number: str, token: str):
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.6/dist/signature_pad.umd.min.js"></script>
         <style>
+            html, body {{ overscroll-behavior: none; }}
             body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; margin: 0; }}
             .container {{ max-width: 650px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.12); }}
             h1 {{ color: #f58220; margin-bottom: 5px; }}
             .job-box {{ background: #f7f7f7; padding: 15px; border-radius: 8px; margin: 20px 0; }}
             label {{ font-weight: bold; display: block; margin-top: 15px; }}
             input[type="text"] {{ width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; }}
-            canvas {{ width: 100%; height: 230px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; touch-action: none; }}
+            canvas {{ width: 100%; height: 260px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; touch-action: none; -ms-touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; display: block; }}
             button {{ width: 100%; padding: 14px; margin-top: 15px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }}
             .submit {{ background: #f58220; color: white; font-weight: bold; }}
             .clear {{ background: #555; color: white; }}
@@ -1087,17 +1101,45 @@ def signature_page(cdr_number: str, token: str):
         </div>
         <script>
             const canvas = document.getElementById("signature-pad");
-            const signaturePad = new SignaturePad(canvas);
+            const signaturePad = new SignaturePad(canvas, {{
+                minWidth: 1,
+                maxWidth: 2.5,
+                throttle: 0,
+                velocityFilterWeight: 0.7
+            }});
+
+            // Stop mobile browsers treating signature movement as page scroll/swipe.
+            // The passive:false option is important on iPhone/Android.
+            ["touchstart", "touchmove", "touchend", "pointerdown", "pointermove", "pointerup"].forEach(function(eventName) {{
+                canvas.addEventListener(eventName, function(event) {{
+                    event.preventDefault();
+                    event.stopPropagation();
+                }}, {{ passive: false }});
+            }});
+
+            let savedSignature = null;
 
             function resizeCanvas() {{
                 const ratio = Math.max(window.devicePixelRatio || 1, 1);
                 const rect = canvas.getBoundingClientRect();
+                if (!signaturePad.isEmpty()) {{
+                    savedSignature = signaturePad.toDataURL("image/png");
+                }}
+
                 canvas.width = rect.width * ratio;
                 canvas.height = rect.height * ratio;
                 canvas.getContext("2d").scale(ratio, ratio);
                 signaturePad.clear();
+
+                if (savedSignature) {{
+                    signaturePad.fromDataURL(savedSignature);
+                    savedSignature = null;
+                }}
             }}
 
+            window.addEventListener("orientationchange", function() {{
+                setTimeout(resizeCanvas, 250);
+            }});
             window.addEventListener("resize", resizeCanvas);
             resizeCanvas();
 
