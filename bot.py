@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-menu-v1"
+BUILD_VERSION = "helpdesk-menu-v2-engineers-list"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -466,6 +466,9 @@ def get_main_menu(role="Engineer"):
     if role == "helpdesk":
         return get_helpdesk_menu()
 
+    if role == "inactive":
+        return ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=False)
+
     return get_engineer_menu()
 
 
@@ -478,28 +481,29 @@ def get_bot_user_role(site_id, telegram_id):
     """
     Returns Engineer, Helpdesk or Admin for a Telegram user.
 
-    Preferred setup is a SharePoint list named 'Bot Users' with columns:
-    - Name
+    This version uses the existing SharePoint 'Engineers' list as the user table.
+    Required columns on Engineers:
+    - EngineerName
     - TelegramID
     - Role: Engineer / Helpdesk / Admin
     - Active: Yes/No
 
-    If the list is not created yet, the bot safely falls back to Engineer,
+    If the Telegram ID is not found, the user is treated as inactive/no access,
     unless the Telegram ID is listed in the HELPDESK_ADMIN_TELEGRAM_IDS Railway variable.
     """
-    telegram_id = str(telegram_id)
+    telegram_id = str(telegram_id).strip()
 
     if telegram_id in get_fallback_admin_ids():
         return "Admin"
 
     try:
-        bot_users_list_id = get_list_id(site_id, BOT_USERS_LIST)
-        bot_users = get_list_items(site_id, bot_users_list_id)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        users = get_list_items(site_id, engineers_list_id)
     except Exception as e:
-        print(f"Bot Users list unavailable; falling back to Engineer role: {e}")
+        print(f"Engineers list unavailable while checking role; falling back to Engineer role: {e}")
         return "Engineer"
 
-    for user in bot_users:
+    for user in users:
         fields = user.get("fields", {})
         user_telegram_id = str(
             get_field_value(fields, "TelegramID", "Telegram ID") or ""
@@ -510,7 +514,7 @@ def get_bot_user_role(site_id, telegram_id):
 
         active_value = get_field_value(fields, "Active")
         if active_value not in [None, ""] and not bool_field(active_value):
-            return "Engineer"
+            return "Inactive"
 
         role = str(get_field_value(fields, "Role") or "Engineer").strip()
 
@@ -519,7 +523,8 @@ def get_bot_user_role(site_id, telegram_id):
 
         return "Engineer"
 
-    return "Engineer"
+    print(f"Telegram ID {telegram_id} not found in Engineers list; no access granted.")
+    return "Inactive"
 
 
 def user_can_use_helpdesk(role):
@@ -1449,6 +1454,13 @@ def run_signature_web_server():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
+
+    if role.lower() == "inactive":
+        await update.message.reply_text(
+            "You are not currently authorised to use the CDR Engineer Bot. Please ask the office to check your Engineers list record, Telegram ID, Role and Active status.",
+            reply_markup=get_main_menu(role),
+        )
+        return
 
     if user_can_use_helpdesk(role):
         message = f"CDR Engineer Bot is online. Your access level is {role}."
