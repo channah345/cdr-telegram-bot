@@ -56,8 +56,6 @@ UK_TZ = ZoneInfo("Europe/London")
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Engineer Deployment"
 ASSIGNED_STATUS = "Assigned"
 COMPLETED_STATUS = "Completed"
-MIN_JOB_PHOTOS_REQUIRED = int(os.getenv("MIN_JOB_PHOTOS_REQUIRED", "1"))
-
 
 WORK_COMPLETED = 0
 MATERIALS_USED = 1
@@ -71,10 +69,11 @@ REVIEW = 8
 
 START_DAY_CONFIRM = 19
 START_DAY_VAN_REG = 20
-START_DAY_VAN_CHECK = 21
-START_DAY_VAN_PHOTOS = 22
-END_DAY_CONFIRM = 23
-END_DAY_MILEAGE = 24
+START_DAY_START_MILEAGE = 21
+START_DAY_VAN_CHECK = 22
+START_DAY_VAN_PHOTOS = 23
+END_DAY_CONFIRM = 24
+END_DAY_MILEAGE = 25
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -311,11 +310,6 @@ def can_click_action(fields, engineer_name, action):
     has_travelled = engineer_has_logged(fields, engineer_name, "Travelling")
     has_on_site = engineer_has_logged(fields, engineer_name, "On Site")
 
-    # Duplicate action protection. Stops double taps from adding repeated log lines
-    # or creating confusing job states. Engineers can still move forward in the workflow.
-    if engineer_has_logged(fields, engineer_name, action):
-        return False, f"This job has already been marked as {action} by you."
-
     if action == "Travelling":
         return True, ""
 
@@ -325,57 +319,7 @@ def can_click_action(fields, engineer_name, action):
     if action in ["No Access", "Revisit Required", "Completed"] and not has_on_site:
         return False, "You need to click On Site before selecting this option."
 
-    existing_outcome = str(fields.get("JobOutcome", ""))
-    if existing_outcome in ["Completed", "No Access", "Revisit Required"]:
-        return False, f"This job already has an outcome recorded: {existing_outcome}."
-
     return True, ""
-
-
-def optional_existing_field_payload(site_id, list_id, fields):
-    """
-    Only returns fields that exist on the SharePoint list.
-    Used for optional v7 tracking columns so deployments do not fail if
-    a column has not been added yet.
-    """
-    return build_field_payload_for_list(site_id, list_id, fields)
-
-
-def build_current_status_payload(site_id, jobs_list_id, engineer_name, status_text):
-    return optional_existing_field_payload(
-        site_id,
-        jobs_list_id,
-        {
-            "Current Status": status_text,
-            "CurrentStatus": status_text,
-            "Current Engineer Status": status_text,
-            "CurrentEngineerStatus": status_text,
-            "Current Status Engineer": engineer_name,
-            "CurrentStatusEngineer": engineer_name,
-            "Current Status Time": graph_datetime_now(),
-            "CurrentStatusTime": graph_datetime_now(),
-            "Last Updated By": engineer_name,
-            "LastUpdatedBy": engineer_name,
-            "Last Updated Time": graph_datetime_now(),
-            "LastUpdatedTime": graph_datetime_now(),
-        },
-    )
-
-
-def build_helpdesk_job_message(title, fields, engineer_name, lines=None):
-    extra = ""
-    if lines:
-        extra = "\n" + "\n".join(lines)
-
-    return (
-        f"{title}\n\n"
-        f"CDR: {fields.get('CDRNumber', '')}\n"
-        f"Engineer: {engineer_name}\n"
-        f"Site: {fields.get('SiteName', '')}\n"
-        f"Address: {fields.get('Address', '')}\n"
-        f"Task: {fields.get('Task', '')}"
-        f"{extra}"
-    )
 
 
 def get_sharepoint_data():
@@ -418,12 +362,11 @@ def get_main_menu():
     return ReplyKeyboardMarkup(
         [
             [MENU_START_DAY, MENU_MY_JOBS],
-            [MENU_MY_STATUS],
-            [MENU_END_DAY, MENU_MY_ID],
+            [MENU_END_DAY, MENU_MY_STATUS],
+            [MENU_MY_ID],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
-        input_field_placeholder="Choose an option",
     )
 
 
@@ -636,57 +579,31 @@ def is_notified(fields):
 def get_job_buttons(item_id):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚚 Travelling", callback_data=f"status|{item_id}|Travelling"),
-            InlineKeyboardButton("📍 On Site", callback_data=f"status|{item_id}|On Site"),
+            InlineKeyboardButton("Travelling", callback_data=f"status|{item_id}|Travelling"),
+            InlineKeyboardButton("On Site", callback_data=f"status|{item_id}|On Site"),
         ],
         [
-            InlineKeyboardButton("🔁 Revisit", callback_data=f"confirm_outcome|{item_id}|Revisit Required"),
-            InlineKeyboardButton("🚫 No Access", callback_data=f"confirm_outcome|{item_id}|No Access"),
+            InlineKeyboardButton("Revisit", callback_data=f"confirm_outcome|{item_id}|Revisit Required"),
+            InlineKeyboardButton("No Access", callback_data=f"confirm_outcome|{item_id}|No Access"),
         ],
         [
-            InlineKeyboardButton("✅ Complete Job", callback_data=f"complete_help|{item_id}"),
+            InlineKeyboardButton("Complete", callback_data=f"complete_help|{item_id}"),
         ],
     ])
 
 
 def format_job(fields, engineer_name=None):
-    cdr_number = fields.get('CDRNumber', '')
-    site = fields.get('SiteName', '')
-    date = format_sharepoint_date(fields.get('Date', ''))
-    start_time = fields.get('StartTime', '')
-    address = fields.get('Address', '')
-    task = fields.get('Task', '')
-    notes = fields.get('Notes', '')
-    contact = fields.get('ContactName', '')
-    status = fields.get('Status', '')
-
-    lines = [
-        f"🧾 CDR: {cdr_number}",
-        f"🏢 Site: {site}",
-        f"📅 Date: {date}",
-        f"⏰ Time: {start_time}",
-    ]
-
-    if engineer_name:
-        lines.append(f"👷 Engineer: {engineer_name}")
-
-    if status:
-        lines.append(f"📌 Status: {status}")
-
-    lines.extend([
-        "",
-        f"📍 Address:\n{address}",
-        "",
-        f"🛠 Task:\n{task}",
-    ])
-
-    if notes:
-        lines.extend(["", f"📝 Notes:\n{notes}"])
-
-    if contact:
-        lines.extend(["", f"👤 Contact:\n{contact}"])
-
-    return "\n".join(lines)
+    return (
+        f"CDR Number: {fields.get('CDRNumber', '')}\n"
+        f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
+        f"Time: {fields.get('StartTime', '')}\n"
+        f"Engineer: {engineer_name or ''}\n"
+        f"Site: {fields.get('SiteName', '')}\n"
+        f"Address: {fields.get('Address', '')}\n"
+        f"Task: {fields.get('Task', '')}\n"
+        f"Notes: {fields.get('Notes', '')}\n"
+        f"Contact: {fields.get('ContactName', '')}"
+    )
 
 
 def find_job_by_cdr(jobs_data, cdr_number):
@@ -1117,13 +1034,43 @@ async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return START_DAY_VAN_REG
 
     start_day["van_reg"] = van_reg
+
+    await update.message.reply_text(
+        "Please enter your start mileage as a number.\n\n"
+        "Example: 15234 or 0."
+    )
+
+    return START_DAY_START_MILEAGE
+
+
+
+async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_day = context.user_data.get("start_day")
+
+    if not start_day:
+        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    mileage = normalise_mileage(update.message.text)
+
+    if mileage is None:
+        await update.message.reply_text(
+            "Please enter start mileage as numbers only. Example: 15234 or 0."
+        )
+        return START_DAY_START_MILEAGE
+
+    start_day["start_mileage"] = mileage
     start_day["question_index"] = 0
 
     await update.message.reply_text(
-        f"Van registration recorded: {van_reg}\n\n"
-        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:\n"
+        f"Start mileage recorded: {mileage}
+
+"
+        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:
+"
         f"{VAN_CHECK_QUESTIONS[0]}"
     )
+
     return START_DAY_VAN_CHECK
 
 
@@ -1198,6 +1145,8 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "WorkDate": start_day["work_date"],
                     "Start Time": graph_datetime_now(),
                     "StartTime": graph_datetime_now(),
+                    "Start Mileage": start_day.get("start_mileage", "0"),
+                    "StartMileage": start_day.get("start_mileage", "0"),
                     "Van Registration": start_day.get("van_reg", ""),
                     "VanRegistration": start_day.get("van_reg", ""),
                     "Van Check Completed": True,
@@ -1376,11 +1325,26 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hours = calculate_day_pay_hours(start_time, end_time)
         pay_summary = build_pay_summary(start_time, end_time, hours)
 
+        start_mileage_value = get_field_value(
+            end_day.get("day_log_fields", {}),
+            "StartMileage",
+            "Start Mileage",
+        )
+
+        total_mileage = None
+
+        try:
+            total_mileage = round(float(mileage) - float(start_mileage_value or 0), 2)
+        except Exception:
+            total_mileage = None
+
         update_payload = {
             "End Time": end_time.isoformat(),
             "EndTime": end_time.isoformat(),
             "End Mileage": mileage,
             "EndMileage": mileage,
+            "Total Mileage": total_mileage if total_mileage is not None else "",
+            "TotalMileage": total_mileage if total_mileage is not None else "",
             "Status": DAY_CLOSED_STATUS,
             "Pay Summary": pay_summary,
             "PaySummary": pay_summary,
@@ -1524,7 +1488,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if current_engineer["lookup_id"] in assigned_ids and job_date == today:
                 found_any = True
                 await update.message.reply_text(
-                    "📋 Today's job\n\n" + format_job(fields, current_engineer["name"]),
+                    "Today's job:\n\n" + format_job(fields, current_engineer["name"]),
                     reply_markup=get_job_buttons(item_id),
                 )
 
@@ -1655,24 +1619,14 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_status,
             )
 
-            update_fields = {
-                "Status": selected_status,
-                "EngineerVisitLog": updated_log,
-            }
-            update_fields.update(
-                build_current_status_payload(
-                    site_id,
-                    jobs_list_id,
-                    current_engineer["name"],
-                    selected_status,
-                )
-            )
-
             update_list_item_fields(
                 site_id,
                 jobs_list_id,
                 item_id,
-                update_fields,
+                {
+                    "Status": selected_status,
+                    "EngineerVisitLog": updated_log,
+                },
             )
 
             await query.message.reply_text(
@@ -1681,11 +1635,12 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await notify_helpdesk(
                 context,
-                build_helpdesk_job_message(
-                    "📍 Job status update",
-                    fields,
-                    current_engineer["name"],
-                    [f"Update: {selected_status}"],
+                (
+                    f"Job update\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Update: {selected_status}\n"
+                    f"Site: {fields.get('SiteName', '')}"
                 ),
             )
 
@@ -1734,15 +1689,6 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 )
 
-            update_fields.update(
-                build_current_status_payload(
-                    site_id,
-                    jobs_list_id,
-                    current_engineer["name"],
-                    selected_outcome,
-                )
-            )
-
             update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
 
             await query.message.reply_text(
@@ -1753,15 +1699,13 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await notify_helpdesk(
                 context,
-                build_helpdesk_job_message(
-                    "⚠️ Job outcome selected",
-                    fields,
-                    current_engineer["name"],
-                    [
-                        f"Outcome: {selected_outcome}",
-                        f"Final engineer: {'Yes' if is_final_engineer else 'No'}",
-                        "Engineer removed from this job.",
-                    ],
+                (
+                    f"Job outcome selected\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Outcome: {selected_outcome}\n"
+                    f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
+                    f"Site: {fields.get('SiteName', '')}"
                 ),
             )
 
@@ -1892,8 +1836,8 @@ async def worksheet_engineer_notes(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text(
         "Upload job photos now.\n\n"
-        f"Minimum required: {MIN_JOB_PHOTOS_REQUIRED} photo(s).\n"
-        "Send photos, then type DONE when finished."
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
     )
 
     return PHOTOS
@@ -1903,15 +1847,6 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worksheet = context.user_data["worksheet"]
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
-        photo_count = len(worksheet.get("photo_links", []))
-
-        if photo_count < MIN_JOB_PHOTOS_REQUIRED:
-            await update.message.reply_text(
-                f"I have {photo_count} job photo(s). Please upload at least "
-                f"{MIN_JOB_PHOTOS_REQUIRED} photo(s) before typing DONE."
-            )
-            return PHOTOS
-
         await update.message.reply_text("Is a client signature required? Reply Yes or No.")
         return SIGNATURE_REQUIRED
 
@@ -1934,15 +1869,9 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         worksheet["photo_links"].append(photo_link)
-        await update.message.reply_text(
-            f"Photo received ({len(worksheet.get('photo_links', []))}/{MIN_JOB_PHOTOS_REQUIRED} minimum). "
-            "Send more photos or type DONE."
-        )
         return PHOTOS
 
-    await update.message.reply_text(
-        f"Please send job photos, or type DONE once at least {MIN_JOB_PHOTOS_REQUIRED} photo(s) have been uploaded."
-    )
+    await update.message.reply_text("Please send the required van photos, or type DONE once all 3 have been uploaded.")
     return PHOTOS
 
 
@@ -2094,15 +2023,6 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
 
-        fields_to_update.update(
-            build_current_status_payload(
-                site_id,
-                jobs_list_id,
-                worksheet["engineer_name"],
-                "Completed",
-            )
-        )
-
         update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
 
         await update.message.reply_text(
@@ -2111,17 +2031,15 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await notify_helpdesk(
             context,
-            build_helpdesk_job_message(
-                "✅ Worksheet submitted",
-                fields,
-                worksheet["engineer_name"],
-                [
-                    "Outcome: Completed",
-                    f"Final engineer: {'Yes' if is_final_engineer else 'No'}",
-                    f"Photos uploaded: {len(worksheet.get('photo_links', []))}",
-                    f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}",
-                    f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}",
-                ],
+            (
+                f"Worksheet submitted\n\n"
+                f"CDR Number: {worksheet['cdr_number']}\n"
+                f"Engineer: {worksheet['engineer_name']}\n"
+                f"Outcome: Completed\n"
+                f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
+                f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
+                f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
+                f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
             ),
         )
 
@@ -2165,7 +2083,7 @@ async def send_new_jobs(app):
 
                 await app.bot.send_message(
                     chat_id=engineer["telegram_id"],
-                    text="📩 New job assigned\n\n" + format_job(fields, engineer["name"]),
+                    text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
                     reply_markup=get_job_buttons(item_id),
                 )
 
@@ -2221,6 +2139,7 @@ startday_handler = ConversationHandler(
     states={
         START_DAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_confirm)],
         START_DAY_VAN_REG: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_reg)],
+        START_DAY_START_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_start_mileage)],
         START_DAY_VAN_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_check)],
         START_DAY_VAN_PHOTOS: [
             MessageHandler(filters.PHOTO, startday_van_photos),
