@@ -451,6 +451,78 @@ def normalise_mileage(value):
 
     return str(number)
 
+def get_field_value(fields, *names):
+    for name in names:
+        if name in fields and fields.get(name) not in [None, ""]:
+            return fields.get(name)
+
+    normalised_names = {normalise_field_name(name) for name in names}
+
+    for key, value in fields.items():
+        if normalise_field_name(key) in normalised_names and value not in [None, ""]:
+            return value
+
+    return None
+
+
+def parse_sharepoint_datetime(value):
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value.astimezone(UK_TZ) if value.tzinfo else value.replace(tzinfo=UK_TZ)
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UK_TZ)
+    except Exception:
+        return None
+
+
+def calculate_day_pay_hours(start_dt, end_dt):
+    if not start_dt or not end_dt:
+        return None
+
+    if end_dt < start_dt:
+        return None
+
+    normal_start = start_dt.replace(hour=8, minute=0, second=0, microsecond=0)
+    normal_end = start_dt.replace(hour=16, minute=30, second=0, microsecond=0)
+
+    # If the shift ends on a different date, calculate normal window for the start date only.
+    # This matches the CDR standard working day rule of 08:00-16:30.
+    overlap_start = max(start_dt, normal_start)
+    overlap_end = min(end_dt, normal_end)
+
+    normal_gross = 0.0
+    if overlap_end > overlap_start:
+        normal_gross = (overlap_end - overlap_start).total_seconds() / 3600
+
+    total_hours = (end_dt - start_dt).total_seconds() / 3600
+    break_deducted = 0.5 if normal_gross >= 0.5 else normal_gross
+    normal_hours = max(0.0, normal_gross - break_deducted)
+    ooh_hours = max(0.0, total_hours - normal_gross)
+
+    return {
+        "total_hours": round(total_hours, 2),
+        "normal_hours": round(normal_hours, 2),
+        "ooh_hours": round(ooh_hours, 2),
+        "break_deducted": round(break_deducted, 2),
+    }
+
+
+def build_pay_summary(start_dt, end_dt, hours):
+    if not hours:
+        return "Unable to calculate hours - start or end time missing."
+
+    return (
+        f"Start: {start_dt.strftime('%d/%m/%Y %H:%M')}\n"
+        f"End: {end_dt.strftime('%d/%m/%Y %H:%M')}\n"
+        f"Total hours: {hours['total_hours']}\n"
+        f"Normal hours: {hours['normal_hours']}\n"
+        f"OOH hours: {hours['ooh_hours']} at 1.5x\n"
+        f"Break deducted: {hours['break_deducted']}"
+    )
+
 
 def get_open_jobs_for_engineer_today(jobs_data, engineer_lookup_id):
     today = datetime.now(UK_TZ).date()
@@ -1142,6 +1214,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "site_id": site_id,
             "day_logs_list_id": day_logs_list_id,
             "day_log_item_id": active_day["id"],
+            "day_log_fields": active_day.get("fields", {}),
             "engineer_name": current_engineer["name"],
             "engineer_lookup_id": current_engineer["lookup_id"],
         }
@@ -1209,16 +1282,42 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
+        end_time = datetime.now(UK_TZ)
+        start_time_value = get_field_value(
+            end_day.get("day_log_fields", {}),
+            "StartTime",
+            "Start Time",
+        )
+        start_time = parse_sharepoint_datetime(start_time_value)
+        hours = calculate_day_pay_hours(start_time, end_time)
+        pay_summary = build_pay_summary(start_time, end_time, hours)
+
+        update_payload = {
+            "End Time": end_time.isoformat(),
+            "EndTime": end_time.isoformat(),
+            "End Mileage": mileage,
+            "EndMileage": mileage,
+            "Status": DAY_CLOSED_STATUS,
+            "Pay Summary": pay_summary,
+            "PaySummary": pay_summary,
+        }
+
+        if hours:
+            update_payload.update({
+                "Total Hours": hours["total_hours"],
+                "TotalHours": hours["total_hours"],
+                "Normal Hours": hours["normal_hours"],
+                "NormalHours": hours["normal_hours"],
+                "OOH Hours": hours["ooh_hours"],
+                "OOHHours": hours["ooh_hours"],
+                "Break Deducted": hours["break_deducted"],
+                "BreakDeducted": hours["break_deducted"],
+            })
+
         end_day_fields = build_field_payload_for_list(
             end_day["site_id"],
             end_day["day_logs_list_id"],
-            {
-                "End Time": graph_datetime_now(),
-                "EndTime": graph_datetime_now(),
-                "End Mileage": mileage,
-                "EndMileage": mileage,
-                "Status": DAY_CLOSED_STATUS,
-            },
+            update_payload,
         )
 
         update_list_item_fields(
@@ -1231,7 +1330,8 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("end_day", None)
 
         await update.message.reply_text(
-            "Day ended. Your job buttons are now locked until you start your next day.",
+            "Day ended. Your job buttons are now locked until you start your next day.\n\n"
+            f"{pay_summary}",
             reply_markup=get_main_menu(),
         )
         return ConversationHandler.END
