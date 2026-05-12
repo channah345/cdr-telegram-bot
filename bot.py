@@ -50,6 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
+BUILD_VERSION = "worksheet-final-v5"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2959,32 +2960,110 @@ def safe_pdf_filename(value):
     return cleaned.replace(" ", "_") or "worksheet"
 
 
-def extract_visit_times(fields, engineer_name):
-    """Pull the current engineer's travelling/on-site/completed times from EngineerVisitLog."""
-    result = {
-        "travelling": "",
-        "on_site": "",
-        "off_site": "",
-    }
+def parse_engineer_visit_log(log_text):
+    """
+    Build one worksheet visit row per attendance from EngineerVisitLog.
+    Expected log line format:
+    dd/mm/yyyy HH:MM - Engineer Name - Action - optional notes
+    """
+    visits = []
+    active_by_engineer = {}
 
-    lines = get_current_engineer_visit_log_lines(fields, engineer_name)
+    for raw_line in str(log_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
 
-    for line in lines:
-        match = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+-\s+(.+?)\s+-\s+(.+?)(\s+-\s+.*)?$", line)
+        match = re.match(
+            r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+-\s+(.+?)\s+-\s+(.+?)(?:\s+-\s+(.*))?$",
+            line,
+        )
         if not match:
             continue
 
-        time_value = match.group(2)
+        visit_date = match.group(1)
+        visit_time = match.group(2)
+        engineer = match.group(3).strip()
         action = match.group(4).strip()
+        extra = (match.group(5) or "").strip()
+        key = engineer.lower()
 
         if action == "Travelling":
-            result["travelling"] = time_value
-        elif action == "On Site":
-            result["on_site"] = time_value
-        elif action in ["Completed", "No Access", "Revisit Required"]:
-            result["off_site"] = time_value
+            # Start a fresh attendance for this engineer.
+            active_by_engineer[key] = {
+                "date": visit_date,
+                "travel": visit_time,
+                "on_site": "",
+                "engineer": engineer,
+                "status": "Travelling",
+                "off_site": "",
+                "notes": extra,
+            }
+            visits.append(active_by_engineer[key])
+            continue
 
-    return result
+        if key not in active_by_engineer:
+            active_by_engineer[key] = {
+                "date": visit_date,
+                "travel": "",
+                "on_site": "",
+                "engineer": engineer,
+                "status": "",
+                "off_site": "",
+                "notes": "",
+            }
+            visits.append(active_by_engineer[key])
+
+        current = active_by_engineer[key]
+
+        if action == "On Site":
+            current["on_site"] = visit_time
+            current["status"] = "On Site"
+        elif action in ["Completed", "No Access", "Revisit Required"]:
+            current["status"] = action
+            current["off_site"] = visit_time
+            if extra:
+                current["notes"] = extra
+            # This attendance is closed. A future Travelling click by the same engineer
+            # will create a new row rather than overwriting this one.
+            active_by_engineer.pop(key, None)
+        else:
+            current["status"] = action
+            if extra:
+                current["notes"] = extra
+
+    return visits
+
+
+def get_signature_image_bytes(site_id, cdr_number):
+    """Download the latest saved client signature image from SharePoint, if available."""
+    try:
+        drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
+        folder_path = f"{SIGNATURE_BASE_FOLDER}/{cdr_number}"
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{folder_path}:/children"
+        response = requests.get(url, headers=get_headers())
+
+        if response.status_code != 200:
+            print(f"Could not list signature folder for {cdr_number}: {response.text}")
+            return None
+
+        files = [item for item in response.json().get("value", []) if "file" in item]
+        if not files:
+            return None
+
+        files.sort(key=lambda item: item.get("lastModifiedDateTime", ""), reverse=True)
+        item_id = files[0]["id"]
+        content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+        content_response = requests.get(content_url, headers=get_headers(content_type=False))
+
+        if content_response.status_code != 200:
+            print(f"Could not download signature image for {cdr_number}: {content_response.text}")
+            return None
+
+        return content_response.content
+    except Exception as e:
+        print(f"ERROR getting signature image: {e}")
+        return None
 
 
 def get_logo_for_pdf(max_width=48 * mm, max_height=20 * mm):
@@ -2999,7 +3078,7 @@ def get_logo_for_pdf(max_width=48 * mm, max_height=20 * mm):
     return Paragraph("<b>CDR</b>", ParagraphStyle("LogoFallback", fontSize=20, textColor=colors.HexColor("#f58220")))
 
 
-def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
+def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=None):
     buffer = BytesIO()
 
     doc = SimpleDocTemplate(
@@ -3017,8 +3096,11 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
     section = ParagraphStyle("CDRSection", parent=normal, fontName="Helvetica-Bold", fontSize=9.5, textColor=colors.white, leading=11)
     title = ParagraphStyle("CDRTitle", parent=normal, fontName="Helvetica-Bold", fontSize=16, textColor=colors.HexColor("#111827"), alignment=2)
 
+    def escape_pdf(value):
+        return clean_pdf_text(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     def ptxt(value):
-        return Paragraph(clean_pdf_text(value).replace("\n", "<br/>").replace("&", "&amp;"), normal)
+        return Paragraph(escape_pdf(value).replace("\n", "<br/>"), normal)
 
     def section_box(title_text, body_text, height_padding=8):
         table = Table(
@@ -3041,7 +3123,6 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
     cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "")
     date_logged = format_sharepoint_date(fields.get("Date", ""))
     date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
-    visit_times = extract_visit_times({**fields, "EngineerVisitLog": updated_log}, worksheet.get("engineer_name", ""))
 
     customer_name = get_field_value(fields, "CustomerName", "Customer Name") or get_field_value(fields, "ClientName", "Client Name") or ""
     customer_address = get_field_value(fields, "CustomerAddress", "Customer Address") or ""
@@ -3088,8 +3169,8 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
     story.append(Spacer(1, 7))
 
     details = Table(
-        [[Paragraph("<b>Customer Details</b><br/>" + clean_pdf_text(customer_details).replace("\n", "<br/>"), normal),
-          Paragraph("<b>Site Details</b><br/>" + clean_pdf_text(site_details).replace("\n", "<br/>"), normal)]],
+        [[Paragraph("<b>Customer Details</b><br/>" + escape_pdf(customer_details).replace("\n", "<br/>"), normal),
+          Paragraph("<b>Site Details</b><br/>" + escape_pdf(site_details).replace("\n", "<br/>"), normal)]],
         colWidths=[91 * mm, 91 * mm],
     )
     details.setStyle(TableStyle([
@@ -3129,19 +3210,30 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
     story.append(section_box("Description", fields.get("Task", "") or fields.get("Description", "") or fields.get("Notes", ""), 7))
     story.append(Spacer(1, 7))
 
-    visits_data = [
-        ["Travel", "On-Site", "Engineer", "Apprentice Engineer", "Status", "Off-Site"],
-        [
-            clean_pdf_text(visit_times.get("travelling")),
-            clean_pdf_text(visit_times.get("on_site")),
-            clean_pdf_text(worksheet.get("engineer_name")),
-            "N/A",
-            clean_pdf_text(outcome),
-            clean_pdf_text(visit_times.get("off_site") or datetime.now(UK_TZ).strftime("%H:%M")),
-        ],
-    ]
-    visits = Table(visits_data, colWidths=[25 * mm, 25 * mm, 43 * mm, 37 * mm, 27 * mm, 25 * mm])
-    visits.setStyle(TableStyle([
+    visits_data = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
+    visits = parse_engineer_visit_log(updated_log)
+    if not visits:
+        visits = [{
+            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
+            "travel": "",
+            "on_site": "",
+            "engineer": worksheet.get("engineer_name", ""),
+            "status": outcome,
+            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+        }]
+
+    for visit in visits:
+        visits_data.append([
+            clean_pdf_text(visit.get("date")),
+            clean_pdf_text(visit.get("travel")),
+            clean_pdf_text(visit.get("on_site")),
+            clean_pdf_text(visit.get("engineer")),
+            clean_pdf_text(visit.get("status")),
+            clean_pdf_text(visit.get("off_site")),
+        ])
+
+    visits_table = Table(visits_data, colWidths=[27 * mm, 25 * mm, 25 * mm, 45 * mm, 35 * mm, 25 * mm])
+    visits_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
@@ -3154,7 +3246,7 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     story.append(Paragraph("<b>Visits</b>", normal))
-    story.append(visits)
+    story.append(visits_table)
     story.append(Spacer(1, 7))
 
     comments = worksheet.get("WorkCompleted", "")
@@ -3166,31 +3258,47 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
         comments += "\n\nFollow-on Required: No"
     if worksheet.get("EngineerCompletionNotes") and str(worksheet.get("EngineerCompletionNotes")).strip().lower() != "none":
         comments += f"\n\nEngineer Notes: {worksheet.get('EngineerCompletionNotes')}"
-    if outcome == "No Access" and worksheet.get("NoAccessReason"):
-        comments += f"\n\nNo Access Reason: {worksheet.get('NoAccessReason')}"
 
     story.append(section_box("Engineer Comment", comments, 8))
     story.append(Spacer(1, 7))
 
-    photo_lines = worksheet.get("photo_links", [])
-    photo_summary = f"{len(photo_lines)} photo(s) uploaded to SharePoint."
-    if photo_lines:
-        photo_summary += "\n" + "\n".join(photo_lines[:6])
-        if len(photo_lines) > 6:
-            photo_summary += f"\n...and {len(photo_lines) - 6} more"
-    story.append(section_box("Photos", photo_summary, 6))
-    story.append(Spacer(1, 7))
-
-    signature_text = "Client signature not required."
     if worksheet.get("ClientSignatureRequired"):
-        signature_text = "Signature required but not received."
+        signature_rows = []
         if worksheet.get("ClientSignatureReceived"):
-            signature_text = (
-                f"Signed digitally via CDR Engineer Portal.\n"
-                f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
-                f"Signature Link: {worksheet.get('ClientSignatureLink', '')}"
-            )
-    story.append(section_box("Client Signature", signature_text, 8))
+            signature_rows.append([Paragraph(
+                f"<b>Client Name:</b> {escape_pdf(worksheet.get('ClientSignatureName', ''))}<br/>"
+                f"<b>Signed Digitally:</b> Yes",
+                normal,
+            )])
+            signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
+            if signature_bytes:
+                try:
+                    sig_img = Image(BytesIO(signature_bytes))
+                    sig_img._restrictSize(80 * mm, 28 * mm)
+                    signature_rows.append([sig_img])
+                except Exception as e:
+                    print(f"Could not embed signature image: {e}")
+                    signature_rows.append([Paragraph("Signature image saved in SharePoint but could not be embedded.", normal)])
+            else:
+                signature_rows.append([Paragraph("Signature image saved in SharePoint but could not be embedded.", normal)])
+        else:
+            signature_rows.append([Paragraph("Client signature required but not received.", normal)])
+    else:
+        signature_rows = [[Paragraph("Client signature not required.", normal)]]
+
+    signature = Table([[Paragraph("Client Signature", section)]] + signature_rows, colWidths=[182 * mm])
+    signature.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.HexColor("#333333")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(signature)
 
     story.append(Spacer(1, 5))
     story.append(Paragraph("CDR M&amp;E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk", small))
@@ -3203,7 +3311,7 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
 
 def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
     try:
-        pdf_bytes = build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome)
+        pdf_bytes = build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id)
         cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
         file_name = f"{safe_pdf_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.pdf"
 
@@ -3235,8 +3343,6 @@ def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_fi
     if worksheet_pdf_link:
         fields_to_update["WorksheetPDFLink"] = worksheet_pdf_link
         fields_to_update["WorksheetGenerated"] = True
-    else:
-        fields_to_update["WorksheetGenerated"] = False
 
     if outcome == "No Access" and worksheet.get("NoAccessReason"):
         fields_to_update["NoAccessReason"] = worksheet.get("NoAccessReason")
@@ -3331,15 +3437,17 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assigned_ids = get_assigned_engineer_ids(fields)
         is_final_engineer = len(assigned_ids) <= 1
 
-        worksheet_pdf_link = generate_and_upload_worksheet_pdf(
-            site_id,
-            jobs_list_id,
-            item_id,
-            worksheet,
-            fields,
-            updated_log,
-            outcome,
-        )
+        worksheet_pdf_link = ""
+        if is_final_engineer and outcome == "Completed":
+            worksheet_pdf_link = generate_and_upload_worksheet_pdf(
+                site_id,
+                jobs_list_id,
+                item_id,
+                worksheet,
+                fields,
+                updated_log,
+                outcome,
+            )
 
         fields_to_update = build_worksheet_update_fields(
             worksheet,
@@ -3359,8 +3467,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             get_job_reference(fields),
         )
 
+        final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer completes."
         await update.message.reply_text(
-            f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}",
+            f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
             reply_markup=get_main_menu(),
         )
 
@@ -3465,15 +3574,17 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
     assigned_ids = get_assigned_engineer_ids(fields)
     is_final_engineer = len(assigned_ids) <= 1
 
-    worksheet_pdf_link = generate_and_upload_worksheet_pdf(
-        site_id,
-        jobs_list_id,
-        item_id,
-        worksheet,
-        fields,
-        updated_log,
-        outcome,
-    )
+    worksheet_pdf_link = ""
+    if is_final_engineer and outcome == "Completed":
+        worksheet_pdf_link = generate_and_upload_worksheet_pdf(
+            site_id,
+            jobs_list_id,
+            item_id,
+            worksheet,
+            fields,
+            updated_log,
+            outcome,
+        )
 
     fields_to_update = build_worksheet_update_fields(
         worksheet,
@@ -3493,8 +3604,9 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         get_job_reference(fields),
     )
 
+    final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer completes."
     await query.message.reply_text(
-        f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}",
+        f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
         reply_markup=get_main_menu(),
     )
 
@@ -3753,7 +3865,7 @@ telegram_app.add_handler(CallbackQueryHandler(status_button))
 if __name__ == "__main__":
     threading.Thread(target=run_signature_web_server, daemon=True).start()
     print(f"Signature web server running on port {PORT}")
-    print(f"Bot running... PID={os.getpid()}")
+    print(f"Bot running... PID={os.getpid()} | Build={BUILD_VERSION}")
 
     telegram_app.run_polling(
         drop_pending_updates=True,
