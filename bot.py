@@ -657,18 +657,47 @@ def get_review_keyboard():
         [InlineKeyboardButton("❌ Cancel", callback_data="review|cancel")],
     ])
 
+
+NO_ACCESS_REASONS = {
+    "no_answer": "No answer",
+    "no_keys": "No keys / access available",
+    "contact_unreachable": "Contact unreachable",
+    "site_closed": "Site closed",
+    "access_refused": "Access refused",
+    "parking_access_issue": "Parking / access issue",
+    "other": "Other / see notes",
+}
+
+
+def get_no_access_reason_keyboard(item_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚪 No answer", callback_data=f"noaccess_reason|{item_id}|no_answer")],
+        [InlineKeyboardButton("🔑 No keys / access", callback_data=f"noaccess_reason|{item_id}|no_keys")],
+        [InlineKeyboardButton("📵 Contact unreachable", callback_data=f"noaccess_reason|{item_id}|contact_unreachable")],
+        [InlineKeyboardButton("🏢 Site closed", callback_data=f"noaccess_reason|{item_id}|site_closed")],
+        [InlineKeyboardButton("🚫 Access refused", callback_data=f"noaccess_reason|{item_id}|access_refused")],
+        [InlineKeyboardButton("🚗 Parking / access issue", callback_data=f"noaccess_reason|{item_id}|parking_access_issue")],
+        [InlineKeyboardButton("📝 Other / see notes", callback_data=f"noaccess_reason|{item_id}|other")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_outcome|{item_id}")],
+    ])
+
+
 def get_job_buttons(item_id):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Travelling", callback_data=f"status|{item_id}|Travelling"),
-            InlineKeyboardButton("On Site", callback_data=f"status|{item_id}|On Site"),
+            InlineKeyboardButton("🚗 Start Travelling", callback_data=f"status|{item_id}|Travelling"),
         ],
         [
-            InlineKeyboardButton("Revisit", callback_data=f"confirm_outcome|{item_id}|Revisit Required"),
-            InlineKeyboardButton("No Access", callback_data=f"confirm_outcome|{item_id}|No Access"),
+            InlineKeyboardButton("📍 Arrived On Site", callback_data=f"status|{item_id}|On Site"),
         ],
         [
-            InlineKeyboardButton("Complete", callback_data=f"start_worksheet|{item_id}|Completed"),
+            InlineKeyboardButton("✅ Complete Job", callback_data=f"start_worksheet|{item_id}|Completed"),
+        ],
+        [
+            InlineKeyboardButton("🔁 Revisit Required", callback_data=f"confirm_outcome|{item_id}|Revisit Required"),
+        ],
+        [
+            InlineKeyboardButton("🚫 No Access", callback_data=f"noaccess|{item_id}"),
         ],
     ])
 
@@ -980,11 +1009,14 @@ def build_signature_url(cdr_number, token):
 def build_review_text(worksheet):
     signature_required = "Yes" if worksheet.get("ClientSignatureRequired") else "No"
     outcome = worksheet.get("JobOutcome", "Completed")
+    no_access_reason = worksheet.get("NoAccessReason", "")
     signature_received = "Yes" if worksheet.get("ClientSignatureReceived") else "No"
+    no_access_line = f"No Access reason: {no_access_reason}\n\n" if outcome == "No Access" and no_access_reason else ""
 
     return (
         f"Please review worksheet for {worksheet['cdr_number']}:\n\n"
         f"Outcome: {outcome}\n\n"
+        f"{no_access_line}"
         f"Work completed:\n{worksheet.get('WorkCompleted', '')}\n\n"
         f"Materials used:\n{worksheet.get('MaterialsUsed', '')}\n\n"
         f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
@@ -2110,6 +2142,45 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if action == "noaccess":
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                "No Access",
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            await query.message.reply_text(
+                "Why was there no access?",
+                reply_markup=get_no_access_reason_keyboard(item_id),
+            )
+            return
+
+        if action == "noaccess_reason":
+            reason_key = data[2] if len(data) > 2 else "other"
+            no_access_reason = NO_ACCESS_REASONS.get(reason_key, "Other / see notes")
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                "No Access",
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            return await begin_worksheet_for_job(
+                update,
+                context,
+                item_id=item_id,
+                outcome="No Access",
+                no_access_reason=no_access_reason,
+            )
+
         if action == "confirm_outcome":
             selected_outcome = data[2]
 
@@ -2309,7 +2380,7 @@ def can_start_completion(fields, engineer_name):
     return True, ""
 
 
-async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id=None, cdr_number=None, outcome="Completed"):
+async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id=None, cdr_number=None, outcome="Completed", no_access_reason=""):
     """Start a worksheet from either the Complete/Revisit/No Access button or legacy /complete."""
     try:
         is_callback = update.callback_query is not None
@@ -2373,6 +2444,7 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
             "ClientSignatureRequired": False,
             "ClientSignatureReceived": False,
             "JobOutcome": outcome,
+            "NoAccessReason": no_access_reason,
         }
 
         if outcome == "Completed":
@@ -2380,11 +2452,14 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
         elif outcome == "Revisit Required":
             first_question = "What was done today, and why is a revisit required?"
         else:
-            first_question = "What happened? Please explain why there was no access."
+            first_question = "Add any extra no access notes. If there is nothing else to add, type None."
+
+        no_access_line = f"\nNo Access reason: {no_access_reason}\n" if outcome == "No Access" and no_access_reason else ""
 
         await sender.reply_text(
             f"Starting worksheet for {cdr}.\n\n"
-            f"Outcome: {outcome}\n\n"
+            f"Outcome: {outcome}"
+            f"{no_access_line}\n"
             f"You can type /cancel at any point before submitting.\n\n"
             f"{first_question}"
         )
@@ -2837,6 +2912,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
         }
 
+        if outcome == "No Access" and worksheet.get("NoAccessReason"):
+            fields_to_update["NoAccessReason"] = worksheet.get("NoAccessReason")
+
         if is_final_engineer:
             fields_to_update["JobOutcome"] = outcome
 
@@ -2884,6 +2962,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"CDR Number: {worksheet['cdr_number']}\n"
                 f"Engineer: {worksheet['engineer_name']}\n"
                 f"Outcome: {outcome}\n"
+                f"No Access reason: {worksheet.get('NoAccessReason', 'N/A') if outcome == 'No Access' else 'N/A'}\n"
                 f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
                 f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
                 f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
@@ -2988,6 +3067,9 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
     }
 
+    if outcome == "No Access" and worksheet.get("NoAccessReason"):
+        fields_to_update["NoAccessReason"] = worksheet.get("NoAccessReason")
+
     if is_final_engineer:
         fields_to_update["JobOutcome"] = outcome
 
@@ -3029,6 +3111,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
             f"CDR Number: {worksheet['cdr_number']}\n"
             f"Engineer: {worksheet['engineer_name']}\n"
             f"Outcome: {outcome}\n"
+            f"No Access reason: {worksheet.get('NoAccessReason', 'N/A') if outcome == 'No Access' else 'N/A'}\n"
             f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
             f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
             f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
