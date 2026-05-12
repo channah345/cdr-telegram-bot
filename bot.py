@@ -194,25 +194,31 @@ def normalise_field_name(value):
 
 def build_field_payload_for_list(site_id, list_id, fields):
     """
-    SharePoint Graph needs the real internal column name.
-    Important: SharePoint exposes read-only Title display fields such as
-    LinkTitle and LinkTitleNoMenu, so we ignore read-only columns and force
-    Title to write to the editable Title field only.
+    Build a SharePoint fields payload using real writable internal column names.
+
+    Important:
+    - Title must always write to the real editable Title field.
+    - SharePoint also exposes read-only display fields such as LinkTitle and
+      LinkTitleNoMenu. These must never be written to.
     """
     columns = get_list_columns(site_id, list_id)
-    lookup = {}
+    lookup = {"title": "Title"}
 
     for column in columns:
         internal_name = column.get("name", "")
         display_name = column.get("displayName", "")
         read_only = column.get("readOnly", False)
 
-        # Do not map display names to read-only SharePoint fields such as LinkTitleNoMenu.
         if read_only:
+            continue
+
+        # Never allow LinkTitle fields, even if Graph does not mark them read-only.
+        if internal_name in ["LinkTitle", "LinkTitleNoMenu"]:
             continue
 
         if internal_name == "Title":
             lookup[normalise_field_name("Title")] = "Title"
+            continue
 
         for key in [internal_name, display_name]:
             normalised = normalise_field_name(key)
@@ -230,7 +236,7 @@ def build_field_payload_for_list(site_id, list_id, fields):
         if internal_name:
             payload[internal_name] = value
         else:
-            print(f"WARNING: SharePoint column not found on {DAY_LOGS_LIST}: {desired_name}. Field skipped.")
+            print(f"WARNING: SharePoint column not found: {desired_name}. Field skipped.")
 
     return payload
 
@@ -1063,11 +1069,8 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
     start_day["question_index"] = 0
 
     await update.message.reply_text(
-        f"Start mileage recorded: {mileage}
-
-"
-        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:
-"
+        f"Start mileage recorded: {mileage}\\n\\n"
+        f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:\\n"
         f"{VAN_CHECK_QUESTIONS[0]}"
     )
 
