@@ -2,6 +2,7 @@ import os
 import base64
 import secrets
 import threading
+from urllib.parse import quote_plus
 import warnings
 import requests
 import msal
@@ -682,8 +683,8 @@ def get_no_access_reason_keyboard(item_id):
     ])
 
 
-def get_job_buttons(item_id):
-    return InlineKeyboardMarkup([
+def get_job_buttons(item_id, address=None):
+    rows = [
         [
             InlineKeyboardButton("🚗 Start Travelling", callback_data=f"status|{item_id}|Travelling"),
         ],
@@ -699,7 +700,18 @@ def get_job_buttons(item_id):
         [
             InlineKeyboardButton("🚫 No Access", callback_data=f"noaccess|{item_id}"),
         ],
-    ])
+    ]
+
+    if address:
+        maps_url = (
+            "https://www.google.com/maps/search/?api=1&query="
+            + quote_plus(str(address))
+        )
+        rows.append([
+            InlineKeyboardButton("🗺 Open Maps", url=maps_url)
+        ])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def format_job(fields, engineer_name=None):
@@ -2066,7 +2078,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 found_any = True
                 await update.message.reply_text(
                     "Today's job:\n\n" + format_job(fields, current_engineer["name"]),
-                    reply_markup=get_job_buttons(item_id),
+                    reply_markup=get_job_buttons(item_id, fields.get("Address", "")),
                 )
 
         if not found_any:
@@ -2483,34 +2495,6 @@ async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     return await begin_worksheet_for_job(update, context, item_id=item_id, outcome=outcome)
-
-
-
-
-async def noaccess_reason_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Conversation entry point after an engineer chooses a No Access reason.
-
-    This must be an entry point on the worksheet ConversationHandler; otherwise
-    the next typed note is received by the bot but no worksheet state is active.
-    """
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, item_id, reason_key = query.data.split("|", 2)
-    except Exception:
-        await query.message.reply_text("Could not start the No Access worksheet. Tap 📋 My Jobs and try again.")
-        return ConversationHandler.END
-
-    no_access_reason = NO_ACCESS_REASONS.get(reason_key, "Other / see notes")
-
-    return await begin_worksheet_for_job(
-        update,
-        context,
-        item_id=item_id,
-        outcome="No Access",
-        no_access_reason=no_access_reason,
-    )
 
 
 async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3195,7 +3179,7 @@ async def send_new_jobs(app):
                     await app.bot.send_message(
                         chat_id=engineer["telegram_id"],
                         text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
-                        reply_markup=get_job_buttons(item_id),
+                        reply_markup=get_job_buttons(item_id, fields.get("Address", "")),
                     )
                     sent_to_any_engineer = True
                 except Exception as e:
@@ -3330,7 +3314,6 @@ endday_handler = ConversationHandler(
 worksheet_handler = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(complete_button_start, pattern="^start_worksheet\\|"),
-        CallbackQueryHandler(noaccess_reason_start, pattern="^noaccess_reason\\|"),
         CommandHandler("complete", complete_start),
     ],
     states={
