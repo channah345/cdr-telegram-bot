@@ -34,6 +34,7 @@ PORT = int(os.getenv("PORT", "8000"))
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 DAY_LOGS_LIST = "Engineer Day Logs"
+BUG_IDEAS_LIST = "Bug Ideas"
 
 
 PHOTO_LIBRARY = "Documents"
@@ -49,6 +50,7 @@ MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
 MENU_MY_STATUS = "📊 My Status"
 MENU_MY_ID = "🆔 My ID"
+MENU_BUG_IDEA = "🐞 Bug / Ideas"
 
 
 UK_TZ = ZoneInfo("Europe/London")
@@ -74,6 +76,7 @@ START_DAY_VAN_CHECK = 22
 START_DAY_VAN_PHOTOS = 23
 END_DAY_CONFIRM = 24
 END_DAY_MILEAGE = 25
+BUG_IDEA_TEXT = 26
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -369,7 +372,7 @@ def get_main_menu():
         [
             [MENU_START_DAY, MENU_MY_JOBS],
             [MENU_END_DAY, MENU_MY_STATUS],
-            [MENU_MY_ID],
+            [MENU_MY_ID, MENU_BUG_IDEA],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -1028,6 +1031,10 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, START_DAY_CONFIRM)
+    if menu_result is not None:
+        return menu_result
+
     answer = update.message.text.strip().lower()
 
     if answer not in ["yes", "no", "y", "n"]:
@@ -1044,6 +1051,10 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, START_DAY_VAN_REG)
+    if menu_result is not None:
+        return menu_result
+
     start_day = context.user_data.get("start_day")
 
     if not start_day:
@@ -1068,6 +1079,10 @@ async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, START_DAY_START_MILEAGE)
+    if menu_result is not None:
+        return menu_result
+
     start_day = context.user_data.get("start_day")
 
     if not start_day:
@@ -1095,6 +1110,10 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, START_DAY_VAN_CHECK)
+    if menu_result is not None:
+        return menu_result
+
     start_day = context.user_data.get("start_day")
 
     if not start_day:
@@ -1131,6 +1150,10 @@ async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, START_DAY_VAN_PHOTOS)
+    if menu_result is not None:
+        return menu_result
+
     try:
         start_day = context.user_data.get("start_day")
 
@@ -1290,6 +1313,10 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, END_DAY_CONFIRM)
+    if menu_result is not None:
+        return menu_result
+
     answer = update.message.text.strip().lower()
 
     if answer not in ["yes", "no", "y", "n"]:
@@ -1309,6 +1336,10 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, END_DAY_MILEAGE)
+    if menu_result is not None:
+        return menu_result
+
     try:
         mileage = normalise_mileage(update.message.text)
 
@@ -1472,6 +1503,150 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_MY_ID:
         await id(update, context)
         return
+
+    if text == MENU_BUG_IDEA:
+        return await bugidea_start(update, context)
+
+
+
+async def handle_menu_during_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, current_state):
+    """
+    Allows safe menu use while an engineer is inside a conversation flow.
+    Without this, buttons like 🆔 My ID are treated as answers to the active question.
+    """
+    text = update.message.text if update.message else ""
+
+    if text == MENU_MY_ID:
+        await id(update, context)
+        return
+
+    if text == MENU_BUG_IDEA:
+        return current_state
+
+    if text == MENU_MY_STATUS:
+        await mystatus(update, context)
+        return current_state
+
+    if text == MENU_MY_JOBS:
+        await update.message.reply_text(
+            "You are currently part-way through another task. Finish it or type /cancel before viewing jobs.",
+            reply_markup=get_main_menu(),
+        )
+        return current_state
+
+    if text in [MENU_START_DAY, MENU_END_DAY, MENU_BUG_IDEA]:
+        await update.message.reply_text(
+            "You are already part-way through another task. Finish it or type /cancel first.",
+            reply_markup=get_main_menu(),
+        )
+        return current_state
+
+    return None
+
+
+
+async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = str(update.effective_user.id)
+        site_id, _, engineers, current_engineer = get_engineer_for_telegram_id(user_id)
+
+        if not current_engineer:
+            await update.message.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        context.user_data["bug_idea"] = {
+            "site_id": site_id,
+            "engineer_name": current_engineer["name"],
+            "engineer_telegram_id": user_id,
+        }
+
+        await update.message.reply_text(
+            "Please type the bug, issue, improvement idea or request you want to log.\n\n"
+            "Example: The photo upload message is unclear on job completion.\n\n"
+            "Type /cancel to cancel."
+        )
+
+        return BUG_IDEA_TEXT
+
+    except Exception as e:
+        print(f"ERROR starting bug/idea log: {e}")
+        await update.message.reply_text(
+            "There was an error opening the bug/idea log. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+
+async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, BUG_IDEA_TEXT)
+    if menu_result is not None:
+        return menu_result
+
+    try:
+        bug_idea = context.user_data.get("bug_idea")
+
+        if not bug_idea:
+            await update.message.reply_text("Please try again from the menu.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+
+        text_value = update.message.text.strip()
+
+        if not text_value:
+            await update.message.reply_text("Please type the bug or idea you want to log.")
+            return BUG_IDEA_TEXT
+
+        bug_ideas_list_id = get_list_id(bug_idea["site_id"], BUG_IDEAS_LIST)
+
+        title = f"{bug_idea['engineer_name']} - {datetime.now(UK_TZ).strftime('%d/%m/%Y %H:%M')}"
+
+        fields_to_create = build_field_payload_for_list(
+            bug_idea["site_id"],
+            bug_ideas_list_id,
+            {
+                "Title": title,
+                "EngineerName": bug_idea["engineer_name"],
+                "Engineer Name": bug_idea["engineer_name"],
+                "EngineerTelegramID": bug_idea["engineer_telegram_id"],
+                "Engineer Telegram ID": bug_idea["engineer_telegram_id"],
+                "BugIdeaText": text_value,
+                "Bug Idea Text": text_value,
+                "DateSubmitted": graph_datetime_now(),
+                "Date Submitted": graph_datetime_now(),
+                "Status": "New",
+            },
+        )
+
+        create_list_item_fields(
+            bug_idea["site_id"],
+            bug_ideas_list_id,
+            fields_to_create,
+        )
+
+        context.user_data.pop("bug_idea", None)
+
+        await update.message.reply_text(
+            "Logged. Thanks — this has been sent to the office as a bug/idea.",
+            reply_markup=get_main_menu(),
+        )
+
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR saving bug/idea: {e}")
+        await update.message.reply_text(
+            "There was an error saving the bug/idea. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+
+async def bugidea_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("bug_idea", None)
+    await update.message.reply_text("Bug/idea cancelled.", reply_markup=get_main_menu())
+    return ConversationHandler.END
 
 
 async def id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1827,18 +2002,30 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, WORK_COMPLETED)
+    if menu_result is not None:
+        return menu_result
+
     context.user_data["worksheet"]["WorkCompleted"] = update.message.text
     await update.message.reply_text("What materials were used? Type None if none.")
     return MATERIALS_USED
 
 
 async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, MATERIALS_USED)
+    if menu_result is not None:
+        return menu_result
+
     context.user_data["worksheet"]["MaterialsUsed"] = update.message.text
     await update.message.reply_text("Is a follow-on required? Reply Yes or No.")
     return FOLLOW_ON_REQUIRED
 
 
 async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, FOLLOW_ON_REQUIRED)
+    if menu_result is not None:
+        return menu_result
+
     answer = update.message.text.strip().lower()
 
     if answer not in ["yes", "no", "y", "n"]:
@@ -1858,12 +2045,20 @@ async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEF
 
 
 async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, FOLLOW_ON_NOTES)
+    if menu_result is not None:
+        return menu_result
+
     context.user_data["worksheet"]["FollowOnNotes"] = update.message.text
     await update.message.reply_text("Any engineer notes? Type None if none.")
     return ENGINEER_NOTES
 
 
 async def worksheet_engineer_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, ENGINEER_NOTES)
+    if menu_result is not None:
+        return menu_result
+
     context.user_data["worksheet"]["EngineerCompletionNotes"] = update.message.text
 
     await update.message.reply_text(
@@ -1876,6 +2071,10 @@ async def worksheet_engineer_notes(update: Update, context: ContextTypes.DEFAULT
 
 
 async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, PHOTOS)
+    if menu_result is not None:
+        return menu_result
+
     worksheet = context.user_data["worksheet"]
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
@@ -1908,6 +2107,10 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def worksheet_signature_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, SIGNATURE_REQUIRED)
+    if menu_result is not None:
+        return menu_result
+
     answer = update.message.text.strip().lower()
     worksheet = context.user_data["worksheet"]
 
@@ -1952,6 +2155,10 @@ async def worksheet_signature_required(update: Update, context: ContextTypes.DEF
 
 
 async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, SIGNATURE_WAITING)
+    if menu_result is not None:
+        return menu_result
+
     answer = update.message.text.strip().upper()
     worksheet = context.user_data["worksheet"]
 
@@ -1988,6 +2195,10 @@ async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFA
 
 
 async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, REVIEW)
+    if menu_result is not None:
+        return menu_result
+
     answer = update.message.text.strip().upper()
     worksheet = context.user_data["worksheet"]
 
@@ -2218,6 +2429,18 @@ worksheet_handler = ConversationHandler(
     fallbacks=[CommandHandler("cancel", worksheet_cancel)],
 )
 
+
+bugidea_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("bugidea", bugidea_start),
+        MessageHandler(filters.Regex(f"^{MENU_BUG_IDEA}$"), bugidea_start),
+    ],
+    states={
+        BUG_IDEA_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bugidea_text)],
+    },
+    fallbacks=[CommandHandler("cancel", bugidea_cancel)],
+)
+
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
@@ -2225,7 +2448,8 @@ telegram_app.add_handler(CommandHandler("mystatus", mystatus))
 telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_MY_STATUS}|{MENU_MY_ID})$"), menu_button))
+telegram_app.add_handler(bugidea_handler)
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_MY_STATUS}|{MENU_MY_ID}|{MENU_BUG_IDEA})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
