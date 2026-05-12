@@ -50,12 +50,13 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "worksheet-final-v6"
+BUILD_VERSION = "helpdesk-menu-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 DAY_LOGS_LIST = "Engineer Day Logs"
 BUG_IDEAS_LIST = "Bug Ideas"
+BOT_USERS_LIST = "Bot Users"
 
 
 PHOTO_LIBRARY = "Documents"
@@ -71,6 +72,13 @@ MENU_START_DAY = "🟢 Start Day"
 MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
+MENU_HELPDESK = "🧰 Helpdesk"
+MENU_LOG_JOB = "➕ Log Job"
+MENU_REASSIGN_JOB = "🔁 Reassign Job"
+MENU_OPEN_JOBS = "📋 Open Jobs"
+MENU_FIND_JOB = "🔎 Find Job"
+MENU_EMERGENCY_JOB = "🚨 Emergency Job"
+MENU_ENGINEER_MENU = "👷 Engineer Menu"
 
 
 UK_TZ = ZoneInfo("Europe/London")
@@ -407,7 +415,7 @@ def build_engineer_maps(engineers):
     return by_telegram_id, by_lookup_id
 
 
-def get_main_menu():
+def get_engineer_menu():
     return ReplyKeyboardMarkup(
         [
             [MENU_START_DAY, MENU_MY_JOBS],
@@ -416,6 +424,115 @@ def get_main_menu():
         resize_keyboard=True,
         one_time_keyboard=False,
     )
+
+
+def get_helpdesk_menu(include_engineer_menu=False):
+    rows = [
+        [MENU_LOG_JOB, MENU_REASSIGN_JOB],
+        [MENU_OPEN_JOBS, MENU_FIND_JOB],
+        [MENU_EMERGENCY_JOB],
+    ]
+
+    if include_engineer_menu:
+        rows.append([MENU_ENGINEER_MENU])
+
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def get_admin_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [MENU_START_DAY, MENU_MY_JOBS],
+            [MENU_END_DAY, MENU_BUG_IDEA],
+            [MENU_LOG_JOB, MENU_REASSIGN_JOB],
+            [MENU_OPEN_JOBS, MENU_FIND_JOB],
+            [MENU_EMERGENCY_JOB],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def get_main_menu(role="Engineer"):
+    role = str(role or "Engineer").strip().lower()
+
+    if role == "admin":
+        return get_admin_menu()
+
+    if role == "helpdesk":
+        return get_helpdesk_menu()
+
+    return get_engineer_menu()
+
+
+def get_fallback_admin_ids():
+    raw_ids = os.getenv("HELPDESK_ADMIN_TELEGRAM_IDS", "")
+    return {value.strip() for value in raw_ids.split(",") if value.strip()}
+
+
+def get_bot_user_role(site_id, telegram_id):
+    """
+    Returns Engineer, Helpdesk or Admin for a Telegram user.
+
+    Preferred setup is a SharePoint list named 'Bot Users' with columns:
+    - Name
+    - TelegramID
+    - Role: Engineer / Helpdesk / Admin
+    - Active: Yes/No
+
+    If the list is not created yet, the bot safely falls back to Engineer,
+    unless the Telegram ID is listed in the HELPDESK_ADMIN_TELEGRAM_IDS Railway variable.
+    """
+    telegram_id = str(telegram_id)
+
+    if telegram_id in get_fallback_admin_ids():
+        return "Admin"
+
+    try:
+        bot_users_list_id = get_list_id(site_id, BOT_USERS_LIST)
+        bot_users = get_list_items(site_id, bot_users_list_id)
+    except Exception as e:
+        print(f"Bot Users list unavailable; falling back to Engineer role: {e}")
+        return "Engineer"
+
+    for user in bot_users:
+        fields = user.get("fields", {})
+        user_telegram_id = str(
+            get_field_value(fields, "TelegramID", "Telegram ID") or ""
+        ).strip()
+
+        if user_telegram_id != telegram_id:
+            continue
+
+        active_value = get_field_value(fields, "Active")
+        if active_value not in [None, ""] and not bool_field(active_value):
+            return "Engineer"
+
+        role = str(get_field_value(fields, "Role") or "Engineer").strip()
+
+        if role.lower() in ["admin", "helpdesk", "engineer"]:
+            return role.title()
+
+        return "Engineer"
+
+    return "Engineer"
+
+
+def user_can_use_helpdesk(role):
+    return str(role or "").strip().lower() in ["helpdesk", "admin"]
+
+
+async def get_role_for_update(update):
+    try:
+        site_id = get_site_id()
+        return get_bot_user_role(site_id, update.effective_user.id)
+    except Exception as e:
+        print(f"Could not determine bot user role: {e}")
+        return "Engineer"
 
 
 def get_today_iso():
@@ -1331,9 +1448,16 @@ def run_signature_web_server():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if user_can_use_helpdesk(role):
+        message = f"CDR Engineer Bot is online. Your access level is {role}."
+    else:
+        message = "CDR Engineer Bot is online. Use the menu below."
+
     await update.message.reply_text(
-        "CDR Engineer Bot is online. Use the menu below.",
-        reply_markup=get_main_menu(),
+        message,
+        reply_markup=get_main_menu(role),
     )
 
 
@@ -1980,9 +2104,68 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_END_DAY:
         return await endday_start(update, context)
 
-
     if text == MENU_BUG_IDEA:
         return await bugidea_start(update, context)
+
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_EMERGENCY_JOB, MENU_ENGINEER_MENU]:
+        return await helpdesk_menu_button(update, context)
+
+
+async def helpdesk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to use the helpdesk menu.",
+            reply_markup=get_main_menu(role),
+        )
+        return
+
+    await update.message.reply_text(
+        "Helpdesk menu opened. Choose an option below.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+    )
+
+
+async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    text = update.message.text
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to use this function.",
+            reply_markup=get_main_menu(role),
+        )
+        return
+
+    if text == MENU_ENGINEER_MENU:
+        await update.message.reply_text(
+            "Engineer menu opened.",
+            reply_markup=get_engineer_menu(),
+        )
+        return
+
+    coming_next = {
+        MENU_LOG_JOB: "Log Job",
+        MENU_REASSIGN_JOB: "Reassign Job",
+        MENU_OPEN_JOBS: "Open Jobs",
+        MENU_FIND_JOB: "Find Job",
+        MENU_EMERGENCY_JOB: "Emergency Job",
+        MENU_HELPDESK: "Helpdesk",
+    }
+
+    if text == MENU_HELPDESK:
+        await update.message.reply_text(
+            "Helpdesk menu opened. Choose an option below.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return
+
+    await update.message.reply_text(
+        f"{coming_next.get(text, 'This helpdesk option')} is permission-protected and ready for the next build. "
+        "Next step is wiring this button into the SharePoint job create/reassign flow.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+    )
 
 
 async def handle_menu_during_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, current_state):
@@ -2000,7 +2183,7 @@ async def handle_menu_during_conversation(update: Update, context: ContextTypes.
         )
         return current_state
 
-    if text in [MENU_START_DAY, MENU_END_DAY, MENU_BUG_IDEA]:
+    if text in [MENU_START_DAY, MENU_END_DAY, MENU_BUG_IDEA, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_EMERGENCY_JOB, MENU_ENGINEER_MENU]:
         await update.message.reply_text(
             "You are already part-way through another task. Finish it or type /cancel first.",
             reply_markup=get_main_menu(),
@@ -3929,11 +4112,12 @@ bugidea_handler = ConversationHandler(
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
+telegram_app.add_handler(CommandHandler("helpdesk", helpdesk_start))
 telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_EMERGENCY_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
