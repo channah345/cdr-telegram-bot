@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-menu-v2-engineers-list"
+BUILD_VERSION = "helpdesk-log-job-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -110,6 +110,21 @@ START_DAY_VAN_PHOTOS = 23
 END_DAY_CONFIRM = 24
 END_DAY_MILEAGE = 25
 BUG_IDEA_TEXT = 26
+
+LOGJOB_CDR_NUMBER = 27
+LOGJOB_CUSTOMER_NAME = 28
+LOGJOB_CUSTOMER_ADDRESS = 29
+LOGJOB_SITE_NAME = 30
+LOGJOB_SITE_ADDRESS = 31
+LOGJOB_CONTACT = 32
+LOGJOB_TASK = 33
+LOGJOB_NOTES = 34
+LOGJOB_DATE = 35
+LOGJOB_TIME = 36
+LOGJOB_CATEGORY = 37
+LOGJOB_ORDER_NUMBER = 38
+LOGJOB_ASSIGN_ENGINEERS = 39
+LOGJOB_REVIEW = 40
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -529,6 +544,208 @@ def get_bot_user_role(site_id, telegram_id):
 
 def user_can_use_helpdesk(role):
     return str(role or "").strip().lower() in ["helpdesk", "admin"]
+
+
+JOB_CATEGORY_CHOICES = [
+    "Electrical",
+    "Mechanical",
+    "Plumbing",
+    "HVAC",
+    "Fire",
+    "Building Fabric",
+    "Other",
+]
+
+
+def is_blank_or_skip(value):
+    return str(value or "").strip().lower() in ["", "skip", "none", "n/a", "na"]
+
+
+def parse_helpdesk_job_date(value):
+    text = str(value or "").strip().lower()
+    today = datetime.now(UK_TZ).date()
+
+    if text in ["today", "tod"]:
+        return today.isoformat()
+
+    if text in ["tomorrow", "tmr", "tom"]:
+        from datetime import timedelta
+        return (today + timedelta(days=1)).isoformat()
+
+    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"]:
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except Exception:
+            pass
+
+    return None
+
+
+def normalise_helpdesk_time(value):
+    text = str(value or "").strip().lower().replace(".", ":")
+
+    if text in ["now", "asap", "urgent"]:
+        return datetime.now(UK_TZ).strftime("%H:%M")
+
+    # 800 -> 08:00, 0830 -> 08:30, 1700 -> 17:00
+    if text.isdigit() and len(text) in [3, 4]:
+        if len(text) == 3:
+            text = "0" + text
+        text = text[:2] + ":" + text[2:]
+
+    try:
+        parsed = datetime.strptime(text, "%H:%M")
+        return parsed.strftime("%H:%M")
+    except Exception:
+        return None
+
+
+def get_active_assignable_engineers(engineers):
+    assignable = []
+
+    for item in engineers:
+        fields = item.get("fields", {})
+        lookup_id = str(fields.get("id", "") or item.get("id", ""))
+        name = get_field_value(fields, "EngineerName", "Engineer Name", "Title") or ""
+        telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
+        role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
+        active_value = get_field_value(fields, "Active")
+
+        if active_value not in [None, ""] and not bool_field(active_value):
+            continue
+
+        # Admins can be assigned if needed, but Helpdesk-only users should not receive engineering jobs.
+        if role not in ["engineer", "admin"]:
+            continue
+
+        if lookup_id and name and telegram_id:
+            assignable.append({
+                "lookup_id": lookup_id,
+                "name": str(name),
+                "telegram_id": telegram_id,
+            })
+
+    assignable.sort(key=lambda e: e["name"].lower())
+    return assignable
+
+
+def format_engineer_selection_list(engineers):
+    lines = []
+    for index, engineer in enumerate(engineers, start=1):
+        lines.append(f"{index}. {engineer['name']}")
+    return "\n".join(lines)
+
+
+def parse_engineer_selection(text, engineers):
+    selected = []
+    seen = set()
+    parts = [part.strip() for part in str(text or "").replace(";", ",").split(",") if part.strip()]
+
+    for part in parts:
+        if not part.isdigit():
+            return None, "Please reply with engineer number(s), for example 1 or 1,3."
+
+        index = int(part)
+        if index < 1 or index > len(engineers):
+            return None, f"Engineer number {index} is not in the list."
+
+        engineer = engineers[index - 1]
+        if engineer["lookup_id"] not in seen:
+            selected.append(engineer)
+            seen.add(engineer["lookup_id"])
+
+    if not selected:
+        return None, "Please select at least one engineer."
+
+    return selected, ""
+
+
+def build_log_job_review(job):
+    assigned_names = ", ".join(engineer["name"] for engineer in job.get("assigned_engineers", [])) or "None"
+    return (
+        "Please review the new job before I create it in SharePoint:\n\n"
+        f"CDR Number: {job.get('cdr_number', '')}\n"
+        f"Customer: {job.get('customer_name', '')}\n"
+        f"Customer Address: {job.get('customer_address', '')}\n"
+        f"Site: {job.get('site_name', '')}\n"
+        f"Site Address: {job.get('site_address', '')}\n"
+        f"Contact: {job.get('contact', '') or 'N/A'}\n"
+        f"Task: {job.get('task', '')}\n"
+        f"Notes: {job.get('notes', '') or 'N/A'}\n"
+        f"Date: {job.get('date_display', job.get('date', ''))}\n"
+        f"Time: {job.get('time', '')}\n"
+        f"Category: {job.get('category', '')}\n"
+        f"Order Number: {job.get('order_number', '') or 'N/A'}\n"
+        f"Assigned Engineer(s): {assigned_names}\n\n"
+        "Reply YES to create and send, NO to cancel, or RESTART to start again."
+    )
+
+
+def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=False):
+    payload = build_field_payload_for_list(
+        site_id,
+        jobs_list_id,
+        {
+            "Title": job["cdr_number"],
+            "CDRNumber": job["cdr_number"],
+            "CDR Number": job["cdr_number"],
+            "Date": job["date"],
+            "StartTime": job["time"],
+            "Start Time": job["time"],
+            "CustomerName": job["customer_name"],
+            "Customer Name": job["customer_name"],
+            "CustomerAddress": job["customer_address"],
+            "Customer Address": job["customer_address"],
+            "SiteName": job["site_name"],
+            "Site Name": job["site_name"],
+            "Address": job["site_address"],
+            "ContactName": job.get("contact", ""),
+            "Contact Name": job.get("contact", ""),
+            "Task": job["task"],
+            "Notes": job.get("notes", ""),
+            "CustomerOrderNumber": job.get("order_number", ""),
+            "Customer Order Number": job.get("order_number", ""),
+            "JobCategory": job.get("category", ""),
+            "Job Category": job.get("category", ""),
+            "Status": ASSIGNED_STATUS,
+            "TelegramNotified": bool(telegram_notified),
+            "Telegram Notified": bool(telegram_notified),
+            "WorksheetGenerated": False,
+            "Worksheet Generated": False,
+            "WorksheetSubmitted": False,
+            "Worksheet Submitted": False,
+            "JobOutcome": "",
+            "Job Outcome": "",
+            "EngineerVisitLog": f"{now_log_time()} - Helpdesk - Job logged via Telegram",
+            "Engineer Visit Log": f"{now_log_time()} - Helpdesk - Job logged via Telegram",
+        },
+    )
+
+    engineer_ids = [int(engineer["lookup_id"]) for engineer in job.get("assigned_engineers", [])]
+    if engineer_ids:
+        payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
+        payload["EngineerLookupId"] = engineer_ids
+
+    return payload
+
+
+async def send_created_job_to_engineers(bot, item_id, fields, assigned_engineers):
+    sent_to_any = False
+    failed = []
+
+    for engineer in assigned_engineers:
+        try:
+            await bot.send_message(
+                chat_id=engineer["telegram_id"],
+                text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
+                reply_markup=get_job_buttons(item_id, fields.get("Address", "")),
+            )
+            sent_to_any = True
+        except Exception as e:
+            failed.append(f"{engineer['name']}: {e}")
+            print(f"WARNING: Could not send newly logged job {fields.get('CDRNumber', item_id)} to {engineer['name']}: {e}")
+
+    return sent_to_any, failed
 
 
 async def get_role_for_update(update):
@@ -2157,6 +2374,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if text == MENU_LOG_JOB:
+        return await logjob_start(update, context)
+
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
@@ -2179,6 +2399,316 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
     )
 
+
+
+
+async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to log jobs.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+        assignable_engineers = get_active_assignable_engineers(engineers)
+
+        if not assignable_engineers:
+            await update.message.reply_text(
+                "No active assignable engineers were found. Check the Engineers list has TelegramID, Role and Active set correctly.",
+                reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+            )
+            return ConversationHandler.END
+
+        context.user_data["log_job"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "assignable_engineers": assignable_engineers,
+            "role": role,
+        }
+
+        await update.message.reply_text(
+            "Log new job.\n\nEnter the CDR/job number.\n\nExample: CDR012896",
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return LOGJOB_CDR_NUMBER
+
+    except Exception as e:
+        print(f"ERROR starting log job flow: {e}")
+        await update.message.reply_text(
+            "There was an error opening Log Job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def logjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    if not job:
+        await update.message.reply_text("Please start again using ➕ Log Job.")
+        return ConversationHandler.END
+
+    value = update.message.text.strip().upper()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter a CDR/job number. Example: CDR012896")
+        return LOGJOB_CDR_NUMBER
+
+    job["cdr_number"] = value
+    await update.message.reply_text("Customer name?\n\nExample: Cleveland Fire Brigade")
+    return LOGJOB_CUSTOMER_NAME
+
+
+async def logjob_customer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the customer name. This appears on the worksheet.")
+        return LOGJOB_CUSTOMER_NAME
+    job["customer_name"] = value
+    await update.message.reply_text("Customer address?\n\nThis is the billing/client address for the worksheet. You can use multiple lines.")
+    return LOGJOB_CUSTOMER_ADDRESS
+
+
+async def logjob_customer_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the customer address. This appears on the worksheet.")
+        return LOGJOB_CUSTOMER_ADDRESS
+    job["customer_address"] = value
+    await update.message.reply_text("Site name?\n\nExample: Headquarters")
+    return LOGJOB_SITE_NAME
+
+
+async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the site name.")
+        return LOGJOB_SITE_NAME
+    job["site_name"] = value
+    await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
+    return LOGJOB_SITE_ADDRESS
+
+
+async def logjob_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the site address.")
+        return LOGJOB_SITE_ADDRESS
+    job["site_address"] = value
+    await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
+    return LOGJOB_CONTACT
+
+
+async def logjob_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    job["contact"] = "" if is_blank_or_skip(value) else value
+    await update.message.reply_text("Task / job description?\n\nExample: HQ leaking tea boiler in ELT kitchen")
+    return LOGJOB_TASK
+
+
+async def logjob_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the task/job description.")
+        return LOGJOB_TASK
+    job["task"] = value
+    await update.message.reply_text("Any extra engineer notes?\n\nType N/A if none.")
+    return LOGJOB_NOTES
+
+
+async def logjob_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    job["notes"] = "" if is_blank_or_skip(value) else value
+    await update.message.reply_text("Job date?\n\nUse today, tomorrow, or DD/MM/YYYY.")
+    return LOGJOB_DATE
+
+
+async def logjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    parsed = parse_helpdesk_job_date(update.message.text)
+    if not parsed:
+        await update.message.reply_text("Please enter a valid date, for example today, tomorrow, or 13/05/2026.")
+        return LOGJOB_DATE
+    job["date"] = parsed
+    try:
+        job["date_display"] = datetime.fromisoformat(parsed).strftime("%d/%m/%Y")
+    except Exception:
+        job["date_display"] = parsed
+    await update.message.reply_text("Start/time required?\n\nUse HH:MM, 0800, 13:30, now, or asap.")
+    return LOGJOB_TIME
+
+
+async def logjob_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    parsed = normalise_helpdesk_time(update.message.text)
+    if not parsed:
+        await update.message.reply_text("Please enter a valid time, for example 08:00, 0800, 13:30, now, or asap.")
+        return LOGJOB_TIME
+    job["time"] = parsed
+    await update.message.reply_text(
+        "Job category? Reply with a number:\n\n" +
+        "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
+    )
+    return LOGJOB_CATEGORY
+
+
+async def logjob_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    text = update.message.text.strip()
+
+    selected = None
+    if text.isdigit():
+        index = int(text)
+        if 1 <= index <= len(JOB_CATEGORY_CHOICES):
+            selected = JOB_CATEGORY_CHOICES[index - 1]
+    else:
+        for choice in JOB_CATEGORY_CHOICES:
+            if text.lower() == choice.lower():
+                selected = choice
+                break
+
+    if not selected:
+        await update.message.reply_text(
+            "Please choose a valid category number:\n\n" +
+            "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
+        )
+        return LOGJOB_CATEGORY
+
+    job["category"] = selected
+    await update.message.reply_text("Customer order number?\n\nType N/A if not available.")
+    return LOGJOB_ORDER_NUMBER
+
+
+async def logjob_order_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+    job["order_number"] = "" if is_blank_or_skip(value) else value
+    engineers = job.get("assignable_engineers", [])
+    await update.message.reply_text(
+        "Assign engineer(s). Reply with the number, or multiple numbers separated by commas.\n\n" +
+        format_engineer_selection_list(engineers)
+    )
+    return LOGJOB_ASSIGN_ENGINEERS
+
+
+async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    engineers = job.get("assignable_engineers", [])
+    selected, error = parse_engineer_selection(update.message.text, engineers)
+    if error:
+        await update.message.reply_text(error + "\n\n" + format_engineer_selection_list(engineers))
+        return LOGJOB_ASSIGN_ENGINEERS
+
+    job["assigned_engineers"] = selected
+    await update.message.reply_text(build_log_job_review(job))
+    return LOGJOB_REVIEW
+
+
+async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+    answer = update.message.text.strip().lower()
+
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("log_job", None)
+        await update.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer in ["restart", "redo"]:
+        context.user_data.pop("log_job", None)
+        return await logjob_start(update, context)
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to create and send, NO to cancel, or RESTART to start again.")
+        return LOGJOB_REVIEW
+
+    try:
+        site_id = job["site_id"]
+        jobs_list_id = job["jobs_list_id"]
+
+        initial_fields = build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=False)
+        created_item = create_list_item_fields(site_id, jobs_list_id, initial_fields)
+        item_id = created_item.get("id")
+        created_fields = created_item.get("fields", initial_fields)
+
+        # Make sure the CDR folder structure exists early, before engineers upload photos or signatures.
+        try:
+            drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
+            cdr_folder = safe_folder_name(job["cdr_number"])
+            ensure_folder(drive_id, f"{PHOTO_BASE_FOLDER}/{cdr_folder}")
+            ensure_folder(drive_id, f"{WORKSHEET_BASE_FOLDER}/{cdr_folder}")
+            ensure_folder(drive_id, f"{SIGNATURE_BASE_FOLDER}/{cdr_folder}")
+        except Exception as folder_error:
+            print(f"WARNING: Could not pre-create job folders for {job['cdr_number']}: {folder_error}")
+
+        sent_to_any, failed = await send_created_job_to_engineers(
+            context.bot,
+            item_id,
+            created_fields,
+            job.get("assigned_engineers", []),
+        )
+
+        final_update = build_field_payload_for_list(
+            site_id,
+            jobs_list_id,
+            {
+                "TelegramNotified": bool(sent_to_any),
+                "Telegram Notified": bool(sent_to_any),
+                "Status": ASSIGNED_STATUS if sent_to_any else AWAITING_DEPLOYMENT_STATUS,
+                "EngineerVisitLog": f"{now_log_time()} - Helpdesk - Job logged via Telegram and {'sent to engineer(s)' if sent_to_any else 'created but not sent'}",
+                "Engineer Visit Log": f"{now_log_time()} - Helpdesk - Job logged via Telegram and {'sent to engineer(s)' if sent_to_any else 'created but not sent'}",
+            },
+        )
+        update_list_item_fields(site_id, jobs_list_id, item_id, final_update)
+
+        context.user_data.pop("log_job", None)
+
+        message = (
+            f"Job created in SharePoint: {job['cdr_number']}\n"
+            f"Assigned to: {', '.join(e['name'] for e in job.get('assigned_engineers', []))}\n"
+            f"Telegram sent: {'Yes' if sent_to_any else 'No'}"
+        )
+        if failed:
+            message += "\n\nSend issues:\n" + "\n".join(failed[:5])
+
+        await update.message.reply_text(
+            message,
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR creating logged job: {e}")
+        await update.message.reply_text(
+            "There was an error creating the job. Nothing further has been sent. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("log_job", None)
+    await update.message.reply_text(
+        "Log Job cancelled. Nothing has been created.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+    )
+    return ConversationHandler.END
 
 async def handle_menu_during_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, current_state):
     """
@@ -4121,6 +4651,31 @@ bugidea_handler = ConversationHandler(
     fallbacks=[CommandHandler("cancel", bugidea_cancel)],
 )
 
+
+logjob_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("logjob", logjob_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_LOG_JOB)}$"), logjob_start),
+    ],
+    states={
+        LOGJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_cdr_number)],
+        LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
+        LOGJOB_CUSTOMER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_address)],
+        LOGJOB_SITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_name)],
+        LOGJOB_SITE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_address)],
+        LOGJOB_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_contact)],
+        LOGJOB_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_task)],
+        LOGJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_notes)],
+        LOGJOB_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_date)],
+        LOGJOB_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_time)],
+        LOGJOB_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_category)],
+        LOGJOB_ORDER_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_order_number)],
+        LOGJOB_ASSIGN_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_assign_engineers)],
+        LOGJOB_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_review)],
+    },
+    fallbacks=[CommandHandler("cancel", logjob_cancel)],
+)
+
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
@@ -4129,6 +4684,7 @@ telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
+telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_EMERGENCY_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
