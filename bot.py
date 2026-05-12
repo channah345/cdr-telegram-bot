@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-dispatch-board-v1"
+BUILD_VERSION = "helpdesk-dispatch-rollback-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -460,7 +460,6 @@ def get_helpdesk_menu(include_engineer_menu=False):
     rows = [
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
-        [MENU_DISPATCH_BOARD],
     ]
 
     if include_engineer_menu:
@@ -480,7 +479,6 @@ def get_admin_menu():
             [MENU_END_DAY, MENU_BUG_IDEA],
             [MENU_LOG_JOB, MENU_REASSIGN_JOB],
             [MENU_OPEN_JOBS, MENU_FIND_JOB],
-            [MENU_DISPATCH_BOARD],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -5964,9 +5962,8 @@ telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
-telegram_app.add_handler(dispatch_handler)
 telegram_app.add_handler(findjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_DISPATCH_BOARD}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
