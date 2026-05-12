@@ -672,12 +672,16 @@ def is_closed_job(fields):
         "Revisit Required",
     }
 
-    # Active/open statuses must stay usable even if WorksheetSubmitted
-    # is still true from an old attendance or reopened job.
+    # Multi-engineer logic:
+    # WorksheetSubmitted can be true when ONE engineer has completed
+    # their worksheet, but the overall job must remain active for
+    # the remaining assigned engineers.
+    #
+    # Therefore WorksheetSubmitted must NOT close the entire job.
     if status in open_statuses and outcome not in closed_outcomes:
         return False
 
-    return status in closed_statuses or outcome in closed_outcomes or worksheet_submitted
+    return status in closed_statuses or outcome in closed_outcomes
 
 
 def has_engineer_action(fields, engineer_name, action):
