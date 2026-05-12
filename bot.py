@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-find-job-v1"
+BUILD_VERSION = "helpdesk-open-jobs-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -134,6 +134,8 @@ REASSIGN_REVIEW = 45
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
+OPENJOBS_FILTER = 48
+OPENJOBS_SELECT = 49
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -2473,6 +2475,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_FIND_JOB:
         return await findjob_start(update, context)
 
+    if text == MENU_OPEN_JOBS:
+        return await openjobs_start(update, context)
+
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
@@ -3200,6 +3205,259 @@ def format_helpdesk_job_detail(job, engineers):
         "- Use 🔁 Reassign Job to change/send engineers.\n"
         "- Use 🔎 Find Job again to search another job."
     )
+
+
+def open_job_bucket(fields):
+    status = str(get_field_value(fields, "Status") or "").strip()
+    outcome = str(get_field_value(fields, "JobOutcome", "Job Outcome") or "").strip()
+    job_date = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "")
+    today = datetime.now(UK_TZ).date()
+
+    if status == COMPLETED_STATUS or outcome == "Completed":
+        return "completed_today" if job_date == today else "completed_old"
+
+    if status in ["No Access", "Revisit Required"] or outcome in ["No Access", "Revisit Required"]:
+        if status in [AWAITING_DEPLOYMENT_STATUS, LEGACY_AWAITING_DEPLOYMENT_STATUS, ""]:
+            return "returned"
+        if status not in [ASSIGNED_STATUS, TRAVELLING_STATUS, ON_SITE_STATUS]:
+            return "returned"
+
+    if status in [AWAITING_DEPLOYMENT_STATUS, LEGACY_AWAITING_DEPLOYMENT_STATUS, ""]:
+        return "awaiting_dispatch"
+
+    if status == ASSIGNED_STATUS:
+        return "assigned_not_started"
+
+    if status in [TRAVELLING_STATUS, ON_SITE_STATUS]:
+        return "live"
+
+    return "other_open"
+
+
+def is_helpdesk_open_job(fields):
+    return open_job_bucket(fields) not in ["completed_old"]
+
+
+def filter_helpdesk_open_jobs(jobs_data, filter_key="all_open"):
+    jobs = []
+    for job in jobs_data:
+        fields = job.get("fields", {})
+        bucket = open_job_bucket(fields)
+
+        if filter_key == "all_open":
+            if bucket not in ["completed_today", "completed_old"]:
+                jobs.append(job)
+        elif filter_key == "today":
+            job_date = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "")
+            if job_date == datetime.now(UK_TZ).date() and bucket != "completed_old":
+                jobs.append(job)
+        elif filter_key == bucket:
+            jobs.append(job)
+
+    def sort_key(job):
+        fields = job.get("fields", {})
+        dt = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "")
+        cdr = str(get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "")
+        # undated jobs first so helpdesk notices them
+        return (dt or datetime.min.date(), cdr)
+
+    jobs.sort(key=sort_key)
+    return jobs
+
+
+def openjobs_filter_keyboard_text():
+    return (
+        "Open Jobs dashboard.\n\n"
+        "Reply with one option:\n"
+        "1. Awaiting Dispatch\n"
+        "2. Assigned - not started\n"
+        "3. Live - Travelling / On Site\n"
+        "4. Returned - No Access / Revisit Required\n"
+        "5. Completed today\n"
+        "6. All open jobs\n"
+        "7. Today's jobs\n\n"
+        "You can also type a status name, e.g. Assigned, On Site, No Access."
+    )
+
+
+def parse_openjobs_filter(text):
+    value = str(text or "").strip().lower()
+    mapping = {
+        "1": "awaiting_dispatch",
+        "awaiting": "awaiting_dispatch",
+        "awaiting dispatch": "awaiting_dispatch",
+        "awaiting deployment": "awaiting_dispatch",
+        "2": "assigned_not_started",
+        "assigned": "assigned_not_started",
+        "not started": "assigned_not_started",
+        "3": "live",
+        "live": "live",
+        "travelling": "live",
+        "on site": "live",
+        "onsite": "live",
+        "4": "returned",
+        "returned": "returned",
+        "no access": "returned",
+        "revisit": "returned",
+        "revisit required": "returned",
+        "5": "completed_today",
+        "completed": "completed_today",
+        "completed today": "completed_today",
+        "6": "all_open",
+        "all": "all_open",
+        "all open": "all_open",
+        "open": "all_open",
+        "7": "today",
+        "today": "today",
+        "todays": "today",
+        "today's": "today",
+    }
+    return mapping.get(value)
+
+
+def openjobs_filter_label(filter_key):
+    return {
+        "awaiting_dispatch": "Awaiting Dispatch",
+        "assigned_not_started": "Assigned - not started",
+        "live": "Live - Travelling / On Site",
+        "returned": "Returned - No Access / Revisit Required",
+        "completed_today": "Completed today",
+        "all_open": "All open jobs",
+        "today": "Today's jobs",
+    }.get(filter_key, "Open jobs")
+
+
+def format_openjobs_results(jobs, filter_key, engineers, max_rows=20):
+    label = openjobs_filter_label(filter_key)
+    lines = [f"{label}: {len(jobs)} job(s)"]
+
+    if not jobs:
+        lines.append("\nNo jobs found in this view.")
+        lines.append("\nType FILTER to choose another view, or /cancel to exit.")
+        return "\n".join(lines)
+
+    for index, job in enumerate(jobs[:max_rows], start=1):
+        fields = job.get("fields", {})
+        cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "No CDR"
+        site = get_field_value(fields, "SiteName", "Site Name") or "No site"
+        date = format_sharepoint_date(get_field_value(fields, "Date") or "") or "No date"
+        status = get_field_value(fields, "Status") or "No status"
+        outcome = get_field_value(fields, "JobOutcome", "Job Outcome") or ""
+        assigned = get_current_assigned_engineers_from_job(fields, engineers)
+        assigned_names = ", ".join(e["name"] for e in assigned) or "Unassigned"
+        outcome_text = f" / {outcome}" if outcome and outcome != status else ""
+        lines.append(f"{index}. {cdr} | {site} | {date} | {status}{outcome_text} | {assigned_names}")
+
+    if len(jobs) > max_rows:
+        lines.append(f"...and {len(jobs) - max_rows} more. Narrow the view if needed.")
+
+    lines.append("\nReply with a number to view full details, FILTER to change view, or /cancel to exit.")
+    return "\n".join(lines)
+
+
+async def openjobs_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to view Open Jobs.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+
+        context.user_data["open_jobs"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "role": role,
+        }
+
+        await update.message.reply_text(
+            openjobs_filter_keyboard_text(),
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return OPENJOBS_FILTER
+
+    except Exception as e:
+        print(f"ERROR opening Open Jobs: {e}")
+        await update.message.reply_text(
+            "There was an error opening Open Jobs. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def openjobs_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("open_jobs")
+    if not data:
+        await update.message.reply_text("Please start again using 📋 Open Jobs.")
+        return ConversationHandler.END
+
+    filter_key = parse_openjobs_filter(update.message.text)
+    if not filter_key:
+        await update.message.reply_text("I did not recognise that view.\n\n" + openjobs_filter_keyboard_text())
+        return OPENJOBS_FILTER
+
+    try:
+        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        jobs = filter_helpdesk_open_jobs(jobs_data, filter_key)
+        data["filter_key"] = filter_key
+        data["jobs"] = jobs
+
+        await update.message.reply_text(format_openjobs_results(jobs, filter_key, data.get("engineers", [])))
+        return OPENJOBS_SELECT
+
+    except Exception as e:
+        print(f"ERROR filtering Open Jobs: {e}")
+        await update.message.reply_text("There was an error loading Open Jobs. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def openjobs_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("open_jobs")
+    if not data:
+        await update.message.reply_text("Please start again using 📋 Open Jobs.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip().lower()
+    if text in ["filter", "filters", "back", "change", "restart"]:
+        await update.message.reply_text(openjobs_filter_keyboard_text())
+        return OPENJOBS_FILTER
+
+    if not text.isdigit():
+        await update.message.reply_text("Reply with a job number, FILTER to change view, or /cancel to exit.")
+        return OPENJOBS_SELECT
+
+    jobs = data.get("jobs", [])
+    index = int(text)
+    if index < 1 or index > len(jobs):
+        await update.message.reply_text("That number is not in the list. Reply with one of the job numbers shown.")
+        return OPENJOBS_SELECT
+
+    selected_job = jobs[index - 1]
+    role = data.get("role", "Helpdesk")
+    await update.message.reply_text(
+        format_helpdesk_job_detail(selected_job, data.get("engineers", [])),
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+    )
+    context.user_data.pop("open_jobs", None)
+    return ConversationHandler.END
+
+
+async def openjobs_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("open_jobs", None)
+    await update.message.reply_text(
+        "Open Jobs cancelled.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+    )
+    return ConversationHandler.END
 
 
 async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5280,6 +5538,19 @@ reassign_handler = ConversationHandler(
 )
 
 
+openjobs_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("openjobs", openjobs_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_OPEN_JOBS)}$"), openjobs_start),
+    ],
+    states={
+        OPENJOBS_FILTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, openjobs_filter)],
+        OPENJOBS_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, openjobs_select)],
+    },
+    fallbacks=[CommandHandler("cancel", openjobs_cancel)],
+)
+
+
 findjob_handler = ConversationHandler(
     entry_points=[
         CommandHandler("findjob", findjob_start),
@@ -5327,6 +5598,7 @@ telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(reassign_handler)
+telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_EMERGENCY_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
