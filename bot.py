@@ -2497,6 +2497,32 @@ async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TY
     return await begin_worksheet_for_job(update, context, item_id=item_id, outcome=outcome)
 
 
+async def noaccess_reason_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Conversation entry point after an engineer chooses a No Access reason.
+
+    This must be an entry point on the worksheet ConversationHandler; otherwise
+    the next typed note is received by the bot but no worksheet state is active.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, item_id, reason_key = query.data.split("|", 2)
+    except Exception:
+        await query.message.reply_text("Could not start the No Access worksheet. Tap 📋 My Jobs and try again.")
+        return ConversationHandler.END
+
+    no_access_reason = NO_ACCESS_REASONS.get(reason_key, "Other / see notes")
+
+    return await begin_worksheet_for_job(
+        update,
+        context,
+        item_id=item_id,
+        outcome="No Access",
+        no_access_reason=no_access_reason,
+    )
+
+
 async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
@@ -3314,6 +3340,7 @@ endday_handler = ConversationHandler(
 worksheet_handler = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(complete_button_start, pattern="^start_worksheet\\|"),
+        CallbackQueryHandler(noaccess_reason_start, pattern="^noaccess_reason\\|"),
         CommandHandler("complete", complete_start),
     ],
     states={
