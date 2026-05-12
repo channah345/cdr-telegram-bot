@@ -191,9 +191,10 @@ def normalise_field_name(value):
 
 def build_field_payload_for_list(site_id, list_id, fields):
     """
-    SharePoint Graph updates need the internal column name, not always the display name.
-    This maps common/display names such as 'Van Registration' to the actual internal name.
-    Unknown optional fields are skipped rather than breaking the bot.
+    SharePoint Graph needs the real internal column name.
+    Important: SharePoint exposes read-only Title display fields such as
+    LinkTitle and LinkTitleNoMenu, so we ignore read-only columns and force
+    Title to write to the editable Title field only.
     """
     columns = get_list_columns(site_id, list_id)
     lookup = {}
@@ -201,16 +202,27 @@ def build_field_payload_for_list(site_id, list_id, fields):
     for column in columns:
         internal_name = column.get("name", "")
         display_name = column.get("displayName", "")
+        read_only = column.get("readOnly", False)
+
+        # Do not map display names to read-only SharePoint fields such as LinkTitleNoMenu.
+        if read_only:
+            continue
+
+        if internal_name == "Title":
+            lookup[normalise_field_name("Title")] = "Title"
 
         for key in [internal_name, display_name]:
             normalised = normalise_field_name(key)
-            if normalised:
+            if normalised and normalised not in lookup:
                 lookup[normalised] = internal_name
 
     payload = {}
 
     for desired_name, value in fields.items():
-        internal_name = lookup.get(normalise_field_name(desired_name))
+        if desired_name == "Title":
+            internal_name = "Title"
+        else:
+            internal_name = lookup.get(normalise_field_name(desired_name))
 
         if internal_name:
             payload[internal_name] = value
