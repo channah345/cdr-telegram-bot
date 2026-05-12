@@ -55,7 +55,7 @@ MENU_BUG_IDEA = "🐞 Bug / Ideas"
 
 UK_TZ = ZoneInfo("Europe/London")
 
-AWAITING_DEPLOYMENT_STATUS = "Awaiting Engineer Deployment"
+AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
 ASSIGNED_STATUS = "Assigned"
 COMPLETED_STATUS = "Completed"
 
@@ -648,6 +648,8 @@ def is_closed_job(fields):
 
     closed_statuses = {
         COMPLETED_STATUS,
+        "No Access",
+        "Revisit Required",
     }
 
     closed_outcomes = {
@@ -696,8 +698,13 @@ def validate_job_action(fields, engineer_name, action):
 
 def should_auto_send_job(fields):
     """
-    Auto-send only jobs that are assigned, unnotified, open, and dated today.
-    Awaiting Engineer Deployment is allowed because that is the normal dispatch queue status.
+    Auto-send today's jobs only when:
+    - an engineer is assigned
+    - TelegramNotified is not already true
+    - the job is not completed/no access/revisit
+    - the job is dated today
+
+    Status may be blank, Awaiting Dispatch, or Assigned.
     """
     if is_notified(fields):
         return False
@@ -712,7 +719,18 @@ def should_auto_send_job(fields):
     job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
     today = datetime.now(UK_TZ).date()
 
-    return job_date == today
+    if job_date != today:
+        return False
+
+    status = str(fields.get("Status", "") or "").strip()
+
+    allowed_statuses = {
+        "",
+        AWAITING_DEPLOYMENT_STATUS,
+        ASSIGNED_STATUS,
+    }
+
+    return status in allowed_statuses
 
 
 def find_job_by_cdr(jobs_data, cdr_number):
@@ -2439,11 +2457,13 @@ async def send_new_jobs(app):
                 continue
 
             assigned_ids = get_assigned_engineer_ids(fields)
+            sent_to_any_engineer = False
 
             for engineer_id in assigned_ids:
                 engineer = engineers_by_lookup.get(engineer_id)
 
                 if not engineer:
+                    print(f"WARNING: No engineer record found for lookup ID {engineer_id} on job {fields.get('CDRNumber', item_id)}")
                     continue
 
                 try:
@@ -2452,10 +2472,12 @@ async def send_new_jobs(app):
                         text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
                         reply_markup=get_job_buttons(item_id),
                     )
+                    sent_to_any_engineer = True
                 except Exception as e:
                     print(f"WARNING: Could not send job {fields.get('CDRNumber', item_id)} to engineer {engineer_id}: {e}")
 
-            sent_job_ids.add(item_id)
+            if sent_to_any_engineer:
+                sent_job_ids.add(item_id)
 
         for item_id in sent_job_ids:
             try:
