@@ -648,7 +648,6 @@ def is_closed_job(fields):
 
     closed_statuses = {
         COMPLETED_STATUS,
-        AWAITING_DEPLOYMENT_STATUS,
     }
 
     closed_outcomes = {
@@ -697,8 +696,8 @@ def validate_job_action(fields, engineer_name, action):
 
 def should_auto_send_job(fields):
     """
-    Auto-send only jobs that are assigned, unnotified and dated today.
-    This prevents future jobs being pushed early and reduces accidental spam.
+    Auto-send only jobs that are assigned, unnotified, open, and dated today.
+    Awaiting Engineer Deployment is allowed because that is the normal dispatch queue status.
     """
     if is_notified(fields):
         return False
