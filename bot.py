@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -488,6 +488,9 @@ async def notify_helpdesk(context, text):
 @web_app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse("CDR Engineer Bot signature portal is online.")
+@web_app.get("/logo.png")
+def logo():
+    return FileResponse("cdr-logo.png")
 
 
 @web_app.get("/sign/{cdr_number}", response_class=HTMLResponse)
@@ -529,8 +532,8 @@ def signature_page(cdr_number: str, token: str):
     </head>
     <body>
         <div class="container">
-            <h1>CDR M&E Services Ltd</h1>
-            <h2>Client Signature</h2>
+            <img src="/logo.png" alt="CDR M&E Services Ltd" style="display:block; max-width:320px; width:80%; margin:0 auto 20px auto;">
+            <h2 style="text-align:center;">Client Signature</h2>
             <div class="job-box">
                 <p><strong>CDR Number:</strong> {cdr_number}</p>
                 <p><strong>Site:</strong> {site}</p>
@@ -562,26 +565,26 @@ def signature_page(cdr_number: str, token: str):
             const canvas = document.getElementById("signature-pad");
             const signaturePad = new SignaturePad(canvas);
 
-            canvas.addEventListener("touchstart", function (event) {
+            canvas.addEventListener("touchstart", function (event) {{
                 event.preventDefault();
-            }, { passive: false });
+            }}, {{ passive: false }});
 
-            canvas.addEventListener("touchmove", function (event) {
+            canvas.addEventListener("touchmove", function (event) {{
                 event.preventDefault();
-            }, { passive: false });
+            }}, {{ passive: false }});
 
-            canvas.addEventListener("touchend", function (event) {
+            canvas.addEventListener("touchend", function (event) {{
                 event.preventDefault();
-            }, { passive: false });
+            }}, {{ passive: false }});
 
-            function resizeCanvas() {
+            function resizeCanvas() {{
                 const ratio = Math.max(window.devicePixelRatio || 1, 1);
                 const rect = canvas.getBoundingClientRect();
                 canvas.width = rect.width * ratio;
                 canvas.height = rect.height * ratio;
                 canvas.getContext("2d").scale(ratio, ratio);
                 signaturePad.clear();
-            }
+            }}
 
             window.addEventListener("resize", resizeCanvas);
             resizeCanvas();
