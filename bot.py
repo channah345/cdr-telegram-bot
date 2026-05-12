@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "worksheet-hide-helpdesk-commands-v1"
+BUILD_VERSION = "helpdesk-dispatch-board-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -77,6 +77,7 @@ MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
 MENU_OPEN_JOBS = "📋 Open Jobs"
 MENU_FIND_JOB = "🔎 Find Job"
+MENU_DISPATCH_BOARD = "🗂 Dispatch Board"
 MENU_EMERGENCY_JOB = "🚨 Emergency Job"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
 
@@ -136,6 +137,9 @@ FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
 OPENJOBS_FILTER = 48
 OPENJOBS_SELECT = 49
+DISPATCH_SELECT_JOB = 50
+DISPATCH_SELECT_ENGINEER = 51
+DISPATCH_CONFIRM = 52
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -456,7 +460,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
     rows = [
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
-        [MENU_EMERGENCY_JOB],
+        [MENU_DISPATCH_BOARD],
     ]
 
     if include_engineer_menu:
@@ -476,7 +480,7 @@ def get_admin_menu():
             [MENU_END_DAY, MENU_BUG_IDEA],
             [MENU_LOG_JOB, MENU_REASSIGN_JOB],
             [MENU_OPEN_JOBS, MENU_FIND_JOB],
-            [MENU_EMERGENCY_JOB],
+            [MENU_DISPATCH_BOARD],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -3460,6 +3464,315 @@ async def openjobs_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+
+
+def job_is_dispatchable(fields):
+    """Jobs that are sensible to show on the dispatch board."""
+    bucket = open_job_bucket(fields)
+    return bucket in ["awaiting_dispatch", "assigned_not_started", "returned", "other_open"]
+
+
+def get_engineer_live_status_from_jobs(jobs_data, engineer_lookup_id):
+    today = datetime.now(UK_TZ).date()
+    live = []
+    assigned_today = 0
+    open_total = 0
+
+    for job in jobs_data:
+        fields = job.get("fields", {})
+        assigned_ids = get_assigned_engineer_ids(fields)
+        if str(engineer_lookup_id) not in assigned_ids:
+            continue
+
+        if not is_closed_job(fields):
+            open_total += 1
+
+        job_date = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "")
+        if job_date == today and not is_closed_job(fields):
+            assigned_today += 1
+            status = str(get_field_value(fields, "Status") or "").strip()
+            if status in [TRAVELLING_STATUS, ON_SITE_STATUS]:
+                cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "No CDR"
+                site = get_field_value(fields, "SiteName", "Site Name") or "No site"
+                live.append(f"{status} at {cdr} - {site}")
+
+    if live:
+        return "; ".join(live[:2]), assigned_today, open_total
+    if assigned_today:
+        return "Assigned today", assigned_today, open_total
+    if open_total:
+        return "Has open jobs", assigned_today, open_total
+    return "Available", assigned_today, open_total
+
+
+def format_dispatch_job_list(jobs, engineers, max_rows=12):
+    lines = ["Dispatch Board - jobs ready to move/send:\n"]
+
+    if not jobs:
+        lines.append("No dispatchable jobs found. Use ➕ Log Job or 📋 Open Jobs instead.")
+        return "\n".join(lines)
+
+    for index, job in enumerate(jobs[:max_rows], start=1):
+        fields = job.get("fields", {})
+        cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "No CDR"
+        site = get_field_value(fields, "SiteName", "Site Name") or "No site"
+        date = format_sharepoint_date(get_field_value(fields, "Date") or "") or "No date"
+        status = get_field_value(fields, "Status") or "Awaiting Dispatch"
+        assigned = get_current_assigned_engineers_from_job(fields, engineers)
+        assigned_names = ", ".join(e["name"] for e in assigned) or "Unassigned"
+        lines.append(f"{index}. {cdr} | {site} | {date} | {status} | {assigned_names}")
+
+    if len(jobs) > max_rows:
+        lines.append(f"...and {len(jobs) - max_rows} more. Use 📋 Open Jobs for wider filtering.")
+
+    lines.append("\nReply with the job number to assign/send, REFRESH to reload, or /cancel to exit.")
+    return "\n".join(lines)
+
+
+def format_dispatch_engineer_board(assignable_engineers, jobs_data):
+    lines = ["Choose engineer(s) for this job:\n"]
+    for index, engineer in enumerate(assignable_engineers, start=1):
+        live_status, assigned_today, open_total = get_engineer_live_status_from_jobs(jobs_data, engineer["lookup_id"])
+        warning = " ⚠️" if assigned_today >= 4 or live_status.startswith((TRAVELLING_STATUS, ON_SITE_STATUS)) else ""
+        lines.append(
+            f"{index}. {engineer['name']} - {live_status} | Today: {assigned_today} | Open: {open_total}{warning}"
+        )
+    lines.append("\nReply with engineer number(s), e.g. 1 or 1,3. Type BACK to choose a different job.")
+    return "\n".join(lines)
+
+
+def build_dispatch_review(data):
+    fields = data.get("job_fields", {})
+    current = ", ".join(e["name"] for e in data.get("current_engineers", [])) or "None"
+    selected = ", ".join(e["name"] for e in data.get("selected_engineers", [])) or "None"
+    return (
+        "Please review this dispatch change:\n\n"
+        f"CDR Number: {get_field_value(fields, 'CDRNumber', 'CDR Number', 'Title') or ''}\n"
+        f"Site: {get_field_value(fields, 'SiteName', 'Site Name') or ''}\n"
+        f"Current engineer(s): {current}\n"
+        f"New engineer(s): {selected}\n\n"
+        "Reply YES to update SharePoint and send the job to the selected engineer(s), NO to cancel, or BACK to choose engineers again."
+    )
+
+
+async def dispatch_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to use the Dispatch Board.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        assignable = get_active_assignable_engineers(engineers)
+        dispatch_jobs = [job for job in jobs_data if job_is_dispatchable(job.get("fields", {}))]
+
+        def sort_key(job):
+            fields = job.get("fields", {})
+            bucket_order = {
+                "awaiting_dispatch": 0,
+                "returned": 1,
+                "assigned_not_started": 2,
+                "other_open": 3,
+            }.get(open_job_bucket(fields), 9)
+            date_value = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "") or datetime.min.date()
+            cdr = str(get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "")
+            return (bucket_order, date_value, cdr)
+
+        dispatch_jobs.sort(key=sort_key)
+
+        context.user_data["dispatch_board"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "assignable_engineers": assignable,
+            "jobs_data": jobs_data,
+            "dispatch_jobs": dispatch_jobs,
+            "role": role,
+        }
+
+        await update.message.reply_text(
+            format_dispatch_job_list(dispatch_jobs, engineers),
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return DISPATCH_SELECT_JOB
+
+    except Exception as e:
+        print(f"ERROR opening Dispatch Board: {e}")
+        await update.message.reply_text(
+            "There was an error opening the Dispatch Board. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def dispatch_select_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("dispatch_board")
+    if not data:
+        await update.message.reply_text("Please start again using 🗂 Dispatch Board.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip().lower()
+    if text in ["refresh", "reload"]:
+        return await dispatch_start(update, context)
+
+    if not text.isdigit():
+        await update.message.reply_text("Reply with a job number, REFRESH to reload, or /cancel to exit.")
+        return DISPATCH_SELECT_JOB
+
+    index = int(text)
+    jobs = data.get("dispatch_jobs", [])
+    if index < 1 or index > len(jobs):
+        await update.message.reply_text("That number is not in the dispatch list. Reply with one of the job numbers shown.")
+        return DISPATCH_SELECT_JOB
+
+    selected_job = jobs[index - 1]
+    fields = selected_job.get("fields", {})
+    data["selected_job"] = selected_job
+    data["item_id"] = selected_job.get("id")
+    data["job_fields"] = fields
+    data["current_engineers"] = get_current_assigned_engineers_from_job(fields, data.get("engineers", []))
+
+    assignable = data.get("assignable_engineers", [])
+    if not assignable:
+        await update.message.reply_text("No active assignable engineers were found in SharePoint.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(format_dispatch_engineer_board(assignable, data.get("jobs_data", [])))
+    return DISPATCH_SELECT_ENGINEER
+
+
+async def dispatch_select_engineer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("dispatch_board")
+    if not data:
+        await update.message.reply_text("Please start again using 🗂 Dispatch Board.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip().lower()
+    if text in ["back", "jobs"]:
+        await update.message.reply_text(format_dispatch_job_list(data.get("dispatch_jobs", []), data.get("engineers", [])))
+        return DISPATCH_SELECT_JOB
+
+    selected, error = parse_engineer_selection(update.message.text, data.get("assignable_engineers", []))
+    if error:
+        await update.message.reply_text(error + "\n\n" + format_dispatch_engineer_board(data.get("assignable_engineers", []), data.get("jobs_data", [])))
+        return DISPATCH_SELECT_ENGINEER
+
+    data["selected_engineers"] = selected
+    await update.message.reply_text(build_dispatch_review(data))
+    return DISPATCH_CONFIRM
+
+
+async def dispatch_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("dispatch_board")
+    role = data.get("role", "Helpdesk") if data else "Helpdesk"
+    if not data:
+        await update.message.reply_text("Please start again using 🗂 Dispatch Board.")
+        return ConversationHandler.END
+
+    answer = update.message.text.strip().lower()
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("dispatch_board", None)
+        await update.message.reply_text(
+            "Dispatch cancelled. Nothing has been changed.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer in ["back", "engineers"]:
+        await update.message.reply_text(format_dispatch_engineer_board(data.get("assignable_engineers", []), data.get("jobs_data", [])))
+        return DISPATCH_SELECT_ENGINEER
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to dispatch, NO to cancel, or BACK to choose engineers again.")
+        return DISPATCH_CONFIRM
+
+    try:
+        site_id = data["site_id"]
+        jobs_list_id = data["jobs_list_id"]
+        item_id = data["item_id"]
+        fields = data.get("job_fields", {})
+        selected_engineers = data.get("selected_engineers", [])
+        cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+
+        note = f"Dispatched to: {', '.join(e['name'] for e in selected_engineers) or 'None'} via Dispatch Board"
+        updated_log = append_engineer_log(fields, "Helpdesk", "Dispatched", note)
+
+        payload = build_field_payload_for_list(
+            site_id,
+            jobs_list_id,
+            {
+                "Status": ASSIGNED_STATUS if selected_engineers else AWAITING_DEPLOYMENT_STATUS,
+                "TelegramNotified": False,
+                "Telegram Notified": False,
+                "EngineerVisitLog": updated_log,
+                "Engineer Visit Log": updated_log,
+            },
+        )
+        payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
+        payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in selected_engineers]
+        update_list_item_fields(site_id, jobs_list_id, item_id, payload)
+
+        send_fields = dict(fields)
+        send_fields.update({
+            "Status": ASSIGNED_STATUS if selected_engineers else AWAITING_DEPLOYMENT_STATUS,
+            "EngineerVisitLog": updated_log,
+        })
+        sent_to_any, failed = await send_created_job_to_engineers(
+            context.bot,
+            item_id,
+            send_fields,
+            selected_engineers,
+        )
+
+        final_payload = build_field_payload_for_list(
+            site_id,
+            jobs_list_id,
+            {
+                "TelegramNotified": bool(sent_to_any),
+                "Telegram Notified": bool(sent_to_any),
+            },
+        )
+        update_list_item_fields(site_id, jobs_list_id, item_id, final_payload)
+
+        context.user_data.pop("dispatch_board", None)
+        message = (
+            f"Dispatch updated: {cdr_number}\n"
+            f"Assigned engineer(s): {', '.join(e['name'] for e in selected_engineers) or 'None'}\n"
+        )
+        if failed:
+            message += "\nWarning - could not send to:\n" + "\n".join(failed)
+        elif sent_to_any:
+            message += "\nJob sent to engineer(s)."
+
+        await update.message.reply_text(
+            message,
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR confirming Dispatch Board update: {e}")
+        await update.message.reply_text("There was an error updating dispatch. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def dispatch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("dispatch_board", None)
+    await update.message.reply_text(
+        "Dispatch Board cancelled.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+    )
+    return ConversationHandler.END
+
 async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
 
@@ -5589,6 +5902,20 @@ openjobs_handler = ConversationHandler(
 )
 
 
+dispatch_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("dispatch", dispatch_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_DISPATCH_BOARD)}$"), dispatch_start),
+    ],
+    states={
+        DISPATCH_SELECT_JOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_select_job)],
+        DISPATCH_SELECT_ENGINEER: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_select_engineer)],
+        DISPATCH_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_confirm)],
+    },
+    fallbacks=[CommandHandler("cancel", dispatch_cancel)],
+)
+
+
 findjob_handler = ConversationHandler(
     entry_points=[
         CommandHandler("findjob", findjob_start),
@@ -5637,8 +5964,9 @@ telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
+telegram_app.add_handler(dispatch_handler)
 telegram_app.add_handler(findjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_EMERGENCY_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_DISPATCH_BOARD}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
