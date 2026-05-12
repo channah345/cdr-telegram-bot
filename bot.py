@@ -1236,17 +1236,84 @@ def submit_signature(
         },
     )
 
-    return HTMLResponse(
-        """
-        <html>
-            <body style="font-family: Arial; padding: 30px;">
-                <h2>Signature saved</h2>
-                <p>Thank you. The job has been signed successfully.</p>
-                <p>You can now hand the phone back to the engineer.</p>
-            </body>
-        </html>
-        """
-    )
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Signature Saved</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            text-align: center;
+        }
+
+        .container {
+            background: white;
+            width: 100%;
+            max-width: 520px;
+            border-radius: 24px;
+            padding: 40px 25px;
+            box-shadow: 0 6px 25px rgba(0,0,0,0.12);
+        }
+
+        .logo {
+            width: 180px;
+            max-width: 80%;
+            margin-bottom: 30px;
+        }
+
+        .tick {
+            font-size: 90px;
+            color: #22c55e;
+            margin-bottom: 20px;
+            font-weight: bold;
+        }
+
+        h1 {
+            font-size: 40px;
+            margin: 0 0 25px 0;
+            color: #111827;
+        }
+
+        p {
+            font-size: 24px;
+            line-height: 1.6;
+            color: #374151;
+            margin: 0;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+
+    <img src="/logo.png" class="logo">
+
+    <div class="tick">✓</div>
+
+    <h1>Signature Saved</h1>
+
+    <p>
+        Thank you.<br><br>
+        The worksheet has been successfully submitted.
+        <br><br>
+        You may now close this page.
+    </p>
+
+</div>
+
+</body>
+</html>
+""")
 
 
 def run_signature_web_server():
