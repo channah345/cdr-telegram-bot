@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "worksheet-final-v5"
+BUILD_VERSION = "worksheet-final-v6"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2960,6 +2960,88 @@ def safe_pdf_filename(value):
     return cleaned.replace(" ", "_") or "worksheet"
 
 
+
+def clean_engineer_log_extra(value):
+    """Keep EngineerVisitLog extra text to one safe line so it can be parsed back into the PDF."""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def build_visit_comment_extra(worksheet):
+    """Create a compact visit comment for EngineerVisitLog and the final worksheet PDF."""
+    parts = []
+
+    outcome = worksheet.get("JobOutcome", "Completed")
+    if outcome:
+        parts.append(f"Outcome: {outcome}")
+
+    if outcome == "No Access" and worksheet.get("NoAccessReason"):
+        parts.append(f"No Access Reason: {worksheet.get('NoAccessReason')}")
+
+    work_completed = clean_engineer_log_extra(worksheet.get("WorkCompleted", ""))
+    if work_completed and work_completed.upper() != "N/A":
+        parts.append(f"Work/Comments: {work_completed}")
+
+    materials = clean_engineer_log_extra(worksheet.get("MaterialsUsed", ""))
+    if materials and materials.lower() not in ["none", "n/a", "no"]:
+        parts.append(f"Materials Used: {materials}")
+
+    if worksheet.get("FollowOnRequired"):
+        follow_on = clean_engineer_log_extra(worksheet.get("FollowOnNotes", ""))
+        parts.append(f"Follow-on Required: Yes{(' - ' + follow_on) if follow_on else ''}")
+    else:
+        parts.append("Follow-on Required: No")
+
+    engineer_notes = clean_engineer_log_extra(worksheet.get("EngineerCompletionNotes", ""))
+    if engineer_notes and engineer_notes.lower() not in ["none", "n/a", "no"]:
+        parts.append(f"Engineer Notes: {engineer_notes}")
+
+    return " | ".join(parts) or "Worksheet submitted"
+
+
+def normalise_visit_note(value):
+    note = clean_engineer_log_extra(value)
+    if not note:
+        return ""
+    if note == "Worksheet submitted":
+        return ""
+    return note.replace(" | ", "\n")
+
+
+def build_engineer_comments_for_pdf(visits, worksheet, fields):
+    """Show comments for every visit, not just the final completed visit."""
+    comment_blocks = []
+
+    for visit in visits:
+        note = normalise_visit_note(visit.get("notes", ""))
+        if not note:
+            continue
+
+        heading_bits = [
+            clean_pdf_text(visit.get("date")),
+            clean_pdf_text(visit.get("engineer")),
+            clean_pdf_text(visit.get("status")),
+        ]
+        heading = " - ".join([bit for bit in heading_bits if bit and bit != "N/A"])
+        comment_blocks.append(f"{heading}\n{note}")
+
+    # Fallback for older jobs where previous worksheet comments were not yet being written into EngineerVisitLog.
+    if not comment_blocks:
+        comments = worksheet.get("WorkCompleted", "")
+        if worksheet.get("MaterialsUsed") and str(worksheet.get("MaterialsUsed")).strip().lower() != "none":
+            comments += f"\n\nMaterials Used: {worksheet.get('MaterialsUsed')}"
+        if worksheet.get("FollowOnRequired"):
+            comments += f"\n\nFollow-on Required: Yes\n{worksheet.get('FollowOnNotes', '')}"
+        else:
+            comments += "\n\nFollow-on Required: No"
+        if worksheet.get("EngineerCompletionNotes") and str(worksheet.get("EngineerCompletionNotes")).strip().lower() != "none":
+            comments += f"\n\nEngineer Notes: {worksheet.get('EngineerCompletionNotes')}"
+        return comments
+
+    return "\n\n".join(comment_blocks)
+
+
 def parse_engineer_visit_log(log_text):
     """
     Build one worksheet visit row per attendance from EngineerVisitLog.
@@ -3249,15 +3331,7 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=N
     story.append(visits_table)
     story.append(Spacer(1, 7))
 
-    comments = worksheet.get("WorkCompleted", "")
-    if worksheet.get("MaterialsUsed") and str(worksheet.get("MaterialsUsed")).strip().lower() != "none":
-        comments += f"\n\nMaterials Used: {worksheet.get('MaterialsUsed')}"
-    if worksheet.get("FollowOnRequired"):
-        comments += f"\n\nFollow-on Required: Yes\n{worksheet.get('FollowOnNotes', '')}"
-    else:
-        comments += "\n\nFollow-on Required: No"
-    if worksheet.get("EngineerCompletionNotes") and str(worksheet.get("EngineerCompletionNotes")).strip().lower() != "none":
-        comments += f"\n\nEngineer Notes: {worksheet.get('EngineerCompletionNotes')}"
+    comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
 
     story.append(section_box("Engineer Comment", comments, 8))
     story.append(Spacer(1, 7))
@@ -3431,7 +3505,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fields,
             worksheet["engineer_name"],
             outcome,
-            "Worksheet submitted",
+            build_visit_comment_extra(worksheet),
         )
 
         assigned_ids = get_assigned_engineer_ids(fields)
@@ -3568,7 +3642,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         fields,
         worksheet["engineer_name"],
         outcome,
-        "Worksheet submitted",
+        build_visit_comment_extra(worksheet),
     )
 
     assigned_ids = get_assigned_engineer_ids(fields)
