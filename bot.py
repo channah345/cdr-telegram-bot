@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-log-job-v1"
+BUILD_VERSION = "helpdesk-reassign-job-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -125,6 +125,12 @@ LOGJOB_CATEGORY = 37
 LOGJOB_ORDER_NUMBER = 38
 LOGJOB_ASSIGN_ENGINEERS = 39
 LOGJOB_REVIEW = 40
+
+REASSIGN_CDR_NUMBER = 41
+REASSIGN_REMOVE_ENGINEERS = 42
+REASSIGN_ASSIGN_ENGINEERS = 43
+REASSIGN_REASON = 44
+REASSIGN_REVIEW = 45
 
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
@@ -726,7 +732,88 @@ def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=Fals
         payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
         payload["EngineerLookupId"] = engineer_ids
 
+
     return payload
+
+
+def get_current_assigned_engineers_from_job(fields, engineers):
+    """Return current assigned engineers with name, lookup_id and telegram_id where possible."""
+    assigned = []
+    assigned_ids = set(get_assigned_engineer_ids(fields))
+
+    by_lookup = {}
+    for item in engineers:
+        item_fields = item.get("fields", {})
+        lookup_id = str(item_fields.get("id", "") or item.get("id", ""))
+        if not lookup_id:
+            continue
+        by_lookup[lookup_id] = {
+            "lookup_id": lookup_id,
+            "name": str(get_field_value(item_fields, "EngineerName", "Engineer Name", "Title") or f"Engineer {lookup_id}"),
+            "telegram_id": str(get_field_value(item_fields, "TelegramID", "Telegram ID") or "").strip(),
+        }
+
+    # Prefer the SharePoint lookup display values on the job, then enrich with Engineers list data.
+    engineer_values = fields.get("Engineer", [])
+    if isinstance(engineer_values, list):
+        for engineer_value in engineer_values:
+            lookup_id = str(engineer_value.get("LookupId") or "")
+            if not lookup_id:
+                continue
+            details = by_lookup.get(lookup_id, {})
+            assigned.append({
+                "lookup_id": lookup_id,
+                "name": details.get("name") or str(engineer_value.get("LookupValue") or f"Engineer {lookup_id}"),
+                "telegram_id": details.get("telegram_id", ""),
+            })
+
+    # Fallback if the lookup field shape changes but IDs are still available.
+    seen = {engineer["lookup_id"] for engineer in assigned}
+    for lookup_id in assigned_ids:
+        if lookup_id not in seen:
+            assigned.append(by_lookup.get(lookup_id, {
+                "lookup_id": lookup_id,
+                "name": f"Engineer {lookup_id}",
+                "telegram_id": "",
+            }))
+
+    assigned.sort(key=lambda e: e["name"].lower())
+    return assigned
+
+
+def parse_remove_engineer_selection(text, current_engineers):
+    value = str(text or "").strip().lower()
+
+    if value in ["all", "remove all", "everyone", "both"]:
+        return current_engineers[:], ""
+
+    if value in ["none", "no", "skip", "0"]:
+        return [], ""
+
+    selected, error = parse_engineer_selection(text, current_engineers)
+    if error:
+        return None, "Reply with engineer number(s), ALL, or NONE."
+    return selected, ""
+
+
+def build_reassign_review(data):
+    current = ", ".join(e["name"] for e in data.get("current_engineers", [])) or "None"
+    removing = ", ".join(e["name"] for e in data.get("remove_engineers", [])) or "None"
+    assigning = ", ".join(e["name"] for e in data.get("assign_engineers", [])) or "None"
+    final = ", ".join(e["name"] for e in data.get("final_engineers", [])) or "None"
+    fields = data.get("job_fields", {})
+
+    return (
+        "Please review this reassignment before I update SharePoint:\n\n"
+        f"CDR Number: {fields.get('CDRNumber', data.get('cdr_number', ''))}\n"
+        f"Site: {fields.get('SiteName', '')}\n"
+        f"Current engineer(s): {current}\n"
+        f"Remove: {removing}\n"
+        f"Assign/send to: {assigning}\n"
+        f"Final assigned engineer(s): {final}\n"
+        f"Reason: {data.get('reason', '') or 'N/A'}\n\n"
+        "Reply YES to reassign and send, NO to cancel, or RESTART to start again."
+    )
 
 
 async def send_created_job_to_engineers(bot, item_id, fields, assigned_engineers):
@@ -2710,6 +2797,282 @@ async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+
+async def reassign_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        role = await get_role_for_update(update)
+        if not user_can_use_helpdesk(role):
+            await update.message.reply_text("You do not have permission to reassign jobs.", reply_markup=get_main_menu(role))
+            return ConversationHandler.END
+
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+        assignable_engineers = get_active_assignable_engineers(engineers)
+
+        if not assignable_engineers:
+            await update.message.reply_text(
+                "No assignable engineers found. Check the Engineers list has TelegramID, Role = Engineer/Admin, and Active = Yes.",
+                reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+            )
+            return ConversationHandler.END
+
+        context.user_data["reassign_job"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "assignable_engineers": assignable_engineers,
+            "role": role,
+        }
+
+        await update.message.reply_text("Enter the CDR number to reassign.\n\nExample: CDR01012")
+        return REASSIGN_CDR_NUMBER
+
+    except Exception as e:
+        print(f"ERROR opening Reassign Job: {e}")
+        role = await get_role_for_update(update)
+        await update.message.reply_text(
+            "There was an error opening Reassign Job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+
+async def reassign_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("reassign_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔁 Reassign Job.")
+        return ConversationHandler.END
+
+    cdr_number = update.message.text.strip()
+    if is_blank_or_skip(cdr_number):
+        await update.message.reply_text("Please enter the CDR number.")
+        return REASSIGN_CDR_NUMBER
+
+    try:
+        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        job = find_job_by_cdr(jobs_data, cdr_number)
+        if not job:
+            await update.message.reply_text("I could not find that CDR number. Please check it and try again.")
+            return REASSIGN_CDR_NUMBER
+
+        fields = job.get("fields", {})
+        current_engineers = get_current_assigned_engineers_from_job(fields, data.get("engineers", []))
+
+        data.update({
+            "cdr_number": fields.get("CDRNumber", cdr_number),
+            "item_id": job.get("id"),
+            "job_fields": fields,
+            "current_engineers": current_engineers,
+        })
+
+        if current_engineers:
+            await update.message.reply_text(
+                "Current assigned engineer(s):\n\n" +
+                format_engineer_selection_list(current_engineers) +
+                "\n\nWho do you want to remove? Reply with number(s), ALL, or NONE."
+            )
+        else:
+            data["remove_engineers"] = []
+            await update.message.reply_text(
+                "There are currently no engineers assigned.\n\nAssign engineer(s). Reply with number(s):\n\n" +
+                format_engineer_selection_list(data.get("assignable_engineers", []))
+            )
+            return REASSIGN_ASSIGN_ENGINEERS
+
+        return REASSIGN_REMOVE_ENGINEERS
+
+    except Exception as e:
+        print(f"ERROR finding job for reassignment: {e}")
+        await update.message.reply_text("There was an error finding the job. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def reassign_remove_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("reassign_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔁 Reassign Job.")
+        return ConversationHandler.END
+
+    selected, error = parse_remove_engineer_selection(update.message.text, data.get("current_engineers", []))
+    if error:
+        await update.message.reply_text(
+            error + "\n\nCurrent assigned engineer(s):\n\n" + format_engineer_selection_list(data.get("current_engineers", []))
+        )
+        return REASSIGN_REMOVE_ENGINEERS
+
+    data["remove_engineers"] = selected
+    await update.message.reply_text(
+        "Assign new engineer(s). Reply with number(s), or type NONE if you only want to remove engineers and leave the job awaiting dispatch.\n\n" +
+        format_engineer_selection_list(data.get("assignable_engineers", []))
+    )
+    return REASSIGN_ASSIGN_ENGINEERS
+
+
+async def reassign_assign_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("reassign_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔁 Reassign Job.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip().lower()
+    if text in ["none", "no", "skip", "0"]:
+        selected = []
+    else:
+        selected, error = parse_engineer_selection(update.message.text, data.get("assignable_engineers", []))
+        if error:
+            await update.message.reply_text(error + "\n\n" + format_engineer_selection_list(data.get("assignable_engineers", [])))
+            return REASSIGN_ASSIGN_ENGINEERS
+
+    data["assign_engineers"] = selected
+
+    remove_ids = {e["lookup_id"] for e in data.get("remove_engineers", [])}
+    final = []
+    seen = set()
+
+    for engineer in data.get("current_engineers", []):
+        if engineer["lookup_id"] not in remove_ids and engineer["lookup_id"] not in seen:
+            final.append(engineer)
+            seen.add(engineer["lookup_id"])
+
+    for engineer in selected:
+        if engineer["lookup_id"] not in seen:
+            final.append(engineer)
+            seen.add(engineer["lookup_id"])
+
+    data["final_engineers"] = final
+
+    await update.message.reply_text("Reason for reassignment?\n\nExample: Engineer delayed on another job / change of plan / emergency priority.")
+    return REASSIGN_REASON
+
+
+async def reassign_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("reassign_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔁 Reassign Job.")
+        return ConversationHandler.END
+
+    value = update.message.text.strip()
+    data["reason"] = "" if is_blank_or_skip(value) else value
+    await update.message.reply_text(build_reassign_review(data))
+    return REASSIGN_REVIEW
+
+
+async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("reassign_job")
+    role = data.get("role", "Helpdesk") if data else "Helpdesk"
+    answer = update.message.text.strip().lower()
+
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("reassign_job", None)
+        await update.message.reply_text(
+            "Reassignment cancelled. Nothing has been changed.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer in ["restart", "redo"]:
+        context.user_data.pop("reassign_job", None)
+        return await reassign_start(update, context)
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to reassign and send, NO to cancel, or RESTART to start again.")
+        return REASSIGN_REVIEW
+
+    try:
+        site_id = data["site_id"]
+        jobs_list_id = data["jobs_list_id"]
+        item_id = data["item_id"]
+        fields = data.get("job_fields", {})
+        cdr_number = fields.get("CDRNumber", data.get("cdr_number", ""))
+        final_engineers = data.get("final_engineers", [])
+        new_engineers = data.get("assign_engineers", [])
+
+        reassignment_note = (
+            f"Removed: {', '.join(e['name'] for e in data.get('remove_engineers', [])) or 'None'}; "
+            f"Assigned: {', '.join(e['name'] for e in new_engineers) or 'None'}; "
+            f"Final: {', '.join(e['name'] for e in final_engineers) or 'None'}"
+        )
+        if data.get("reason"):
+            reassignment_note += f"; Reason: {data['reason']}"
+
+        updated_log = append_engineer_log(fields, "Helpdesk", "Reassigned", reassignment_note)
+
+        # First place the job back into dispatch while the assignment is changed.
+        interim_payload = build_field_payload_for_list(
+            site_id,
+            jobs_list_id,
+            {
+                "Status": AWAITING_DEPLOYMENT_STATUS,
+                "TelegramNotified": False,
+                "Telegram Notified": False,
+                "EngineerVisitLog": updated_log,
+                "Engineer Visit Log": updated_log,
+            },
+        )
+        interim_payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
+        interim_payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in final_engineers]
+        update_list_item_fields(site_id, jobs_list_id, item_id, interim_payload)
+
+        # Send the job only to newly selected engineer(s), not engineers who were already left assigned.
+        send_fields = dict(fields)
+        send_fields.update({
+            "Status": ASSIGNED_STATUS if final_engineers else AWAITING_DEPLOYMENT_STATUS,
+            "EngineerVisitLog": updated_log,
+        })
+        sent_to_any, failed = await send_created_job_to_engineers(
+            context.bot,
+            item_id,
+            send_fields,
+            new_engineers,
+        )
+
+        final_payload = build_field_payload_for_list(
+            site_id,
+            jobs_list_id,
+            {
+                "Status": ASSIGNED_STATUS if final_engineers else AWAITING_DEPLOYMENT_STATUS,
+                "TelegramNotified": bool(sent_to_any or (final_engineers and not new_engineers)),
+                "Telegram Notified": bool(sent_to_any or (final_engineers and not new_engineers)),
+            },
+        )
+        update_list_item_fields(site_id, jobs_list_id, item_id, final_payload)
+
+        context.user_data.pop("reassign_job", None)
+
+        message = (
+            f"Job reassigned: {cdr_number}\n"
+            f"Final assigned engineer(s): {', '.join(e['name'] for e in final_engineers) or 'None'}\n"
+            f"Telegram sent to new engineer(s): {'Yes' if sent_to_any else 'No'}"
+        )
+        if failed:
+            message += "\n\nSend issues:\n" + "\n".join(failed[:5])
+
+        await update.message.reply_text(
+            message,
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR reassigning job: {e}")
+        await update.message.reply_text(
+            "There was an error reassigning the job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def reassign_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("reassign_job", None)
+    await update.message.reply_text(
+        "Reassign Job cancelled. Nothing has been changed.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+    )
+    return ConversationHandler.END
+
 async def handle_menu_during_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, current_state):
     """
     Allows safe menu use while an engineer is inside a conversation flow.
@@ -4652,6 +5015,23 @@ bugidea_handler = ConversationHandler(
 )
 
 
+
+reassign_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("reassign", reassign_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_REASSIGN_JOB)}$"), reassign_start),
+    ],
+    states={
+        REASSIGN_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_cdr_number)],
+        REASSIGN_REMOVE_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_remove_engineers)],
+        REASSIGN_ASSIGN_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_assign_engineers)],
+        REASSIGN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_reason)],
+        REASSIGN_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_review)],
+    },
+    fallbacks=[CommandHandler("cancel", reassign_cancel)],
+)
+
+
 logjob_handler = ConversationHandler(
     entry_points=[
         CommandHandler("logjob", logjob_start),
@@ -4685,6 +5065,7 @@ telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(logjob_handler)
+telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_EMERGENCY_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
