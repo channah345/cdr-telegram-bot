@@ -315,7 +315,15 @@ def find_active_day_log(day_logs, telegram_id, work_date=None):
 
     for log in day_logs:
         fields = log.get("fields", {})
-        log_date = str(fields.get("WorkDate", ""))[:10]
+
+        raw_work_date = fields.get("WorkDate", "")
+        parsed_work_date = sharepoint_date_to_uk_date(raw_work_date)
+
+        if parsed_work_date:
+            log_date = parsed_work_date.isoformat()
+        else:
+            log_date = str(raw_work_date)[:10]
+
         status = str(fields.get("Status", ""))
         log_telegram_id = str(fields.get("EngineerTelegramID", ""))
 
