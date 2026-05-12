@@ -562,14 +562,26 @@ def signature_page(cdr_number: str, token: str):
             const canvas = document.getElementById("signature-pad");
             const signaturePad = new SignaturePad(canvas);
 
-            function resizeCanvas() {{
+            canvas.addEventListener("touchstart", function (event) {
+                event.preventDefault();
+            }, { passive: false });
+
+            canvas.addEventListener("touchmove", function (event) {
+                event.preventDefault();
+            }, { passive: false });
+
+            canvas.addEventListener("touchend", function (event) {
+                event.preventDefault();
+            }, { passive: false });
+
+            function resizeCanvas() {
                 const ratio = Math.max(window.devicePixelRatio || 1, 1);
                 const rect = canvas.getBoundingClientRect();
                 canvas.width = rect.width * ratio;
                 canvas.height = rect.height * ratio;
                 canvas.getContext("2d").scale(ratio, ratio);
                 signaturePad.clear();
-            }}
+            }
 
             window.addEventListener("resize", resizeCanvas);
             resizeCanvas();
