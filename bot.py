@@ -55,6 +55,8 @@ MENU_BUG_IDEA = "🐞 Bug / Ideas"
 
 UK_TZ = ZoneInfo("Europe/London")
 
+
+VAN_CHECK_INTERVAL_DAYS = 14
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
 LEGACY_AWAITING_DEPLOYMENT_STATUS = "Awaiting Deployment"
 ASSIGNED_STATUS = "Assigned"
@@ -1166,6 +1168,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "work_date": get_today_iso(),
             "van_check_answers": [],
             "van_photo_links": [],
+            "day_logs": day_logs,
         }
 
         await update.message.reply_text(
@@ -1229,6 +1232,117 @@ async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return START_DAY_START_MILEAGE
 
 
+
+def parse_sharepoint_date_to_date(value):
+    if not value:
+        return None
+
+    try:
+        if isinstance(value, datetime):
+            return value.astimezone(UK_TZ).date() if value.tzinfo else value.date()
+
+        value = str(value).strip()
+
+        if not value:
+            return None
+
+        if value.endswith("Z"):
+            value = value.replace("Z", "+00:00")
+
+        return datetime.fromisoformat(value).astimezone(UK_TZ).date()
+    except Exception:
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+
+def engineer_needs_van_check(day_logs, engineer_telegram_id, today_date=None):
+    today_date = today_date or datetime.now(UK_TZ).date()
+    engineer_telegram_id = str(engineer_telegram_id)
+
+    last_check_date = None
+
+    for item in day_logs:
+        fields = item.get("fields", {})
+
+        log_telegram_id = str(
+            fields.get("EngineerTelegramID")
+            or fields.get("Engineer Telegram ID")
+            or ""
+        )
+
+        if log_telegram_id != engineer_telegram_id:
+            continue
+
+        van_completed = bool_field(
+            fields.get("VanCheckCompleted")
+            or fields.get("Van Check Completed")
+        )
+
+        if not van_completed:
+            continue
+
+        log_date = parse_sharepoint_date_to_date(
+            fields.get("WorkDate")
+            or fields.get("Work Date")
+            or fields.get("Created")
+        )
+
+        if log_date and (last_check_date is None or log_date > last_check_date):
+            last_check_date = log_date
+
+    if last_check_date is None:
+        return True, None, None
+
+    days_since = (today_date - last_check_date).days
+    return days_since >= VAN_CHECK_INTERVAL_DAYS, last_check_date, days_since
+
+
+def build_start_day_log_fields(start_day, van_check_completed=False):
+    return build_field_payload_for_list(
+        start_day["site_id"],
+        start_day["day_logs_list_id"],
+        {
+            "Title": f"{start_day['engineer_name']} - {start_day['work_date']}",
+            "Engineer": start_day["engineer_name"],
+            "Engineer Name": start_day["engineer_name"],
+            "EngineerName": start_day["engineer_name"],
+            "Engineer Telegram ID": start_day["engineer_telegram_id"],
+            "EngineerTelegramID": start_day["engineer_telegram_id"],
+            "Engineer Lookup ID": start_day["engineer_lookup_id"],
+            "EngineerLookupID": start_day["engineer_lookup_id"],
+            "Work Date": start_day["work_date"],
+            "WorkDate": start_day["work_date"],
+            "Start Time": graph_datetime_now(),
+            "StartTime": graph_datetime_now(),
+            "Start Mileage": start_day.get("start_mileage", "0"),
+            "StartMileage": start_day.get("start_mileage", "0"),
+            "Van Registration": start_day.get("van_reg", ""),
+            "VanRegistration": start_day.get("van_reg", ""),
+            "Van Check Completed": bool(van_check_completed),
+            "VanCheckCompleted": bool(van_check_completed),
+            "Van Check Answers": "\n\n".join(start_day.get("van_check_answers", [])),
+            "VanCheckAnswers": "\n\n".join(start_day.get("van_check_answers", [])),
+            "Van Photo Links": "\n".join(start_day.get("van_photo_links", [])),
+            "VanPhotoLinks": "\n".join(start_day.get("van_photo_links", [])),
+            "Status": DAY_ACTIVE_STATUS,
+            "CurrentStatus": "Day Started",
+            "CurrentJob": "",
+        },
+    )
+
+
+def create_start_day_log(start_day, van_check_completed=False):
+    day_log_fields = build_start_day_log_fields(start_day, van_check_completed)
+    create_list_item_fields(
+        start_day["site_id"],
+        start_day["day_logs_list_id"],
+        day_log_fields,
+    )
+
+
+
 async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_START_MILEAGE)
     if menu_result is not None:
@@ -1249,10 +1363,29 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
         return START_DAY_START_MILEAGE
 
     start_day["start_mileage"] = mileage
+
+    needs_check, last_check_date, days_since = engineer_needs_van_check(
+        start_day.get("day_logs", []),
+        start_day["engineer_telegram_id"],
+    )
+
+    if not needs_check:
+        create_start_day_log(start_day, van_check_completed=False)
+        context.user_data.pop("start_day", None)
+
+        await update.message.reply_text(
+            f"Start mileage recorded: {mileage}\n\n"
+            f"Van check not due today. Last completed van check was {days_since} day(s) ago "
+            f"on {last_check_date}. Your jobs are now unlocked.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
     start_day["question_index"] = 0
 
     await update.message.reply_text(
         f"Start mileage recorded: {mileage}\n\n"
+        f"Van check is due. It is required every {VAN_CHECK_INTERVAL_DAYS} days.\n\n"
         f"Van check 1 of {len(VAN_CHECK_QUESTIONS)}:\n"
         f"{VAN_CHECK_QUESTIONS[0]}"
     )
@@ -1323,43 +1456,7 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "3. Dashboard / mileage"
                 )
                 return START_DAY_VAN_PHOTOS
-
-            day_log_fields = build_field_payload_for_list(
-                start_day["site_id"],
-                start_day["day_logs_list_id"],
-                {
-                    "Title": f"{start_day['engineer_name']} - {start_day['work_date']}",
-                    "Engineer Name": start_day["engineer_name"],
-                    "EngineerName": start_day["engineer_name"],
-                    "Engineer Telegram ID": start_day["engineer_telegram_id"],
-                    "EngineerTelegramID": start_day["engineer_telegram_id"],
-                    "Engineer Lookup ID": start_day["engineer_lookup_id"],
-                    "EngineerLookupID": start_day["engineer_lookup_id"],
-                    "Work Date": start_day["work_date"],
-                    "WorkDate": start_day["work_date"],
-                    "Start Time": graph_datetime_now(),
-                    "StartTime": graph_datetime_now(),
-                    "Start Mileage": start_day.get("start_mileage", "0"),
-                    "StartMileage": start_day.get("start_mileage", "0"),
-                    "Van Registration": start_day.get("van_reg", ""),
-                    "VanRegistration": start_day.get("van_reg", ""),
-                    "Van Check Completed": True,
-                    "VanCheckCompleted": True,
-                    "Van Check Answers": "\n\n".join(start_day.get("van_check_answers", [])),
-                    "VanCheckAnswers": "\n\n".join(start_day.get("van_check_answers", [])),
-                    "Van Photo Links": "\n".join(start_day.get("van_photo_links", [])),
-                    "VanPhotoLinks": "\n".join(start_day.get("van_photo_links", [])),
-                    "Status": DAY_ACTIVE_STATUS,
-                    "CurrentStatus": "Day Started",
-                    "CurrentJob": "",
-},
-            )
-
-            create_list_item_fields(
-                start_day["site_id"],
-                start_day["day_logs_list_id"],
-                day_log_fields,
-            )
+            create_start_day_log(start_day, van_check_completed=True)
 
             context.user_data.pop("start_day", None)
 
