@@ -323,10 +323,37 @@ def append_engineer_log(fields, engineer_name, action, extra_text=""):
     return line
 
 
-def engineer_has_logged(fields, engineer_name, action):
+def get_current_engineer_visit_log_lines(fields, engineer_name):
+    """
+    Return only the log lines for the engineer's current visit attempt.
+
+    A job can be marked Revisit Required / No Access, returned to the office,
+    and later re-dispatched to the same engineer. The old visit history must
+    stay in SharePoint for audit, but it must not block the engineer from
+    clicking Travelling / On Site again on the new visit.
+    """
     log = fields.get("EngineerVisitLog", "") or ""
+    lines = [line for line in log.splitlines() if line.strip()]
+
+    reset_actions = ["Completed", "No Access", "Revisit Required"]
+    last_reset_index = -1
+
+    for index, line in enumerate(lines):
+        if f" - {engineer_name} - " not in line:
+            continue
+
+        for reset_action in reset_actions:
+            if f" - {engineer_name} - {reset_action}" in line:
+                last_reset_index = index
+                break
+
+    return lines[last_reset_index + 1:]
+
+
+def engineer_has_logged(fields, engineer_name, action):
+    current_visit_lines = get_current_engineer_visit_log_lines(fields, engineer_name)
     search_text = f" - {engineer_name} - {action}"
-    return search_text in log
+    return any(search_text in line for line in current_visit_lines)
 
 
 def can_click_action(fields, engineer_name, action):
