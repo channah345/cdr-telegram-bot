@@ -48,8 +48,6 @@ DAY_CLOSED_STATUS = "Closed"
 MENU_START_DAY = "🟢 Start Day"
 MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
-MENU_MY_STATUS = "📊 My Status"
-MENU_MY_ID = "🆔 My ID"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
 
 
@@ -364,8 +362,7 @@ def get_main_menu():
     return ReplyKeyboardMarkup(
         [
             [MENU_START_DAY, MENU_MY_JOBS],
-            [MENU_END_DAY, MENU_MY_STATUS],
-            [MENU_MY_ID, MENU_BUG_IDEA],
+            [MENU_END_DAY, MENU_BUG_IDEA],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -529,33 +526,10 @@ def build_pay_summary(start_dt, end_dt, hours):
 
 def update_active_day_live_status(site_id, telegram_id, status, current_job=""):
     """
-    Updates live engineer status on Engineer Day Logs only.
-    Uses CurrentStatus and CurrentJob only.
+    Live CurrentStatus/CurrentJob tracking has been retired.
+    Kept as a no-op so older call sites cannot break the bot.
     """
-    try:
-        day_logs_list_id, active_day = get_active_day_for_engineer(site_id, telegram_id)
-
-        if not active_day:
-            return
-
-        live_fields = build_field_payload_for_list(
-            site_id,
-            day_logs_list_id,
-            {
-                "CurrentStatus": status,
-                "CurrentJob": current_job,
-            },
-        )
-
-        update_list_item_fields(
-            site_id,
-            day_logs_list_id,
-            active_day["id"],
-            live_fields,
-        )
-
-    except Exception as e:
-        print(f"WARNING: Could not update live engineer day status: {e}")
+    return
 
 
 def get_job_reference(fields):
@@ -627,7 +601,7 @@ def get_job_buttons(item_id):
             InlineKeyboardButton("No Access", callback_data=f"confirm_outcome|{item_id}|No Access"),
         ],
         [
-            InlineKeyboardButton("Complete", callback_data=f"complete_help|{item_id}"),
+            InlineKeyboardButton("Complete", callback_data=f"start_worksheet|{item_id}|Completed"),
         ],
     ])
 
@@ -947,10 +921,12 @@ def build_signature_url(cdr_number, token):
 
 def build_review_text(worksheet):
     signature_required = "Yes" if worksheet.get("ClientSignatureRequired") else "No"
+    outcome = worksheet.get("JobOutcome", "Completed")
     signature_received = "Yes" if worksheet.get("ClientSignatureReceived") else "No"
 
     return (
         f"Please review worksheet for {worksheet['cdr_number']}:\n\n"
+        f"Outcome: {outcome}\n\n"
         f"Work completed:\n{worksheet.get('WorkCompleted', '')}\n\n"
         f"Materials used:\n{worksheet.get('MaterialsUsed', '')}\n\n"
         f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
@@ -1331,8 +1307,6 @@ def build_start_day_log_fields(start_day, van_check_completed=False):
             "Van Photo Links": "\n".join(start_day.get("van_photo_links", [])),
             "VanPhotoLinks": "\n".join(start_day.get("van_photo_links", [])),
             "Status": DAY_ACTIVE_STATUS,
-            "CurrentStatus": "Day Started",
-            "CurrentJob": "",
         },
     )
 
@@ -1651,9 +1625,7 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Total Mileage": total_mileage if total_mileage is not None else "",
             "TotalMileage": total_mileage if total_mileage is not None else "",
             "Status": DAY_CLOSED_STATUS,
-            "CurrentStatus": "Off Duty",
-            "CurrentJob": "",
-"Pay Summary": pay_summary,
+            "Pay Summary": pay_summary,
             "PaySummary": pay_summary,
         }
 
@@ -1698,6 +1670,12 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_menu(),
         )
         return ConversationHandler.END
+
+
+async def endday_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("end_day", None)
+    await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu())
+    return ConversationHandler.END
 
 
 async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1746,13 +1724,6 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_END_DAY:
         return await endday_start(update, context)
 
-    if text == MENU_MY_STATUS:
-        await mystatus(update, context)
-        return
-
-    if text == MENU_MY_ID:
-        await id(update, context)
-        return
 
     if text == MENU_BUG_IDEA:
         return await bugidea_start(update, context)
@@ -1764,18 +1735,8 @@ async def handle_menu_during_conversation(update: Update, context: ContextTypes.
     Without this, buttons like 🆔 My ID are treated as answers to the active question.
     """
     text = update.message.text if update.message else ""
-
-    if text == MENU_MY_ID:
-        await id(update, context)
-        return
-
     if text == MENU_BUG_IDEA:
         return current_state
-
-    if text == MENU_MY_STATUS:
-        await mystatus(update, context)
-        return current_state
-
     if text == MENU_MY_JOBS:
         await update.message.reply_text(
             "You are currently part-way through another task. Finish it or type /cancel before viewing jobs.",
@@ -2031,7 +1992,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     InlineKeyboardButton(
                         "Yes, confirm",
-                        callback_data=f"outcome|{item_id}|{selected_outcome}",
+                        callback_data=f"start_worksheet|{item_id}|{selected_outcome}",
                     ),
                 ],
                 [
@@ -2210,67 +2171,60 @@ def can_start_completion(fields, engineer_name):
     return True, ""
 
 
-async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id=None, cdr_number=None, outcome="Completed"):
+    """Start a worksheet from either the Complete/Revisit/No Access button or legacy /complete."""
     try:
-        if not context.args:
-            await update.message.reply_text("To complete a job, type:\n\n/complete CDR00001")
-            return ConversationHandler.END
-
-        cdr_number = context.args[0].strip()
-        user_id = str(update.effective_user.id)
+        is_callback = update.callback_query is not None
+        sender = update.callback_query.message if is_callback else update.message
+        user = update.callback_query.from_user if is_callback else update.effective_user
+        user_id = str(user.id)
 
         site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
         engineers_by_telegram, _ = build_engineer_maps(engineers)
-
         current_engineer = engineers_by_telegram.get(user_id)
 
         if not current_engineer:
-            await update.message.reply_text(
+            await sender.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
                 reply_markup=get_main_menu(),
             )
             return ConversationHandler.END
 
         if not engineer_has_active_day(site_id, user_id):
-            await update.message.reply_text(
-                "Please start your day first using 🟢 Start Day or /startday before completing jobs.",
+            await sender.reply_text(
+                "Please start your day first using 🟢 Start Day or /startday before updating jobs.",
                 reply_markup=get_main_menu(),
             )
             return ConversationHandler.END
 
-        job = find_job_by_cdr(jobs_data, cdr_number)
+        job = find_job_by_item_id(jobs_data, item_id) if item_id else find_job_by_cdr(jobs_data, cdr_number)
 
         if not job:
-            await update.message.reply_text(f"No job found with CDR number: {cdr_number}. Check the CDR number exactly as shown on the job card.")
+            await sender.reply_text("Could not find this job. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
             return ConversationHandler.END
 
         fields = job["fields"]
 
         if is_closed_job(fields):
-            await update.message.reply_text(
+            await sender.reply_text(
                 "This job has already been closed or returned to the office. No further action is required.",
                 reply_markup=get_main_menu(),
             )
             return ConversationHandler.END
 
         assigned_ids = get_assigned_engineer_ids(fields)
-
         if current_engineer["lookup_id"] not in assigned_ids:
-            await update.message.reply_text("You are not assigned to this job.")
+            await sender.reply_text("You are not assigned to this job.", reply_markup=get_main_menu())
             return ConversationHandler.END
 
-        allowed, reason = can_click_action(
-            fields,
-            current_engineer["name"],
-            "Completed",
-        )
-
+        allowed, reason = can_click_action(fields, current_engineer["name"], outcome)
         if not allowed:
-            await update.message.reply_text(reason)
+            await sender.reply_text(reason, reply_markup=get_main_menu())
             return ConversationHandler.END
 
+        cdr = fields.get("CDRNumber", "")
         context.user_data["worksheet"] = {
-            "cdr_number": cdr_number,
+            "cdr_number": cdr,
             "site_id": site_id,
             "jobs_list_id": jobs_list_id,
             "item_id": job["id"],
@@ -2280,21 +2234,59 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "photo_links": [],
             "ClientSignatureRequired": False,
             "ClientSignatureReceived": False,
+            "JobOutcome": outcome,
         }
 
-        await update.message.reply_text(
-            f"Starting worksheet for {cdr_number}.\n\n"
-            f"You can type /cancel at any point before submitting.\n\n"
-            f"What work was completed?"
-        )
+        if outcome == "Completed":
+            first_question = "What work was completed?"
+        elif outcome == "Revisit Required":
+            first_question = "What was done today, and why is a revisit required?"
+        else:
+            first_question = "What happened? Please explain why there was no access."
 
+        await sender.reply_text(
+            f"Starting worksheet for {cdr}.\n\n"
+            f"Outcome: {outcome}\n\n"
+            f"You can type /cancel at any point before submitting.\n\n"
+            f"{first_question}"
+        )
         return WORK_COMPLETED
 
     except Exception as e:
         print(f"ERROR starting worksheet: {e}")
-        await update.message.reply_text("There was an error starting the worksheet.")
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text("There was an error starting the worksheet.", reply_markup=get_main_menu())
         return ConversationHandler.END
 
+
+async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, item_id, outcome = query.data.split("|", 2)
+    except Exception:
+        await query.message.reply_text("Could not start this worksheet. Tap 📋 My Jobs and try again.")
+        return ConversationHandler.END
+
+    return await begin_worksheet_for_job(update, context, item_id=item_id, outcome=outcome)
+
+
+async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Use 📋 My Jobs, then tap Complete, Revisit or No Access on the job card.\n\n"
+            "The old /complete CDR number method still works if needed: /complete CDR00001",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+    return await begin_worksheet_for_job(
+        update,
+        context,
+        cdr_number=context.args[0].strip(),
+        outcome="Completed",
+    )
 
 async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_result = await handle_menu_during_conversation(update, context, WORK_COMPLETED)
@@ -2545,10 +2537,12 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
+        outcome = worksheet.get("JobOutcome", "Completed")
+
         updated_log = append_engineer_log(
             fields,
             worksheet["engineer_name"],
-            "Completed",
+            outcome,
             "Worksheet submitted",
         )
 
@@ -2562,13 +2556,19 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
             "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
             "WorksheetSubmitted": True,
-            "JobOutcome": "Completed",
             "EngineerVisitLog": updated_log,
             "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
         }
 
         if is_final_engineer:
-            fields_to_update["Status"] = COMPLETED_STATUS
+            fields_to_update["JobOutcome"] = outcome
+
+            if outcome == "Completed":
+                fields_to_update["Status"] = COMPLETED_STATUS
+            else:
+                fields_to_update["Status"] = AWAITING_DEPLOYMENT_STATUS
+                fields_to_update["TelegramNotified"] = False
+
             fields_to_update.update(clear_engineer_assignment_payload())
         else:
             fields_to_update.update(
@@ -2583,12 +2583,13 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_active_day_live_status(
             site_id,
             str(update.effective_user.id),
-            "Completed",
+            outcome,
             get_job_reference(fields),
         )
 
         await update.message.reply_text(
-            f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
+            f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}",
+            reply_markup=get_main_menu(),
         )
 
         await notify_helpdesk(
@@ -2597,7 +2598,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Worksheet submitted\n\n"
                 f"CDR Number: {worksheet['cdr_number']}\n"
                 f"Engineer: {worksheet['engineer_name']}\n"
-                f"Outcome: Completed\n"
+                f"Outcome: {outcome}\n"
                 f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
                 f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
                 f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
@@ -2695,6 +2696,39 @@ async def send_new_jobs(app):
         print(f"ERROR sending new jobs: {e}")
 
 
+async def remind_active_engineers_to_end_day(app):
+    """Daily reminder so engineers do not forget to close their day."""
+    try:
+        site_id = get_site_id()
+        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+        day_logs = get_list_items(site_id, day_logs_list_id)
+        today = get_today_iso()
+
+        for log in day_logs:
+            fields = log.get("fields", {})
+            status = str(fields.get("Status", ""))
+            telegram_id = str(fields.get("EngineerTelegramID") or fields.get("Engineer Telegram ID") or "")
+            raw_work_date = fields.get("WorkDate") or fields.get("Work Date") or ""
+            parsed_work_date = sharepoint_date_to_uk_date(raw_work_date)
+            log_date = parsed_work_date.isoformat() if parsed_work_date else str(raw_work_date)[:10]
+
+            if status == DAY_ACTIVE_STATUS and telegram_id and log_date == today:
+                try:
+                    await app.bot.send_message(
+                        chat_id=telegram_id,
+                        text=(
+                            "End of day reminder: if you have finished work, please tap 🏁 End Day. "
+                            "This keeps timesheets, mileage and pay hours correct."
+                        ),
+                        reply_markup=get_main_menu(),
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
+
+    except Exception as e:
+        print(f"ERROR sending end-day reminders: {e}")
+
+
 async def post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -2708,6 +2742,14 @@ async def post_init(app):
         send_new_jobs,
         trigger="interval",
         seconds=30,
+        args=[app],
+    )
+
+    scheduler.add_job(
+        remind_active_engineers_to_end_day,
+        trigger="cron",
+        hour=16,
+        minute=45,
         args=[app],
     )
 
@@ -2749,12 +2791,15 @@ endday_handler = ConversationHandler(
         END_DAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_confirm)],
         END_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_mileage)],
     },
-    fallbacks=[CommandHandler("cancel", worksheet_cancel)],
+    fallbacks=[CommandHandler("cancel", endday_cancel)],
 )
 
 
 worksheet_handler = ConversationHandler(
-    entry_points=[CommandHandler("complete", complete_start)],
+    entry_points=[
+        CallbackQueryHandler(complete_button_start, pattern="^start_worksheet\\|"),
+        CommandHandler("complete", complete_start),
+    ],
     states={
         WORK_COMPLETED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_work_completed)],
         MATERIALS_USED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_materials_used)],
@@ -2787,12 +2832,11 @@ bugidea_handler = ConversationHandler(
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
-telegram_app.add_handler(CommandHandler("mystatus", mystatus))
 telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_MY_STATUS}|{MENU_MY_ID}|{MENU_BUG_IDEA})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
