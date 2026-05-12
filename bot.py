@@ -175,6 +175,51 @@ def get_list_items(site_id, list_id):
     return response.json()["value"]
 
 
+def get_list_columns(site_id, list_id):
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns"
+    response = requests.get(url, headers=get_headers())
+
+    if response.status_code != 200:
+        raise Exception(f"Could not get list columns: {response.text}")
+
+    return response.json().get("value", [])
+
+
+def normalise_field_name(value):
+    return "".join(str(value or "").lower().replace("_x0020_", "").split())
+
+
+def build_field_payload_for_list(site_id, list_id, fields):
+    """
+    SharePoint Graph updates need the internal column name, not always the display name.
+    This maps common/display names such as 'Van Registration' to the actual internal name.
+    Unknown optional fields are skipped rather than breaking the bot.
+    """
+    columns = get_list_columns(site_id, list_id)
+    lookup = {}
+
+    for column in columns:
+        internal_name = column.get("name", "")
+        display_name = column.get("displayName", "")
+
+        for key in [internal_name, display_name]:
+            normalised = normalise_field_name(key)
+            if normalised:
+                lookup[normalised] = internal_name
+
+    payload = {}
+
+    for desired_name, value in fields.items():
+        internal_name = lookup.get(normalise_field_name(desired_name))
+
+        if internal_name:
+            payload[internal_name] = value
+        else:
+            print(f"WARNING: SharePoint column not found on {DAY_LOGS_LIST}: {desired_name}. Field skipped.")
+
+    return payload
+
+
 def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
 
@@ -871,8 +916,11 @@ async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return START_DAY_VAN_CHECK
 
     await update.message.reply_text(
-        "Van check questions complete. Upload van photos now.\n\n"
-        "Send one or more photos, then type DONE when finished."
+        "Van check questions complete. Please upload these 3 van photos:\n\n"
+        "1. Van cab\n"
+        "2. Van rear load area\n"
+        "3. Dashboard / mileage\n\n"
+        "Send the 3 photos now, then type DONE when finished."
     )
     return START_DAY_VAN_PHOTOS
 
@@ -886,22 +934,48 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
 
         if update.message.text and update.message.text.strip().upper() == "DONE":
-            item = create_list_item_fields(
+            photo_count = len(start_day.get("van_photo_links", []))
+
+            if photo_count < 3:
+                await update.message.reply_text(
+                    f"I have {photo_count} van photo(s). Please upload all 3 required photos before typing DONE:\n\n"
+                    "1. Van cab\n"
+                    "2. Van rear load area\n"
+                    "3. Dashboard / mileage"
+                )
+                return START_DAY_VAN_PHOTOS
+
+            day_log_fields = build_field_payload_for_list(
                 start_day["site_id"],
                 start_day["day_logs_list_id"],
                 {
                     "Title": f"{start_day['engineer_name']} - {start_day['work_date']}",
+                    "Engineer Name": start_day["engineer_name"],
                     "EngineerName": start_day["engineer_name"],
+                    "Engineer Telegram ID": start_day["engineer_telegram_id"],
                     "EngineerTelegramID": start_day["engineer_telegram_id"],
+                    "Engineer Lookup ID": start_day["engineer_lookup_id"],
                     "EngineerLookupID": start_day["engineer_lookup_id"],
+                    "Work Date": start_day["work_date"],
                     "WorkDate": start_day["work_date"],
+                    "Start Time": graph_datetime_now(),
                     "StartTime": graph_datetime_now(),
+                    "Van Registration": start_day.get("van_reg", ""),
                     "VanRegistration": start_day.get("van_reg", ""),
+                    "Van Check Completed": True,
                     "VanCheckCompleted": True,
+                    "Van Check Answers": "\n\n".join(start_day.get("van_check_answers", [])),
                     "VanCheckAnswers": "\n\n".join(start_day.get("van_check_answers", [])),
+                    "Van Photo Links": "\n".join(start_day.get("van_photo_links", [])),
                     "VanPhotoLinks": "\n".join(start_day.get("van_photo_links", [])),
                     "Status": DAY_ACTIVE_STATUS,
                 },
+            )
+
+            create_list_item_fields(
+                start_day["site_id"],
+                start_day["day_logs_list_id"],
+                day_log_fields,
             )
 
             context.user_data.pop("start_day", None)
@@ -929,12 +1003,9 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
             start_day["van_photo_links"].append(photo_link)
-            await update.message.reply_text(
-                f"Photo uploaded ({len(start_day['van_photo_links'])}). Send another photo or type DONE."
-            )
             return START_DAY_VAN_PHOTOS
 
-        await update.message.reply_text("Please send a photo or type DONE.")
+        await update.message.reply_text("Please send the required van photos, or type DONE once all 3 have been uploaded.")
         return START_DAY_VAN_PHOTOS
 
     except Exception as e:
@@ -1004,15 +1075,23 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please try /endday again.", reply_markup=get_main_menu())
             return ConversationHandler.END
 
+        end_day_fields = build_field_payload_for_list(
+            end_day["site_id"],
+            end_day["day_logs_list_id"],
+            {
+                "End Time": graph_datetime_now(),
+                "EndTime": graph_datetime_now(),
+                "End Mileage": mileage,
+                "EndMileage": mileage,
+                "Status": DAY_CLOSED_STATUS,
+            },
+        )
+
         update_list_item_fields(
             end_day["site_id"],
             end_day["day_logs_list_id"],
             end_day["day_log_item_id"],
-            {
-                "EndTime": graph_datetime_now(),
-                "EndMileage": mileage,
-                "Status": DAY_CLOSED_STATUS,
-            },
+            end_day_fields,
         )
 
         context.user_data.pop("end_day", None)
@@ -1510,7 +1589,7 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worksheet["photo_links"].append(photo_link)
         return PHOTOS
 
-    await update.message.reply_text("Please send a photo or type DONE.")
+    await update.message.reply_text("Please send the required van photos, or type DONE once all 3 have been uploaded.")
     return PHOTOS
 
 
