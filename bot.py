@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-open-jobs-v1"
+BUILD_VERSION = "worksheet-hide-helpdesk-commands-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -3579,25 +3579,42 @@ async def findjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+HELPDESK_MENU_TEXTS = {
+    MENU_HELPDESK,
+    MENU_LOG_JOB,
+    MENU_REASSIGN_JOB,
+    MENU_OPEN_JOBS,
+    MENU_FIND_JOB,
+    MENU_EMERGENCY_JOB,
+    MENU_ENGINEER_MENU,
+}
+
+ALL_MENU_TEXTS = {
+    MENU_START_DAY,
+    MENU_MY_JOBS,
+    MENU_END_DAY,
+    MENU_BUG_IDEA,
+    *HELPDESK_MENU_TEXTS,
+}
+
+
+def is_bot_menu_text(value):
+    return str(value or "").strip() in ALL_MENU_TEXTS
+
+
 async def handle_menu_during_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, current_state):
     """
-    Allows safe menu use while an engineer is inside a conversation flow.
-    Without this, buttons like 🆔 My ID are treated as answers to the active question.
+    Prevent reply-keyboard menu buttons being saved as answers inside active flows.
+    This is especially important during worksheets, where helpdesk/admin buttons
+    must never end up in Work Completed, Materials, Notes or PDF comments.
     """
-    text = update.message.text if update.message else ""
-    if text == MENU_BUG_IDEA:
-        return current_state
-    if text == MENU_MY_JOBS:
-        await update.message.reply_text(
-            "You are currently part-way through another task. Finish it or type /cancel before viewing jobs.",
-            reply_markup=get_main_menu(),
-        )
-        return current_state
+    text = update.message.text.strip() if update.message and update.message.text else ""
 
-    if text in [MENU_START_DAY, MENU_END_DAY, MENU_BUG_IDEA, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_EMERGENCY_JOB, MENU_ENGINEER_MENU]:
+    if text in ALL_MENU_TEXTS:
         await update.message.reply_text(
-            "You are already part-way through another task. Finish it or type /cancel first.",
-            reply_markup=get_main_menu(),
+            "You are part-way through another task. Finish it or type /cancel first. "
+            "This menu button has not been added to the worksheet or job record.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return current_state
 
@@ -4215,6 +4232,10 @@ async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT
     if menu_result is not None:
         return menu_result
 
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type the work completed, or type /cancel.")
+        return WORK_COMPLETED
+
     context.user_data["worksheet"]["WorkCompleted"] = update.message.text
     await update.message.reply_text("What materials were used? Type None if none.")
     return MATERIALS_USED
@@ -4224,6 +4245,10 @@ async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT
     menu_result = await handle_menu_during_conversation(update, context, MATERIALS_USED)
     if menu_result is not None:
         return menu_result
+
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type materials used, or type None.")
+        return MATERIALS_USED
 
     context.user_data["worksheet"]["MaterialsUsed"] = update.message.text
     await update.message.reply_text(
@@ -4283,6 +4308,10 @@ async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAUL
     if menu_result is not None:
         return menu_result
 
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type the follow-on required, or type /cancel.")
+        return FOLLOW_ON_NOTES
+
     context.user_data["worksheet"]["FollowOnNotes"] = update.message.text
     await update.message.reply_text("Any engineer notes? Type None if none.")
     return ENGINEER_NOTES
@@ -4292,6 +4321,10 @@ async def worksheet_engineer_notes(update: Update, context: ContextTypes.DEFAULT
     menu_result = await handle_menu_during_conversation(update, context, ENGINEER_NOTES)
     if menu_result is not None:
         return menu_result
+
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type engineer notes, or type None.")
+        return ENGINEER_NOTES
 
     context.user_data["worksheet"]["EngineerCompletionNotes"] = update.message.text
 
@@ -4663,6 +4696,11 @@ def parse_engineer_visit_log(log_text):
         action = match.group(4).strip()
         extra = (match.group(5) or "").strip()
         key = engineer.lower()
+
+        # Office/helpdesk audit lines are useful in SharePoint, but they are not
+        # engineer attendances and should not appear on the customer worksheet.
+        if key in ["helpdesk", "admin", "office"] or action in ["Reassigned", "Job logged via Telegram"]:
+            continue
 
         if action == "Travelling":
             # Start a fresh attendance for this engineer.
