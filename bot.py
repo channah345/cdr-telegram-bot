@@ -50,13 +50,14 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "helpdesk-dispatch-rollback-v1"
+BUILD_VERSION = "site-autofill-self-learning-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 DAY_LOGS_LIST = "Engineer Day Logs"
 BUG_IDEAS_LIST = "Bug Ideas"
 BOT_USERS_LIST = "Bot Users"
+SITES_LIST = "Sites"
 
 
 PHOTO_LIBRARY = "Documents"
@@ -132,6 +133,9 @@ REASSIGN_REMOVE_ENGINEERS = 42
 REASSIGN_ASSIGN_ENGINEERS = 43
 REASSIGN_REASON = 44
 REASSIGN_REVIEW = 45
+
+LOGJOB_SITE_CONFIRM = 53
+LOGJOB_SITE_NOTES = 54
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -574,6 +578,192 @@ def is_blank_or_skip(value):
     return str(value or "").strip().lower() in ["", "skip", "none", "n/a", "na"]
 
 
+def normalise_site_lookup_text(value):
+    """Normalise site names for forgiving matching without being too clever."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def site_match_score(search_text, candidate_text):
+    search = normalise_site_lookup_text(search_text)
+    candidate = normalise_site_lookup_text(candidate_text)
+
+    if not search or not candidate:
+        return 0
+
+    if search == candidate:
+        return 100
+
+    if search in candidate or candidate in search:
+        return 90
+
+    search_words = set(search.split())
+    candidate_words = set(candidate.split())
+    if search_words and candidate_words:
+        overlap = len(search_words.intersection(candidate_words)) / max(len(search_words), len(candidate_words))
+    else:
+        overlap = 0
+
+    from difflib import SequenceMatcher
+    ratio = SequenceMatcher(None, search, candidate).ratio()
+    return int(max(overlap, ratio) * 100)
+
+
+def extract_site_fields_from_sites_item(item):
+    fields = item.get("fields", {})
+    return {
+        "source": "Sites",
+        "item_id": item.get("id"),
+        "site_name": str(get_field_value(fields, "SiteName", "Site Name", "Title") or "").strip(),
+        "address": str(get_field_value(fields, "Address", "SiteAddress", "Site Address") or "").strip(),
+        "customer_name": str(get_field_value(fields, "CustomerName", "Customer Name") or "").strip(),
+        "notes": str(get_field_value(fields, "Notes", "SiteNotes", "Site Notes") or "").strip(),
+    }
+
+
+def extract_site_fields_from_job_item(item):
+    fields = item.get("fields", {})
+    return {
+        "source": "Previous Jobs",
+        "item_id": item.get("id"),
+        "site_name": str(get_field_value(fields, "SiteName", "Site Name") or "").strip(),
+        "address": str(get_field_value(fields, "Address", "SiteAddress", "Site Address") or "").strip(),
+        "customer_name": str(get_field_value(fields, "CustomerName", "Customer Name") or "").strip(),
+        "notes": "",
+    }
+
+
+def find_best_site_candidate(site_id, jobs_list_id, site_name):
+    """
+    Search the master Sites list first, then fall back to previous Engineer Jobs.
+    Returns a dict with source/site_name/address/customer_name/notes, or None.
+    """
+    best = None
+    best_score = 0
+
+    try:
+        sites_list_id = get_list_id(site_id, SITES_LIST)
+        site_items = get_list_items(site_id, sites_list_id)
+        for item in site_items:
+            fields = item.get("fields", {})
+            active_value = get_field_value(fields, "Active")
+            if active_value not in [None, ""] and not bool_field(active_value):
+                continue
+
+            candidate = extract_site_fields_from_sites_item(item)
+            if not candidate["site_name"] or not candidate["address"]:
+                continue
+
+            score = site_match_score(site_name, candidate["site_name"])
+            if score > best_score:
+                best = candidate
+                best_score = score
+    except Exception as e:
+        print(f"INFO: Sites list lookup skipped: {e}")
+
+    if best and best_score >= 70:
+        return best
+
+    try:
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        for item in jobs_data:
+            candidate = extract_site_fields_from_job_item(item)
+            if not candidate["site_name"] or not candidate["address"]:
+                continue
+
+            score = site_match_score(site_name, candidate["site_name"])
+            if score > best_score:
+                best = candidate
+                best_score = score
+    except Exception as e:
+        print(f"INFO: Previous job site lookup skipped: {e}")
+
+    if best and best_score >= 70:
+        return best
+
+    return None
+
+
+def format_site_candidate(candidate):
+    notes = candidate.get("notes", "")
+    notes_block = f"\n\nSite notes:\n{notes}" if notes else ""
+    return (
+        f"I found a possible saved site from {candidate.get('source', 'records')}:\n\n"
+        f"Site: {candidate.get('site_name', '')}\n"
+        f"Address: {candidate.get('address', '')}\n"
+        f"Customer: {candidate.get('customer_name', '') or 'N/A'}"
+        f"{notes_block}\n\n"
+        "Use this address?\n\n"
+        "Reply YES to use it, EDIT to change the address, or NO to enter manually."
+    )
+
+
+def upsert_site_record_from_job(job):
+    """Create/update the Sites list after a successful job log. Non-critical: failures only warn."""
+    site_id = job.get("site_id")
+    if not site_id:
+        return
+
+    site_name = str(job.get("site_name", "")).strip()
+    address = str(job.get("site_address", "")).strip()
+    customer_name = str(job.get("customer_name", "")).strip()
+    notes = str(job.get("site_notes", "")).strip()
+
+    if not site_name or not address:
+        return
+
+    try:
+        sites_list_id = get_list_id(site_id, SITES_LIST)
+        site_items = get_list_items(site_id, sites_list_id)
+
+        existing = None
+        best_score = 0
+        for item in site_items:
+            candidate = extract_site_fields_from_sites_item(item)
+            score = site_match_score(site_name, candidate.get("site_name", ""))
+            if score > best_score:
+                existing = item
+                best_score = score
+
+        fields = {
+            "Title": site_name,
+            "SiteName": site_name,
+            "Site Name": site_name,
+            "Address": address,
+            "CustomerName": customer_name,
+            "Customer Name": customer_name,
+            "Active": True,
+        }
+        if notes:
+            fields["Notes"] = notes
+
+        payload = build_field_payload_for_list(site_id, sites_list_id, fields)
+
+        if existing and best_score >= 90:
+            update_list_item_fields(site_id, sites_list_id, existing["id"], payload)
+        else:
+            create_list_item_fields(site_id, sites_list_id, payload)
+
+    except Exception as e:
+        print(f"WARNING: Could not update Sites list for {site_name}: {e}")
+
+
+def prompt_for_site_notes(existing_notes=""):
+    if existing_notes:
+        return (
+            "Any permanent site notes to save or update?\n\n"
+            f"Current notes:\n{existing_notes}\n\n"
+            "Reply with updated notes, or type SKIP to leave them as they are."
+        )
+
+    return (
+        "Any permanent site notes to save for next time?\n\n"
+        "Examples: keys at reception, parking instructions, plant room location, asbestos register location.\n\n"
+        "Type notes, or type SKIP."
+    )
+
+
 def parse_helpdesk_job_date(value):
     text = str(value or "").strip().lower()
     today = datetime.now(UK_TZ).date()
@@ -682,6 +872,7 @@ def build_log_job_review(job):
         f"Customer Address: {job.get('customer_address', '')}\n"
         f"Site: {job.get('site_name', '')}\n"
         f"Site Address: {job.get('site_address', '')}\n"
+        f"Site Notes: {job.get('site_notes', '') or 'N/A'}\n"
         f"Contact: {job.get('contact', '') or 'N/A'}\n"
         f"Task: {job.get('task', '')}\n"
         f"Notes: {job.get('notes', '') or 'N/A'}\n"
@@ -695,6 +886,15 @@ def build_log_job_review(job):
 
 
 def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=False):
+    job_notes = job.get("notes", "") or ""
+    site_notes = job.get("site_notes", "") or ""
+
+    if site_notes:
+        if job_notes:
+            job_notes = f"{job_notes}\n\nSite notes: {site_notes}"
+        else:
+            job_notes = f"Site notes: {site_notes}"
+
     payload = build_field_payload_for_list(
         site_id,
         jobs_list_id,
@@ -715,7 +915,7 @@ def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=Fals
             "ContactName": job.get("contact", ""),
             "Contact Name": job.get("contact", ""),
             "Task": job["task"],
-            "Notes": job.get("notes", ""),
+            "Notes": job_notes,
             "CustomerOrderNumber": job.get("order_number", ""),
             "Customer Order Number": job.get("order_number", ""),
             "JobCategory": job.get("category", ""),
@@ -2595,9 +2795,53 @@ async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_blank_or_skip(value):
         await update.message.reply_text("Please enter the site name.")
         return LOGJOB_SITE_NAME
+
     job["site_name"] = value
+    job.pop("site_candidate", None)
+    job.pop("site_notes", None)
+
+    candidate = find_best_site_candidate(job["site_id"], job["jobs_list_id"], value)
+    if candidate:
+        job["site_candidate"] = candidate
+        await update.message.reply_text(format_site_candidate(candidate))
+        return LOGJOB_SITE_CONFIRM
+
     await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
     return LOGJOB_SITE_ADDRESS
+
+
+async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    if not job:
+        await update.message.reply_text("Please start again using ➕ Log Job.")
+        return ConversationHandler.END
+
+    answer = update.message.text.strip().lower()
+    candidate = job.get("site_candidate") or {}
+
+    if answer in ["yes", "y", "use", "use it", "correct"]:
+        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
+        job["site_address"] = candidate.get("address", "")
+        if candidate.get("notes"):
+            job["site_notes"] = candidate.get("notes", "")
+        await update.message.reply_text(prompt_for_site_notes(candidate.get("notes", "")))
+        return LOGJOB_SITE_NOTES
+
+    if answer in ["edit", "change", "amend", "wrong address"]:
+        await update.message.reply_text(
+            "Enter the correct site address.\n\n"
+            "This will be used for the job and saved back to the Sites list."
+        )
+        return LOGJOB_SITE_ADDRESS
+
+    if answer in ["no", "n", "manual", "enter manually"]:
+        job.pop("site_candidate", None)
+        job.pop("site_notes", None)
+        await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
+        return LOGJOB_SITE_ADDRESS
+
+    await update.message.reply_text("Reply YES to use it, EDIT to change the address, or NO to enter manually.")
+    return LOGJOB_SITE_CONFIRM
 
 
 async def logjob_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2607,6 +2851,21 @@ async def logjob_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Please enter the site address.")
         return LOGJOB_SITE_ADDRESS
     job["site_address"] = value
+
+    existing_notes = (job.get("site_candidate") or {}).get("notes", "")
+    await update.message.reply_text(prompt_for_site_notes(existing_notes))
+    return LOGJOB_SITE_NOTES
+
+
+async def logjob_site_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    value = update.message.text.strip()
+
+    if not is_blank_or_skip(value):
+        job["site_notes"] = value
+    elif not job.get("site_notes") and (job.get("site_candidate") or {}).get("notes"):
+        job["site_notes"] = (job.get("site_candidate") or {}).get("notes", "")
+
     await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
     return LOGJOB_CONTACT
 
@@ -2778,6 +3037,8 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
         )
         update_list_item_fields(site_id, jobs_list_id, item_id, final_update)
+
+        upsert_site_record_from_job(job)
 
         context.user_data.pop("log_job", None)
 
@@ -5937,7 +6198,9 @@ logjob_handler = ConversationHandler(
         LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
         LOGJOB_CUSTOMER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_address)],
         LOGJOB_SITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_name)],
+        LOGJOB_SITE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_confirm)],
         LOGJOB_SITE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_address)],
+        LOGJOB_SITE_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_notes)],
         LOGJOB_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_contact)],
         LOGJOB_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_task)],
         LOGJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_notes)],
