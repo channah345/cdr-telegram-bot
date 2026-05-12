@@ -316,19 +316,7 @@ def engineer_has_logged(fields, engineer_name, action):
 
 
 def can_click_action(fields, engineer_name, action):
-    has_travelled = engineer_has_logged(fields, engineer_name, "Travelling")
-    has_on_site = engineer_has_logged(fields, engineer_name, "On Site")
-
-    if action == "Travelling":
-        return True, ""
-
-    if action == "On Site" and not has_travelled:
-        return False, "You need to click Travelling before clicking On Site."
-
-    if action in ["No Access", "Revisit Required", "Completed"] and not has_on_site:
-        return False, "You need to click On Site before selecting this option."
-
-    return True, ""
+    return validate_job_action(fields, engineer_name, action)
 
 
 def get_sharepoint_data():
@@ -534,14 +522,35 @@ def build_pay_summary(start_dt, end_dt, hours):
     )
 
 
+def update_active_day_live_status(site_id, telegram_id, status, current_job=""):
+    """
+    Updates live engineer status on Engineer Day Logs only.
+    Uses CurrentStatus and CurrentJob only.
+    """
+    try:
+        day_logs_list_id, active_day = get_active_day_for_engineer(site_id, telegram_id)
 
-def live_status_payload(status, current_job="", action_time=None):
-    action_time = action_time or graph_datetime_now()
-    return {
-        "CurrentStatus": status,
-        "CurrentJob": current_job,
-        "LastActionTime": action_time,
-    }
+        if not active_day:
+            return
+
+        live_fields = build_field_payload_for_list(
+            site_id,
+            day_logs_list_id,
+            {
+                "CurrentStatus": status,
+                "CurrentJob": current_job,
+            },
+        )
+
+        update_list_item_fields(
+            site_id,
+            day_logs_list_id,
+            active_day["id"],
+            live_fields,
+        )
+
+    except Exception as e:
+        print(f"WARNING: Could not update live engineer day status: {e}")
 
 
 def get_job_reference(fields):
@@ -630,6 +639,81 @@ def format_job(fields, engineer_name=None):
         f"Notes: {fields.get('Notes', '')}\n"
         f"Contact: {fields.get('ContactName', '')}"
     )
+
+
+def is_closed_job(fields):
+    status = str(fields.get("Status", "") or "")
+    outcome = str(fields.get("JobOutcome", "") or "")
+    worksheet_submitted = bool_field(fields.get("WorksheetSubmitted"))
+
+    closed_statuses = {
+        COMPLETED_STATUS,
+        AWAITING_DEPLOYMENT_STATUS,
+    }
+
+    closed_outcomes = {
+        "Completed",
+        "No Access",
+        "Revisit Required",
+    }
+
+    return status in closed_statuses or outcome in closed_outcomes or worksheet_submitted
+
+
+def has_engineer_action(fields, engineer_name, action):
+    return engineer_has_logged(fields, engineer_name, action)
+
+
+def validate_job_action(fields, engineer_name, action):
+    """
+    Hard gate for all job button actions.
+    Prevents duplicate clicks, old-button actions, and out-of-order progress.
+    """
+    if is_closed_job(fields):
+        return False, "This job has already been closed or returned to the office. No further action is required."
+
+    has_travelled = has_engineer_action(fields, engineer_name, "Travelling")
+    has_on_site = has_engineer_action(fields, engineer_name, "On Site")
+
+    if action == "Travelling":
+        if has_travelled:
+            return False, "Travelling has already been logged for this job."
+        return True, ""
+
+    if action == "On Site":
+        if not has_travelled:
+            return False, "You need to click Travelling before clicking On Site."
+        if has_on_site:
+            return False, "On Site has already been logged for this job."
+        return True, ""
+
+    if action in ["No Access", "Revisit Required", "Completed"]:
+        if not has_on_site:
+            return False, "You need to click On Site before selecting this option."
+        return True, ""
+
+    return True, ""
+
+
+def should_auto_send_job(fields):
+    """
+    Auto-send only jobs that are assigned, unnotified and dated today.
+    This prevents future jobs being pushed early and reduces accidental spam.
+    """
+    if is_notified(fields):
+        return False
+
+    assigned_ids = get_assigned_engineer_ids(fields)
+    if not assigned_ids:
+        return False
+
+    if is_closed_job(fields):
+        return False
+
+    job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
+    today = datetime.now(UK_TZ).date()
+
+    return job_date == today
 
 
 def find_job_by_cdr(jobs_data, cdr_number):
@@ -1077,7 +1161,6 @@ async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return START_DAY_START_MILEAGE
 
 
-
 async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_START_MILEAGE)
     if menu_result is not None:
@@ -1201,8 +1284,7 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "Status": DAY_ACTIVE_STATUS,
                     "CurrentStatus": "Day Started",
                     "CurrentJob": "",
-                    "LastActionTime": graph_datetime_now(),
-                },
+},
             )
 
             create_list_item_fields(
@@ -1402,8 +1484,7 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Status": DAY_CLOSED_STATUS,
             "CurrentStatus": "Off Duty",
             "CurrentJob": "",
-            "LastActionTime": end_time.isoformat(),
-            "Pay Summary": pay_summary,
+"Pay Summary": pay_summary,
             "PaySummary": pay_summary,
         }
 
@@ -1508,7 +1589,6 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await bugidea_start(update, context)
 
 
-
 async def handle_menu_during_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE, current_state):
     """
     Allows safe menu use while an engineer is inside a conversation flow.
@@ -1542,7 +1622,6 @@ async def handle_menu_during_conversation(update: Update, context: ContextTypes.
         return current_state
 
     return None
-
 
 
 async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1686,7 +1765,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
             assigned_ids = get_assigned_engineer_ids(fields)
 
-            if current_engineer["lookup_id"] in assigned_ids and job_date == today:
+            if current_engineer["lookup_id"] in assigned_ids and job_date == today and not is_closed_job(fields):
                 found_any = True
                 await update.message.reply_text(
                     "Today's job:\n\n" + format_job(fields, current_engineer["name"]),
@@ -1735,6 +1814,13 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         fields = job["fields"]
+
+        if is_closed_job(fields):
+            await query.message.reply_text(
+                "This job has already been closed or returned to the office. No further action is required."
+            )
+            return
+
         assigned_ids = get_assigned_engineer_ids(fields)
 
         if current_engineer["lookup_id"] not in assigned_ids:
@@ -1827,10 +1913,14 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {
                     "Status": selected_status,
                     "EngineerVisitLog": updated_log,
-                    "CurrentStatus": selected_status,
-                    "CurrentJob": get_job_reference(fields),
-                    "LastActionTime": graph_datetime_now(),
                 },
+            )
+
+            update_active_day_live_status(
+                site_id,
+                user_id,
+                selected_status,
+                get_job_reference(fields),
             )
 
             await query.message.reply_text(
@@ -1879,9 +1969,6 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_fields = {
                 "JobOutcome": selected_outcome,
                 "EngineerVisitLog": updated_log,
-                "CurrentStatus": selected_outcome,
-                "CurrentJob": get_job_reference(fields),
-                "LastActionTime": graph_datetime_now(),
             }
 
             if is_final_engineer:
@@ -1897,6 +1984,13 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+
+            update_active_day_live_status(
+                site_id,
+                user_id,
+                selected_outcome,
+                get_job_reference(fields),
+            )
 
             await query.message.reply_text(
                 f"Updated:\n\n"
@@ -1958,6 +2052,14 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         fields = job["fields"]
+
+        if is_closed_job(fields):
+            await update.message.reply_text(
+                "This job has already been closed or returned to the office. No further action is required.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
         assigned_ids = get_assigned_engineer_ids(fields)
 
         if current_engineer["lookup_id"] not in assigned_ids:
@@ -2233,6 +2335,23 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job = find_job_by_item_id(latest_jobs, item_id)
         fields = job["fields"] if job else worksheet["fields"]
 
+        if is_closed_job(fields):
+            context.user_data.pop("worksheet", None)
+            await update.message.reply_text(
+                "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
+        assigned_ids_latest = get_assigned_engineer_ids(fields)
+        if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
+            context.user_data.pop("worksheet", None)
+            await update.message.reply_text(
+                "You are no longer assigned to this job. Worksheet has not been submitted.",
+                reply_markup=get_main_menu(),
+            )
+            return ConversationHandler.END
+
         updated_log = append_engineer_log(
             fields,
             worksheet["engineer_name"],
@@ -2253,9 +2372,6 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "JobOutcome": "Completed",
             "EngineerVisitLog": updated_log,
             "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
-            "CurrentStatus": "Completed",
-            "CurrentJob": get_job_reference(fields),
-            "LastActionTime": graph_datetime_now(),
         }
 
         if is_final_engineer:
@@ -2270,6 +2386,13 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
+
+        update_active_day_live_status(
+            site_id,
+            str(update.effective_user.id),
+            "Completed",
+            get_job_reference(fields),
+        )
 
         await update.message.reply_text(
             f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
@@ -2313,13 +2436,10 @@ async def send_new_jobs(app):
             fields = job["fields"]
             item_id = job["id"]
 
-            if is_notified(fields):
+            if not should_auto_send_job(fields):
                 continue
 
             assigned_ids = get_assigned_engineer_ids(fields)
-
-            if not assigned_ids:
-                continue
 
             for engineer_id in assigned_ids:
                 engineer = engineers_by_lookup.get(engineer_id)
@@ -2327,26 +2447,30 @@ async def send_new_jobs(app):
                 if not engineer:
                     continue
 
-                await app.bot.send_message(
-                    chat_id=engineer["telegram_id"],
-                    text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
-                    reply_markup=get_job_buttons(item_id),
-                )
+                try:
+                    await app.bot.send_message(
+                        chat_id=engineer["telegram_id"],
+                        text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
+                        reply_markup=get_job_buttons(item_id),
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not send job {fields.get('CDRNumber', item_id)} to engineer {engineer_id}: {e}")
 
             sent_job_ids.add(item_id)
 
         for item_id in sent_job_ids:
-            update_list_item_fields(
-                site_id,
-                jobs_list_id,
-                item_id,
-                {
-                    "TelegramNotified": True,
-                    "Status": ASSIGNED_STATUS,
-                    "CurrentJob": get_job_reference(fields),
-                    "LastActionTime": graph_datetime_now(),
-                },
-            )
+            try:
+                update_list_item_fields(
+                    site_id,
+                    jobs_list_id,
+                    item_id,
+                    {
+                        "TelegramNotified": True,
+                        "Status": ASSIGNED_STATUS,
+                    },
+                )
+            except Exception as e:
+                print(f"ERROR marking job {item_id} as TelegramNotified: {e}")
 
     except Exception as e:
         print(f"ERROR sending new jobs: {e}")
