@@ -56,6 +56,7 @@ MENU_BUG_IDEA = "🐞 Bug / Ideas"
 UK_TZ = ZoneInfo("Europe/London")
 
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
+LEGACY_AWAITING_DEPLOYMENT_STATUS = "Awaiting Deployment"
 ASSIGNED_STATUS = "Assigned"
 COMPLETED_STATUS = "Completed"
 
@@ -642,9 +643,16 @@ def format_job(fields, engineer_name=None):
 
 
 def is_closed_job(fields):
-    status = str(fields.get("Status", "") or "")
-    outcome = str(fields.get("JobOutcome", "") or "")
+    status = str(fields.get("Status", "") or "").strip()
+    outcome = str(fields.get("JobOutcome", "") or "").strip()
     worksheet_submitted = bool_field(fields.get("WorksheetSubmitted"))
+
+    dispatch_statuses = {
+        "",
+        AWAITING_DEPLOYMENT_STATUS,
+        LEGACY_AWAITING_DEPLOYMENT_STATUS,
+        ASSIGNED_STATUS,
+    }
 
     closed_statuses = {
         COMPLETED_STATUS,
@@ -657,6 +665,11 @@ def is_closed_job(fields):
         "No Access",
         "Revisit Required",
     }
+
+    # If the office has put the job back into dispatch, it is open even if
+    # WorksheetSubmitted is still true from a previous attendance.
+    if status in dispatch_statuses and outcome not in closed_outcomes:
+        return False
 
     return status in closed_statuses or outcome in closed_outcomes or worksheet_submitted
 
@@ -701,19 +714,16 @@ def should_auto_send_job(fields):
     Auto-send today's jobs only when:
     - an engineer is assigned
     - TelegramNotified is not already true
-    - the job is not completed/no access/revisit
     - the job is dated today
+    - the job is not finally closed
 
-    Status may be blank, Awaiting Dispatch, or Assigned.
+    Supports both Awaiting Dispatch and Awaiting Deployment while SharePoint is being tidied.
     """
     if is_notified(fields):
         return False
 
     assigned_ids = get_assigned_engineer_ids(fields)
     if not assigned_ids:
-        return False
-
-    if is_closed_job(fields):
         return False
 
     job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
@@ -723,14 +733,22 @@ def should_auto_send_job(fields):
         return False
 
     status = str(fields.get("Status", "") or "").strip()
+    outcome = str(fields.get("JobOutcome", "") or "").strip()
 
     allowed_statuses = {
         "",
         AWAITING_DEPLOYMENT_STATUS,
+        LEGACY_AWAITING_DEPLOYMENT_STATUS,
         ASSIGNED_STATUS,
     }
 
-    return status in allowed_statuses
+    if status not in allowed_statuses:
+        return False
+
+    if outcome in ["Completed", "No Access", "Revisit Required"]:
+        return False
+
+    return True
 
 
 def find_job_by_cdr(jobs_data, cdr_number):
@@ -1991,6 +2009,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_final_engineer:
                 update_fields["Status"] = AWAITING_DEPLOYMENT_STATUS
                 update_fields["TelegramNotified"] = False
+                update_fields["WorksheetSubmitted"] = False
                 update_fields.update(clear_engineer_assignment_payload())
             else:
                 update_fields.update(
