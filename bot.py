@@ -531,6 +531,23 @@ def build_pay_summary(start_dt, end_dt, hours):
     )
 
 
+
+def live_status_payload(status, current_job="", action_time=None):
+    action_time = action_time or graph_datetime_now()
+    return {
+        "CurrentStatus": status,
+        "CurrentJob": current_job,
+        "LastActionTime": action_time,
+    }
+
+
+def get_job_reference(fields):
+    cdr_number = fields.get("CDRNumber", "")
+    site_name = fields.get("SiteName", "")
+    if cdr_number and site_name:
+        return f"{cdr_number} - {site_name}"
+    return cdr_number or site_name or ""
+
 def get_open_jobs_for_engineer_today(jobs_data, engineer_lookup_id):
     today = datetime.now(UK_TZ).date()
     open_jobs = []
@@ -1159,6 +1176,9 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "Van Photo Links": "\n".join(start_day.get("van_photo_links", [])),
                     "VanPhotoLinks": "\n".join(start_day.get("van_photo_links", [])),
                     "Status": DAY_ACTIVE_STATUS,
+                    "CurrentStatus": "Day Started",
+                    "CurrentJob": "",
+                    "LastActionTime": graph_datetime_now(),
                 },
             )
 
@@ -1349,6 +1369,9 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Total Mileage": total_mileage if total_mileage is not None else "",
             "TotalMileage": total_mileage if total_mileage is not None else "",
             "Status": DAY_CLOSED_STATUS,
+            "CurrentStatus": "Off Duty",
+            "CurrentJob": "",
+            "LastActionTime": end_time.isoformat(),
             "Pay Summary": pay_summary,
             "PaySummary": pay_summary,
         }
@@ -1629,6 +1652,9 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {
                     "Status": selected_status,
                     "EngineerVisitLog": updated_log,
+                    "CurrentStatus": selected_status,
+                    "CurrentJob": get_job_reference(fields),
+                    "LastActionTime": graph_datetime_now(),
                 },
             )
 
@@ -1678,6 +1704,9 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_fields = {
                 "JobOutcome": selected_outcome,
                 "EngineerVisitLog": updated_log,
+                "CurrentStatus": selected_outcome,
+                "CurrentJob": get_job_reference(fields),
+                "LastActionTime": graph_datetime_now(),
             }
 
             if is_final_engineer:
@@ -2013,6 +2042,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "JobOutcome": "Completed",
             "EngineerVisitLog": updated_log,
             "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
+            "CurrentStatus": "Completed",
+            "CurrentJob": get_job_reference(fields),
+            "LastActionTime": graph_datetime_now(),
         }
 
         if is_final_engineer:
@@ -2100,6 +2132,8 @@ async def send_new_jobs(app):
                 {
                     "TelegramNotified": True,
                     "Status": ASSIGNED_STATUS,
+                    "CurrentJob": get_job_reference(fields),
+                    "LastActionTime": graph_datetime_now(),
                 },
             )
 
