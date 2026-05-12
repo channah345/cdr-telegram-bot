@@ -2442,6 +2442,26 @@ async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+
+def debug_job_dispatch_decision(fields):
+    try:
+        print("---- JOB DISPATCH CHECK ----")
+        print(f"CDR: {fields.get('CDRNumber')}")
+        print(f"Status: {fields.get('Status')}")
+        print(f"JobOutcome: {fields.get('JobOutcome')}")
+        print(f"TelegramNotified: {fields.get('TelegramNotified')}")
+        print(f"WorksheetSubmitted: {fields.get('WorksheetSubmitted')}")
+        print(f"Date raw: {fields.get('Date')}")
+        print(f"Date parsed: {sharepoint_date_to_uk_date(fields.get('Date', ''))}")
+        print(f"Today: {datetime.now(UK_TZ).date()}")
+        print(f"Assigned engineer IDs: {get_assigned_engineer_ids(fields)}")
+        print(f"Closed: {is_closed_job(fields)}")
+        print(f"Should send: {should_auto_send_job(fields)}")
+        print("----------------------------")
+    except Exception as e:
+        print(f"ERROR in debug_job_dispatch_decision: {e}")
+
+
 async def send_new_jobs(app):
     try:
         site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
@@ -2452,6 +2472,8 @@ async def send_new_jobs(app):
         for job in jobs_data:
             fields = job["fields"]
             item_id = job["id"]
+
+            debug_job_dispatch_decision(fields)
 
             if not should_auto_send_job(fields):
                 continue
