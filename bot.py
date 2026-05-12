@@ -2565,8 +2565,16 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if outcome == "Completed":
                 fields_to_update["Status"] = COMPLETED_STATUS
+                # Keep TelegramNotified as a pure dispatch flag.
+                # It should only be set to True after the bot actually sends the job
+                # to an engineer in send_new_jobs(). Completed jobs are blocked from
+                # being resent by Status/JobOutcome, not by forcing this flag.
+                if is_notified(fields):
+                    fields_to_update["TelegramNotified"] = True
             else:
                 fields_to_update["Status"] = AWAITING_DEPLOYMENT_STATUS
+                # Revisit/No Access goes back to the office for re-dispatch.
+                # Leave this False so the next assigned engineer can be notified.
                 fields_to_update["TelegramNotified"] = False
 
             fields_to_update.update(clear_engineer_assignment_payload())
@@ -2621,22 +2629,12 @@ async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def debug_job_dispatch_decision(fields):
-    try:
-        print("---- JOB DISPATCH CHECK ----")
-        print(f"CDR: {fields.get('CDRNumber')}")
-        print(f"Status: {fields.get('Status')}")
-        print(f"JobOutcome: {fields.get('JobOutcome')}")
-        print(f"TelegramNotified: {fields.get('TelegramNotified')}")
-        print(f"WorksheetSubmitted: {fields.get('WorksheetSubmitted')}")
-        print(f"Date raw: {fields.get('Date')}")
-        print(f"Date parsed: {sharepoint_date_to_uk_date(fields.get('Date', ''))}")
-        print(f"Today: {datetime.now(UK_TZ).date()}")
-        print(f"Assigned engineer IDs: {get_assigned_engineer_ids(fields)}")
-        print(f"Closed: {is_closed_job(fields)}")
-        print(f"Should send: {should_auto_send_job(fields)}")
-        print("----------------------------")
-    except Exception as e:
-        print(f"ERROR in debug_job_dispatch_decision: {e}")
+    """
+    Debug logging is intentionally disabled for normal use.
+    The dispatch scheduler runs frequently, so printing every job every cycle
+    makes Railway logs noisy even when no job is being sent.
+    """
+    return
 
 
 async def send_new_jobs(app):
@@ -2649,8 +2647,6 @@ async def send_new_jobs(app):
         for job in jobs_data:
             fields = job["fields"]
             item_id = job["id"]
-
-            debug_job_dispatch_decision(fields)
 
             if not should_auto_send_job(fields):
                 continue
