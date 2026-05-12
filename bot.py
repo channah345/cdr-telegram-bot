@@ -590,6 +590,33 @@ def is_notified(fields):
     return value in [True, "true", "True", "Yes", "yes", "1", 1]
 
 
+
+
+def get_yes_no_keyboard(prefix):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes", callback_data=f"{prefix}|yes"),
+            InlineKeyboardButton("❌ No", callback_data=f"{prefix}|no"),
+        ]
+    ])
+
+
+def get_signed_skip_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Signed", callback_data="signature_waiting|signed"),
+            InlineKeyboardButton("⏭️ Skip", callback_data="signature_waiting|skip"),
+        ]
+    ])
+
+
+def get_review_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Submit worksheet", callback_data="review|submit")],
+        [InlineKeyboardButton("🔄 Restart worksheet", callback_data="review|restart")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="review|cancel")],
+    ])
+
 def get_job_buttons(item_id):
     return InlineKeyboardMarkup([
         [
@@ -935,9 +962,9 @@ def build_review_text(worksheet):
         f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
         f"Client signature required: {signature_required}\n"
         f"Client signature received: {signature_received}\n\n"
-        f"Type SUBMIT to complete the job.\n"
-        f"Type RESTART to redo the worksheet.\n"
-        f"Type CANCEL to abandon it."
+        f"Tap Submit worksheet to complete the job.\n"
+        f"Tap Restart worksheet to redo the worksheet.\n"
+        f"Tap Cancel to abandon it."
     )
 
 
@@ -1152,7 +1179,8 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         await update.message.reply_text(
-            "Are you sure you want to start your day? Reply Yes or No."
+            "Are you sure you want to start your day?",
+            reply_markup=get_yes_no_keyboard("startday_confirm"),
         )
         return START_DAY_CONFIRM
 
@@ -1173,7 +1201,7 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.message.text.strip().lower()
 
     if answer not in ["yes", "no", "y", "n"]:
-        await update.message.reply_text("Please reply Yes or No.")
+        await update.message.reply_text("Please tap Yes or No.")
         return START_DAY_CONFIRM
 
     if answer in ["no", "n"]:
@@ -1182,6 +1210,21 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text("Starting your day. Please enter the van registration.")
+    return START_DAY_VAN_REG
+
+
+async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    answer = query.data.split("|", 1)[1]
+
+    if answer == "no":
+        context.user_data.pop("start_day", None)
+        await query.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    await query.message.reply_text("Starting your day. Please enter the van registration.")
     return START_DAY_VAN_REG
 
 
@@ -1524,7 +1567,8 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         await update.message.reply_text(
-            "Are you sure you want to end your day? Reply Yes or No."
+            "Are you sure you want to end your day?",
+            reply_markup=get_yes_no_keyboard("endday_confirm"),
         )
         return END_DAY_CONFIRM
 
@@ -1545,7 +1589,7 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.message.text.strip().lower()
 
     if answer not in ["yes", "no", "y", "n"]:
-        await update.message.reply_text("Please reply Yes or No.")
+        await update.message.reply_text("Please tap Yes or No.")
         return END_DAY_CONFIRM
 
     if answer in ["no", "n"]:
@@ -1554,6 +1598,24 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text(
+        "Please enter your end mileage as a number.\n\n"
+        "If you do not need to record mileage, type 0."
+    )
+    return END_DAY_MILEAGE
+
+
+async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    answer = query.data.split("|", 1)[1]
+
+    if answer == "no":
+        context.user_data.pop("end_day", None)
+        await query.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    await query.message.reply_text(
         "Please enter your end mileage as a number.\n\n"
         "If you do not need to record mileage, type 0."
     )
@@ -2304,7 +2366,10 @@ async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT
         return menu_result
 
     context.user_data["worksheet"]["MaterialsUsed"] = update.message.text
-    await update.message.reply_text("Is a follow-on required? Reply Yes or No.")
+    await update.message.reply_text(
+        "Is a follow-on required?",
+        reply_markup=get_yes_no_keyboard("follow_on_required"),
+    )
     return FOLLOW_ON_REQUIRED
 
 
@@ -2316,7 +2381,7 @@ async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEF
     answer = update.message.text.strip().lower()
 
     if answer not in ["yes", "no", "y", "n"]:
-        await update.message.reply_text("Please reply Yes or No.")
+        await update.message.reply_text("Please tap Yes or No.")
         return FOLLOW_ON_REQUIRED
 
     follow_on_required = answer in ["yes", "y"]
@@ -2328,6 +2393,28 @@ async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEF
 
     context.user_data["worksheet"]["FollowOnNotes"] = ""
     await update.message.reply_text("Any engineer notes? Type None if none.")
+    return ENGINEER_NOTES
+
+
+async def worksheet_follow_on_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    answer = query.data.split("|", 1)[1]
+    follow_on_required = answer == "yes"
+    worksheet["FollowOnRequired"] = follow_on_required
+
+    if follow_on_required:
+        await query.message.reply_text("What follow-on is required?")
+        return FOLLOW_ON_NOTES
+
+    worksheet["FollowOnNotes"] = ""
+    await query.message.reply_text("Any engineer notes? Type None if none.")
     return ENGINEER_NOTES
 
 
@@ -2365,7 +2452,10 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worksheet = context.user_data["worksheet"]
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
-        await update.message.reply_text("Is a client signature required? Reply Yes or No.")
+        await update.message.reply_text(
+            "Is a client signature required?",
+            reply_markup=get_yes_no_keyboard("signature_required"),
+        )
         return SIGNATURE_REQUIRED
 
     if update.message.photo:
@@ -2402,14 +2492,17 @@ async def worksheet_signature_required(update: Update, context: ContextTypes.DEF
     worksheet = context.user_data["worksheet"]
 
     if answer not in ["yes", "no", "y", "n"]:
-        await update.message.reply_text("Please reply Yes or No.")
+        await update.message.reply_text("Please tap Yes or No.")
         return SIGNATURE_REQUIRED
 
     signature_required = answer in ["yes", "y"]
     worksheet["ClientSignatureRequired"] = signature_required
 
     if not signature_required:
-        await update.message.reply_text(build_review_text(worksheet))
+        await update.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
         return REVIEW
 
     try:
@@ -2427,8 +2520,8 @@ async def worksheet_signature_required(update: Update, context: ContextTypes.DEF
             "Client signature required.\n\n"
             "Open this link on your phone and ask the client to sign:\n\n"
             f"{signature_url}\n\n"
-            "Once signed, type SIGNED.\n"
-            "If no client is available, type SKIP."
+            "Once signed, tap Signed. If no client is available, tap Skip.",
+            reply_markup=get_signed_skip_keyboard(),
         )
 
         return SIGNATURE_WAITING
@@ -2436,7 +2529,56 @@ async def worksheet_signature_required(update: Update, context: ContextTypes.DEF
     except Exception as e:
         print(f"ERROR creating signature link: {e}")
         await update.message.reply_text(
-            "There was an error creating the signature link. Type SKIP to continue without a signature."
+            "There was an error creating the signature link. Tap Skip to continue without a signature."
+        )
+        return SIGNATURE_WAITING
+
+
+async def worksheet_signature_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    signature_required = query.data.split("|", 1)[1] == "yes"
+    worksheet["ClientSignatureRequired"] = signature_required
+
+    if not signature_required:
+        await query.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    try:
+        token = create_signature_token_for_job(
+            worksheet["site_id"],
+            worksheet["jobs_list_id"],
+            worksheet["item_id"],
+        )
+
+        signature_url = build_signature_url(worksheet["cdr_number"], token)
+        worksheet["SignatureToken"] = token
+        worksheet["SignatureUrl"] = signature_url
+
+        await query.message.reply_text(
+            "Client signature required.\n\n"
+            "Open this link on your phone and ask the client to sign:\n\n"
+            f"{signature_url}\n\n"
+            "Once signed, tap Signed. If no client is available, tap Skip.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+
+        return SIGNATURE_WAITING
+
+    except Exception as e:
+        print(f"ERROR creating signature link: {e}")
+        await query.message.reply_text(
+            "There was an error creating the signature link. Tap Skip to continue without a signature.",
+            reply_markup=get_signed_skip_keyboard(),
         )
         return SIGNATURE_WAITING
 
@@ -2451,11 +2593,17 @@ async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFA
 
     if answer == "SKIP":
         worksheet["ClientSignatureReceived"] = False
-        await update.message.reply_text(build_review_text(worksheet))
+        await update.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
         return REVIEW
 
     if answer != "SIGNED":
-        await update.message.reply_text("Please type SIGNED once the client has signed, or SKIP to continue without a signature.")
+        await update.message.reply_text(
+            "Please tap Signed once the client has signed, or Skip to continue without a signature.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
         return SIGNATURE_WAITING
 
     latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
@@ -2472,11 +2620,64 @@ async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFA
         worksheet["ClientSignatureName"] = fields.get("ClientSignatureName", "")
         worksheet["ClientSignatureLink"] = fields.get("ClientSignatureLink", "")
         await update.message.reply_text("Signature received.")
-        await update.message.reply_text(build_review_text(worksheet))
+        await update.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
         return REVIEW
 
     await update.message.reply_text(
-        "I cannot see the signature yet. Make sure the client pressed Submit Signature, then type SIGNED again."
+        "I cannot see the signature yet. Make sure the client pressed Submit Signature, then tap Signed again.",
+        reply_markup=get_signed_skip_keyboard(),
+    )
+    return SIGNATURE_WAITING
+
+
+async def worksheet_signature_waiting_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    action = query.data.split("|", 1)[1]
+
+    if action == "skip":
+        worksheet["ClientSignatureReceived"] = False
+        await query.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
+    job = find_job_by_item_id(latest_jobs, worksheet["item_id"])
+
+    if not job:
+        await query.message.reply_text(
+            "Could not check the signature. Tap Signed again or Skip.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+        return SIGNATURE_WAITING
+
+    fields = job["fields"]
+
+    if bool_field(fields.get("ClientSignatureReceived")):
+        worksheet["ClientSignatureReceived"] = True
+        worksheet["ClientSignatureName"] = fields.get("ClientSignatureName", "")
+        worksheet["ClientSignatureLink"] = fields.get("ClientSignatureLink", "")
+        await query.message.reply_text("Signature received.")
+        await query.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    await query.message.reply_text(
+        "I cannot see the signature yet. Make sure the client pressed Submit Signature, then tap Signed again.",
+        reply_markup=get_signed_skip_keyboard(),
     )
     return SIGNATURE_WAITING
 
@@ -2617,8 +2818,150 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("worksheet", None)
         return ConversationHandler.END
 
-    await update.message.reply_text("Please type SUBMIT, RESTART or CANCEL.")
+    await update.message.reply_text(
+        "Please tap Submit worksheet, Restart worksheet or Cancel.",
+        reply_markup=get_review_keyboard(),
+    )
     return REVIEW
+
+
+async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    action = query.data.split("|", 1)[1]
+
+    if action == "cancel":
+        context.user_data.pop("worksheet", None)
+        await query.message.reply_text("Worksheet cancelled. Nothing has been submitted.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    if action == "restart":
+        worksheet["WorkCompleted"] = ""
+        worksheet["MaterialsUsed"] = ""
+        worksheet["FollowOnRequired"] = False
+        worksheet["FollowOnNotes"] = ""
+        worksheet["EngineerCompletionNotes"] = ""
+        worksheet["photo_links"] = []
+        worksheet["ClientSignatureRequired"] = False
+        worksheet["ClientSignatureReceived"] = False
+
+        await query.message.reply_text(
+            f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
+            f"What work was completed?"
+        )
+        return WORK_COMPLETED
+
+    if action != "submit":
+        await query.message.reply_text(
+            "Please tap Submit worksheet, Restart worksheet or Cancel.",
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    site_id = worksheet["site_id"]
+    jobs_list_id = worksheet["jobs_list_id"]
+    item_id = worksheet["item_id"]
+
+    latest_jobs = get_list_items(site_id, jobs_list_id)
+    job = find_job_by_item_id(latest_jobs, item_id)
+    fields = job["fields"] if job else worksheet["fields"]
+
+    if is_closed_job(fields):
+        context.user_data.pop("worksheet", None)
+        await query.message.reply_text(
+            "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+    assigned_ids_latest = get_assigned_engineer_ids(fields)
+    if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
+        context.user_data.pop("worksheet", None)
+        await query.message.reply_text(
+            "You are no longer assigned to this job. Worksheet has not been submitted.",
+            reply_markup=get_main_menu(),
+        )
+        return ConversationHandler.END
+
+    outcome = worksheet.get("JobOutcome", "Completed")
+
+    updated_log = append_engineer_log(
+        fields,
+        worksheet["engineer_name"],
+        outcome,
+        "Worksheet submitted",
+    )
+
+    assigned_ids = get_assigned_engineer_ids(fields)
+    is_final_engineer = len(assigned_ids) <= 1
+
+    fields_to_update = {
+        "WorkCompleted": worksheet.get("WorkCompleted", ""),
+        "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
+        "FollowOnRequired": worksheet.get("FollowOnRequired", False),
+        "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
+        "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
+        "WorksheetSubmitted": True,
+        "EngineerVisitLog": updated_log,
+        "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
+    }
+
+    if is_final_engineer:
+        fields_to_update["JobOutcome"] = outcome
+
+        if outcome == "Completed":
+            fields_to_update["Status"] = COMPLETED_STATUS
+            if is_notified(fields):
+                fields_to_update["TelegramNotified"] = True
+        else:
+            fields_to_update["Status"] = AWAITING_DEPLOYMENT_STATUS
+            fields_to_update["TelegramNotified"] = False
+
+        fields_to_update.update(clear_engineer_assignment_payload())
+    else:
+        fields_to_update.update(
+            remove_current_engineer_assignment_payload(
+                fields,
+                worksheet["engineer_lookup_id"],
+            )
+        )
+
+    update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
+
+    update_active_day_live_status(
+        site_id,
+        str(query.from_user.id),
+        outcome,
+        get_job_reference(fields),
+    )
+
+    await query.message.reply_text(
+        f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}",
+        reply_markup=get_main_menu(),
+    )
+
+    await notify_helpdesk(
+        context,
+        (
+            f"Worksheet submitted\n\n"
+            f"CDR Number: {worksheet['cdr_number']}\n"
+            f"Engineer: {worksheet['engineer_name']}\n"
+            f"Outcome: {outcome}\n"
+            f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
+            f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
+            f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
+            f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
+        ),
+    )
+
+    context.user_data.pop("worksheet", None)
+    return ConversationHandler.END
 
 
 async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2766,7 +3109,10 @@ startday_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{MENU_START_DAY}$"), startday_start),
     ],
     states={
-        START_DAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_confirm)],
+        START_DAY_CONFIRM: [
+            CallbackQueryHandler(startday_confirm_button, pattern=r"^startday_confirm\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, startday_confirm),
+        ],
         START_DAY_VAN_REG: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_reg)],
         START_DAY_START_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_start_mileage)],
         START_DAY_VAN_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_check)],
@@ -2784,7 +3130,10 @@ endday_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{MENU_END_DAY}$"), endday_start),
     ],
     states={
-        END_DAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_confirm)],
+        END_DAY_CONFIRM: [
+            CallbackQueryHandler(endday_confirm_button, pattern=r"^endday_confirm\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, endday_confirm),
+        ],
         END_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_mileage)],
     },
     fallbacks=[CommandHandler("cancel", endday_cancel)],
@@ -2799,16 +3148,28 @@ worksheet_handler = ConversationHandler(
     states={
         WORK_COMPLETED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_work_completed)],
         MATERIALS_USED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_materials_used)],
-        FOLLOW_ON_REQUIRED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_required)],
+        FOLLOW_ON_REQUIRED: [
+            CallbackQueryHandler(worksheet_follow_on_required_button, pattern=r"^follow_on_required\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_required),
+        ],
         FOLLOW_ON_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_notes)],
         ENGINEER_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_engineer_notes)],
         PHOTOS: [
             MessageHandler(filters.PHOTO, worksheet_photos),
             MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_photos),
         ],
-        SIGNATURE_REQUIRED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_required)],
-        SIGNATURE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_waiting)],
-        REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_review)],
+        SIGNATURE_REQUIRED: [
+            CallbackQueryHandler(worksheet_signature_required_button, pattern=r"^signature_required\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_required),
+        ],
+        SIGNATURE_WAITING: [
+            CallbackQueryHandler(worksheet_signature_waiting_button, pattern=r"^signature_waiting\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_waiting),
+        ],
+        REVIEW: [
+            CallbackQueryHandler(worksheet_review_button, pattern=r"^review\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_review),
+        ],
     },
     fallbacks=[CommandHandler("cancel", worksheet_cancel)],
 )
