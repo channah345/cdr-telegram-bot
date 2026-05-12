@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "site-autofill-self-learning-v1"
+BUILD_VERSION = "site-autofill-cancel-delete-v2"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -78,6 +78,8 @@ MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
 MENU_OPEN_JOBS = "📋 Open Jobs"
 MENU_FIND_JOB = "🔎 Find Job"
+MENU_CANCEL_JOB = "❌ Cancel Job"
+MENU_DELETE_JOB = "🗑 Delete Job"
 MENU_DISPATCH_BOARD = "🗂 Dispatch Board"
 MENU_EMERGENCY_JOB = "🚨 Emergency Job"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
@@ -136,6 +138,11 @@ REASSIGN_REVIEW = 45
 
 LOGJOB_SITE_CONFIRM = 53
 LOGJOB_SITE_NOTES = 54
+
+CANCELJOB_CDR_NUMBER = 55
+CANCELJOB_CONFIRM = 56
+DELETEJOB_CDR_NUMBER = 57
+DELETEJOB_CONFIRM = 58
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -339,6 +346,17 @@ def create_list_item_fields(site_id, list_id, fields_to_create):
     return response.json()
 
 
+def delete_list_item(site_id, list_id, item_id):
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}"
+
+    response = requests.delete(url, headers=get_headers())
+
+    if response.status_code not in [200, 202, 204]:
+        raise Exception(f"Could not delete list item {item_id}: {response.text}")
+
+
+
+
 def clear_engineer_assignment_payload():
     return {
         "EngineerLookupId@odata.type": "Collection(Edm.Int32)",
@@ -464,9 +482,11 @@ def get_helpdesk_menu(include_engineer_menu=False):
     rows = [
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
+        [MENU_CANCEL_JOB],
     ]
 
     if include_engineer_menu:
+        rows.append([MENU_DELETE_JOB])
         rows.append([MENU_ENGINEER_MENU])
 
     return ReplyKeyboardMarkup(
@@ -483,6 +503,7 @@ def get_admin_menu():
             [MENU_END_DAY, MENU_BUG_IDEA],
             [MENU_LOG_JOB, MENU_REASSIGN_JOB],
             [MENU_OPEN_JOBS, MENU_FIND_JOB],
+            [MENU_CANCEL_JOB, MENU_DELETE_JOB],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -618,6 +639,7 @@ def extract_site_fields_from_sites_item(item):
         "site_name": str(get_field_value(fields, "SiteName", "Site Name", "Title") or "").strip(),
         "address": str(get_field_value(fields, "Address", "SiteAddress", "Site Address") or "").strip(),
         "customer_name": str(get_field_value(fields, "CustomerName", "Customer Name") or "").strip(),
+        "customer_address": str(get_field_value(fields, "CustomerAddress", "Customer Address") or "").strip(),
         "notes": str(get_field_value(fields, "Notes", "SiteNotes", "Site Notes") or "").strip(),
     }
 
@@ -630,6 +652,7 @@ def extract_site_fields_from_job_item(item):
         "site_name": str(get_field_value(fields, "SiteName", "Site Name") or "").strip(),
         "address": str(get_field_value(fields, "Address", "SiteAddress", "Site Address") or "").strip(),
         "customer_name": str(get_field_value(fields, "CustomerName", "Customer Name") or "").strip(),
+        "customer_address": str(get_field_value(fields, "CustomerAddress", "Customer Address") or "").strip(),
         "notes": "",
     }
 
@@ -692,7 +715,8 @@ def format_site_candidate(candidate):
         f"I found a possible saved site from {candidate.get('source', 'records')}:\n\n"
         f"Site: {candidate.get('site_name', '')}\n"
         f"Address: {candidate.get('address', '')}\n"
-        f"Customer: {candidate.get('customer_name', '') or 'N/A'}"
+        f"Customer: {candidate.get('customer_name', '') or 'N/A'}\n"
+        f"Customer Address: {candidate.get('customer_address', '') or 'N/A'}"
         f"{notes_block}\n\n"
         "Use this address?\n\n"
         "Reply YES to use it, EDIT to change the address, or NO to enter manually."
@@ -708,6 +732,7 @@ def upsert_site_record_from_job(job):
     site_name = str(job.get("site_name", "")).strip()
     address = str(job.get("site_address", "")).strip()
     customer_name = str(job.get("customer_name", "")).strip()
+    customer_address = str(job.get("customer_address", "")).strip()
     notes = str(job.get("site_notes", "")).strip()
 
     if not site_name or not address:
@@ -733,6 +758,8 @@ def upsert_site_record_from_job(job):
             "Address": address,
             "CustomerName": customer_name,
             "Customer Name": customer_name,
+            "CustomerAddress": customer_address,
+            "Customer Address": customer_address,
             "Active": True,
         }
         if notes:
@@ -2630,7 +2657,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_BUG_IDEA:
         return await bugidea_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_EMERGENCY_JOB, MENU_ENGINEER_MENU]:
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -2680,12 +2707,19 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_OPEN_JOBS:
         return await openjobs_start(update, context)
 
+    if text == MENU_CANCEL_JOB:
+        return await canceljob_start(update, context)
+
+    if text == MENU_DELETE_JOB:
+        return await deletejob_start(update, context)
+
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
         MENU_OPEN_JOBS: "Open Jobs",
         MENU_FIND_JOB: "Find Job",
-        MENU_EMERGENCY_JOB: "Emergency Job",
+        MENU_CANCEL_JOB: "Cancel Job",
+        MENU_DELETE_JOB: "Delete Job",
         MENU_HELPDESK: "Helpdesk",
     }
 
@@ -4031,6 +4065,252 @@ async def dispatch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
     )
     return ConversationHandler.END
+
+async def canceljob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to cancel jobs.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    context.user_data["cancel_job"] = {"role": role}
+    await update.message.reply_text(
+        "Enter the CDR/job number you want to cancel.\n\n"
+        "This will keep the SharePoint record but mark it as Cancelled.",
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+    )
+    return CANCELJOB_CDR_NUMBER
+
+
+async def canceljob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("cancel_job") or {}
+    cdr_number = update.message.text.strip()
+
+    if is_blank_or_skip(cdr_number):
+        await update.message.reply_text("Please enter a CDR/job number to cancel.")
+        return CANCELJOB_CDR_NUMBER
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        job = find_job_by_cdr(jobs_data, cdr_number)
+
+        if not job:
+            await update.message.reply_text("I could not find that job. Check the CDR number and try again.")
+            return CANCELJOB_CDR_NUMBER
+
+        data.update({
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "job": job,
+            "cdr_number": get_field_value(job.get("fields", {}), "CDRNumber", "CDR Number", "Title") or cdr_number,
+        })
+        context.user_data["cancel_job"] = data
+
+        await update.message.reply_text(
+            format_helpdesk_job_detail(job, engineers)
+            + "\n\nCancel this job?\n\nReply YES to cancel, or NO to stop."
+        )
+        return CANCELJOB_CONFIRM
+
+    except Exception as e:
+        print(f"ERROR starting cancel job: {e}")
+        await update.message.reply_text(
+            "There was an error finding that job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(str(data.get("role", "")).lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def canceljob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("cancel_job") or {}
+    role = data.get("role") or await get_role_for_update(update)
+    answer = update.message.text.strip().lower()
+
+    if answer in ["no", "n", "cancel", "stop"]:
+        context.user_data.pop("cancel_job", None)
+        await update.message.reply_text(
+            "Cancel Job stopped. Nothing has been changed.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(str(role).lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to cancel this job, or NO to stop.")
+        return CANCELJOB_CONFIRM
+
+    try:
+        site_id = data["site_id"]
+        jobs_list_id = data["jobs_list_id"]
+        job = data["job"]
+        fields = job.get("fields", {})
+        cdr_number = data.get("cdr_number") or get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+        updated_log = append_engineer_log(fields, "Helpdesk", "Cancelled", f"Cancelled by {update.effective_user.id}")
+
+        payload = build_field_payload_for_list(
+            site_id,
+            jobs_list_id,
+            {
+                "Status": "Cancelled",
+                "JobOutcome": "Cancelled by Helpdesk",
+                "Job Outcome": "Cancelled by Helpdesk",
+                "TelegramNotified": False,
+                "Telegram Notified": False,
+                "EngineerVisitLog": updated_log,
+                "Engineer Visit Log": updated_log,
+            },
+        )
+        payload.update(clear_engineer_assignment_payload())
+        update_list_item_fields(site_id, jobs_list_id, job["id"], payload)
+
+        context.user_data.pop("cancel_job", None)
+        await update.message.reply_text(
+            f"Job cancelled: {cdr_number}\n\nThe SharePoint record has been kept for audit history.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(str(role).lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR cancelling job: {e}")
+        await update.message.reply_text(
+            "There was an error cancelling the job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(str(role).lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def canceljob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("cancel_job", None)
+    await update.message.reply_text(
+        "Cancel Job stopped. Nothing has been changed.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(str(role).lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
+    )
+    return ConversationHandler.END
+
+
+async def deletejob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if str(role).lower() != "admin":
+        await update.message.reply_text(
+            "Hard delete is admin-only. Use ❌ Cancel Job if you need to remove a job from the active workflow.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    context.user_data["delete_job"] = {"role": role}
+    await update.message.reply_text(
+        "ADMIN HARD DELETE.\n\n"
+        "Enter the CDR/job number you want to permanently delete from the SharePoint list.\n\n"
+        "This does not delete any separate files/photos already uploaded to document libraries.",
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+    )
+    return DELETEJOB_CDR_NUMBER
+
+
+async def deletejob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("delete_job") or {}
+    cdr_number = update.message.text.strip()
+
+    if is_blank_or_skip(cdr_number):
+        await update.message.reply_text("Please enter a CDR/job number to hard delete.")
+        return DELETEJOB_CDR_NUMBER
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        job = find_job_by_cdr(jobs_data, cdr_number)
+
+        if not job:
+            await update.message.reply_text("I could not find that job. Check the CDR number and try again.")
+            return DELETEJOB_CDR_NUMBER
+
+        fields = job.get("fields", {})
+        actual_cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or cdr_number
+        data.update({
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "job": job,
+            "cdr_number": actual_cdr,
+        })
+        context.user_data["delete_job"] = data
+
+        await update.message.reply_text(
+            format_helpdesk_job_detail(job, engineers)
+            + "\n\n⚠️ ADMIN HARD DELETE WARNING ⚠️\n"
+            + "This permanently deletes the SharePoint list item.\n\n"
+            + f"To confirm, type exactly:\nDELETE {actual_cdr}\n\n"
+            + "Type NO to stop."
+        )
+        return DELETEJOB_CONFIRM
+
+    except Exception as e:
+        print(f"ERROR starting hard delete: {e}")
+        await update.message.reply_text(
+            "There was an error finding that job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=True),
+        )
+        return ConversationHandler.END
+
+
+async def deletejob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get("delete_job") or {}
+    answer = update.message.text.strip()
+    cdr_number = str(data.get("cdr_number", "")).strip()
+
+    if answer.lower() in ["no", "n", "cancel", "stop"]:
+        context.user_data.pop("delete_job", None)
+        await update.message.reply_text(
+            "Hard Delete stopped. Nothing has been changed.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=True),
+        )
+        return ConversationHandler.END
+
+    expected = f"DELETE {cdr_number}"
+    if answer != expected:
+        await update.message.reply_text(
+            f"Confirmation did not match. To permanently delete this job, type exactly:\n{expected}\n\nOr type NO to stop."
+        )
+        return DELETEJOB_CONFIRM
+
+    try:
+        delete_list_item(data["site_id"], data["jobs_list_id"], data["job"]["id"])
+        context.user_data.pop("delete_job", None)
+        await update.message.reply_text(
+            f"Hard deleted SharePoint job item: {cdr_number}\n\nAny files/photos already uploaded to document libraries have not been deleted.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=True),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR hard deleting job: {e}")
+        await update.message.reply_text(
+            "There was an error hard deleting the job. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=True),
+        )
+        return ConversationHandler.END
+
+
+async def deletejob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("delete_job", None)
+    await update.message.reply_text(
+        "Hard Delete stopped. Nothing has been changed.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=True),
+    )
+    return ConversationHandler.END
+
 
 async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
@@ -6175,6 +6455,32 @@ dispatch_handler = ConversationHandler(
 )
 
 
+canceljob_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("canceljob", canceljob_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_CANCEL_JOB)}$"), canceljob_start),
+    ],
+    states={
+        CANCELJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, canceljob_cdr_number)],
+        CANCELJOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, canceljob_confirm)],
+    },
+    fallbacks=[CommandHandler("cancel", canceljob_cancel)],
+)
+
+
+deletejob_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("deletejob", deletejob_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_DELETE_JOB)}$"), deletejob_start),
+    ],
+    states={
+        DELETEJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, deletejob_cdr_number)],
+        DELETEJOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, deletejob_confirm)],
+    },
+    fallbacks=[CommandHandler("cancel", deletejob_cancel)],
+)
+
+
 findjob_handler = ConversationHandler(
     entry_points=[
         CommandHandler("findjob", findjob_start),
@@ -6225,8 +6531,10 @@ telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
+telegram_app.add_handler(canceljob_handler)
+telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
