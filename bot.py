@@ -1,7 +1,9 @@
 import os
+import re
 import base64
 import secrets
 import threading
+from io import BytesIO
 from urllib.parse import quote_plus
 import warnings
 import requests
@@ -34,6 +36,12 @@ from telegram.ext import (
 )
 import uvicorn
 
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
@@ -53,6 +61,7 @@ PHOTO_LIBRARY = "Documents"
 PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 SIGNATURE_BASE_FOLDER = "16 - CLIENT SIGNATURES"
 VAN_CHECK_PHOTO_BASE_FOLDER = "17 - VAN CHECK PHOTOS"
+WORKSHEET_BASE_FOLDER = "18 - JOB WORKSHEETS"
 
 DAY_ACTIVE_STATUS = "Active"
 DAY_CLOSED_STATUS = "Closed"
@@ -2938,6 +2947,322 @@ async def worksheet_signature_waiting_button(update: Update, context: ContextTyp
     return SIGNATURE_WAITING
 
 
+
+
+def clean_pdf_text(value):
+    text = str(value or "").strip()
+    return text if text and text.lower() != "none" else "N/A"
+
+
+def safe_pdf_filename(value):
+    cleaned = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in ["-", "_", " "]).strip()
+    return cleaned.replace(" ", "_") or "worksheet"
+
+
+def extract_visit_times(fields, engineer_name):
+    """Pull the current engineer's travelling/on-site/completed times from EngineerVisitLog."""
+    result = {
+        "travelling": "",
+        "on_site": "",
+        "off_site": "",
+    }
+
+    lines = get_current_engineer_visit_log_lines(fields, engineer_name)
+
+    for line in lines:
+        match = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+-\s+(.+?)\s+-\s+(.+?)(\s+-\s+.*)?$", line)
+        if not match:
+            continue
+
+        time_value = match.group(2)
+        action = match.group(4).strip()
+
+        if action == "Travelling":
+            result["travelling"] = time_value
+        elif action == "On Site":
+            result["on_site"] = time_value
+        elif action in ["Completed", "No Access", "Revisit Required"]:
+            result["off_site"] = time_value
+
+    return result
+
+
+def get_logo_for_pdf(max_width=48 * mm, max_height=20 * mm):
+    for path in ["cdr-logo.png", "CDR-logo.png", "logo.png"]:
+        if os.path.exists(path):
+            try:
+                logo = Image(path)
+                logo._restrictSize(max_width, max_height)
+                return logo
+            except Exception as e:
+                print(f"Could not load logo {path}: {e}")
+    return Paragraph("<b>CDR</b>", ParagraphStyle("LogoFallback", fontSize=20, textColor=colors.HexColor("#f58220")))
+
+
+def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome):
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle("CDRNormal", parent=styles["BodyText"], fontName="Helvetica", fontSize=8.8, leading=11)
+    small = ParagraphStyle("CDRSmall", parent=normal, fontSize=7.6, leading=9)
+    section = ParagraphStyle("CDRSection", parent=normal, fontName="Helvetica-Bold", fontSize=9.5, textColor=colors.white, leading=11)
+    title = ParagraphStyle("CDRTitle", parent=normal, fontName="Helvetica-Bold", fontSize=16, textColor=colors.HexColor("#111827"), alignment=2)
+
+    def ptxt(value):
+        return Paragraph(clean_pdf_text(value).replace("\n", "<br/>").replace("&", "&amp;"), normal)
+
+    def section_box(title_text, body_text, height_padding=8):
+        table = Table(
+            [[Paragraph(title_text, section)], [ptxt(body_text)]],
+            colWidths=[182 * mm],
+        )
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.HexColor("#333333")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), height_padding),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), height_padding),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        return table
+
+    cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "")
+    date_logged = format_sharepoint_date(fields.get("Date", ""))
+    date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
+    visit_times = extract_visit_times({**fields, "EngineerVisitLog": updated_log}, worksheet.get("engineer_name", ""))
+
+    customer_name = get_field_value(fields, "CustomerName", "Customer Name") or get_field_value(fields, "ClientName", "Client Name") or ""
+    customer_address = get_field_value(fields, "CustomerAddress", "Customer Address") or ""
+    customer_details = "\n".join([v for v in [customer_name, customer_address] if str(v or "").strip()])
+
+    site_details = "\n".join([v for v in [
+        fields.get("SiteName", ""),
+        fields.get("Address", ""),
+    ] if str(v or "").strip()])
+
+    order_number = get_field_value(fields, "CustomerOrderNumber", "Customer Order Number", "OrderNumber", "Order Number") or ""
+    job_category = get_field_value(fields, "JobCategory", "Job Category") or ""
+
+    story = []
+
+    header = Table(
+        [[get_logo_for_pdf(), Paragraph("JOB WORKSHEET", title)]],
+        colWidths=[85 * mm, 97 * mm],
+    )
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(header)
+
+    company = Table([[
+        Paragraph(
+            "<b>CDR M&amp;E Services Ltd</b><br/>"
+            "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA<br/>"
+            "Telephone: 01642 057939 &nbsp;&nbsp; Email: helpdesk@cdrme.co.uk<br/>"
+            "VAT Number: 397715249 &nbsp;&nbsp; Company No.: 13744971",
+            small,
+        )
+    ]], colWidths=[182 * mm])
+    company.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f7f7f7")),
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(company)
+    story.append(Spacer(1, 7))
+
+    details = Table(
+        [[Paragraph("<b>Customer Details</b><br/>" + clean_pdf_text(customer_details).replace("\n", "<br/>"), normal),
+          Paragraph("<b>Site Details</b><br/>" + clean_pdf_text(site_details).replace("\n", "<br/>"), normal)]],
+        colWidths=[91 * mm, 91 * mm],
+    )
+    details.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(details)
+    story.append(Spacer(1, 7))
+
+    job_data = [
+        ["Job Number:", clean_pdf_text(cdr_number), "Customer Order Number:", clean_pdf_text(order_number)],
+        ["Date Logged:", clean_pdf_text(date_logged), "Job Category:", clean_pdf_text(job_category)],
+        ["Date Complete:", clean_pdf_text(date_complete), "Status:", clean_pdf_text(outcome)],
+    ]
+    job_table = Table(job_data, colWidths=[38 * mm, 53 * mm, 46 * mm, 45 * mm])
+    job_table.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#999999")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(job_table)
+    story.append(Spacer(1, 7))
+
+    story.append(section_box("Description", fields.get("Task", "") or fields.get("Description", "") or fields.get("Notes", ""), 7))
+    story.append(Spacer(1, 7))
+
+    visits_data = [
+        ["Travel", "On-Site", "Engineer", "Apprentice Engineer", "Status", "Off-Site"],
+        [
+            clean_pdf_text(visit_times.get("travelling")),
+            clean_pdf_text(visit_times.get("on_site")),
+            clean_pdf_text(worksheet.get("engineer_name")),
+            "N/A",
+            clean_pdf_text(outcome),
+            clean_pdf_text(visit_times.get("off_site") or datetime.now(UK_TZ).strftime("%H:%M")),
+        ],
+    ]
+    visits = Table(visits_data, colWidths=[25 * mm, 25 * mm, 43 * mm, 37 * mm, 27 * mm, 25 * mm])
+    visits.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#999999")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(Paragraph("<b>Visits</b>", normal))
+    story.append(visits)
+    story.append(Spacer(1, 7))
+
+    comments = worksheet.get("WorkCompleted", "")
+    if worksheet.get("MaterialsUsed") and str(worksheet.get("MaterialsUsed")).strip().lower() != "none":
+        comments += f"\n\nMaterials Used: {worksheet.get('MaterialsUsed')}"
+    if worksheet.get("FollowOnRequired"):
+        comments += f"\n\nFollow-on Required: Yes\n{worksheet.get('FollowOnNotes', '')}"
+    else:
+        comments += "\n\nFollow-on Required: No"
+    if worksheet.get("EngineerCompletionNotes") and str(worksheet.get("EngineerCompletionNotes")).strip().lower() != "none":
+        comments += f"\n\nEngineer Notes: {worksheet.get('EngineerCompletionNotes')}"
+    if outcome == "No Access" and worksheet.get("NoAccessReason"):
+        comments += f"\n\nNo Access Reason: {worksheet.get('NoAccessReason')}"
+
+    story.append(section_box("Engineer Comment", comments, 8))
+    story.append(Spacer(1, 7))
+
+    photo_lines = worksheet.get("photo_links", [])
+    photo_summary = f"{len(photo_lines)} photo(s) uploaded to SharePoint."
+    if photo_lines:
+        photo_summary += "\n" + "\n".join(photo_lines[:6])
+        if len(photo_lines) > 6:
+            photo_summary += f"\n...and {len(photo_lines) - 6} more"
+    story.append(section_box("Photos", photo_summary, 6))
+    story.append(Spacer(1, 7))
+
+    signature_text = "Client signature not required."
+    if worksheet.get("ClientSignatureRequired"):
+        signature_text = "Signature required but not received."
+        if worksheet.get("ClientSignatureReceived"):
+            signature_text = (
+                f"Signed digitally via CDR Engineer Portal.\n"
+                f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
+                f"Signature Link: {worksheet.get('ClientSignatureLink', '')}"
+            )
+    story.append(section_box("Client Signature", signature_text, 8))
+
+    story.append(Spacer(1, 5))
+    story.append(Paragraph("CDR M&amp;E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk", small))
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
+    try:
+        pdf_bytes = build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome)
+        cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
+        file_name = f"{safe_pdf_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.pdf"
+
+        worksheet_link = upload_file_to_sharepoint(
+            site_id,
+            WORKSHEET_BASE_FOLDER,
+            safe_folder_name(cdr_number),
+            file_name,
+            pdf_bytes,
+        )
+        return worksheet_link
+    except Exception as e:
+        print(f"ERROR generating worksheet PDF: {e}")
+        return ""
+
+
+def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_final_engineer, worksheet_pdf_link=""):
+    fields_to_update = {
+        "WorkCompleted": worksheet.get("WorkCompleted", ""),
+        "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
+        "FollowOnRequired": worksheet.get("FollowOnRequired", False),
+        "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
+        "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
+        "WorksheetSubmitted": True,
+        "EngineerVisitLog": updated_log,
+        "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
+    }
+
+    if worksheet_pdf_link:
+        fields_to_update["WorksheetPDFLink"] = worksheet_pdf_link
+        fields_to_update["WorksheetGenerated"] = True
+    else:
+        fields_to_update["WorksheetGenerated"] = False
+
+    if outcome == "No Access" and worksheet.get("NoAccessReason"):
+        fields_to_update["NoAccessReason"] = worksheet.get("NoAccessReason")
+
+    if is_final_engineer:
+        fields_to_update["JobOutcome"] = outcome
+
+        if outcome == "Completed":
+            fields_to_update["Status"] = COMPLETED_STATUS
+            if is_notified(fields):
+                fields_to_update["TelegramNotified"] = True
+        else:
+            fields_to_update["Status"] = AWAITING_DEPLOYMENT_STATUS
+            fields_to_update["TelegramNotified"] = False
+
+        fields_to_update.update(clear_engineer_assignment_payload())
+    else:
+        fields_to_update.update(
+            remove_current_engineer_assignment_payload(
+                fields,
+                worksheet["engineer_lookup_id"],
+            )
+        )
+
+    return fields_to_update
+
 async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_result = await handle_menu_during_conversation(update, context, REVIEW)
     if menu_result is not None:
@@ -3006,45 +3331,24 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assigned_ids = get_assigned_engineer_ids(fields)
         is_final_engineer = len(assigned_ids) <= 1
 
-        fields_to_update = {
-            "WorkCompleted": worksheet.get("WorkCompleted", ""),
-            "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
-            "FollowOnRequired": worksheet.get("FollowOnRequired", False),
-            "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
-            "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
-            "WorksheetSubmitted": True,
-            "EngineerVisitLog": updated_log,
-            "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
-        }
+        worksheet_pdf_link = generate_and_upload_worksheet_pdf(
+            site_id,
+            jobs_list_id,
+            item_id,
+            worksheet,
+            fields,
+            updated_log,
+            outcome,
+        )
 
-        if outcome == "No Access" and worksheet.get("NoAccessReason"):
-            fields_to_update["NoAccessReason"] = worksheet.get("NoAccessReason")
-
-        if is_final_engineer:
-            fields_to_update["JobOutcome"] = outcome
-
-            if outcome == "Completed":
-                fields_to_update["Status"] = COMPLETED_STATUS
-                # Keep TelegramNotified as a pure dispatch flag.
-                # It should only be set to True after the bot actually sends the job
-                # to an engineer in send_new_jobs(). Completed jobs are blocked from
-                # being resent by Status/JobOutcome, not by forcing this flag.
-                if is_notified(fields):
-                    fields_to_update["TelegramNotified"] = True
-            else:
-                fields_to_update["Status"] = AWAITING_DEPLOYMENT_STATUS
-                # Revisit/No Access goes back to the office for re-dispatch.
-                # Leave this False so the next assigned engineer can be notified.
-                fields_to_update["TelegramNotified"] = False
-
-            fields_to_update.update(clear_engineer_assignment_payload())
-        else:
-            fields_to_update.update(
-                remove_current_engineer_assignment_payload(
-                    fields,
-                    worksheet["engineer_lookup_id"],
-                )
-            )
+        fields_to_update = build_worksheet_update_fields(
+            worksheet,
+            fields,
+            updated_log,
+            outcome,
+            is_final_engineer,
+            worksheet_pdf_link,
+        )
 
         update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
 
@@ -3161,39 +3465,24 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
     assigned_ids = get_assigned_engineer_ids(fields)
     is_final_engineer = len(assigned_ids) <= 1
 
-    fields_to_update = {
-        "WorkCompleted": worksheet.get("WorkCompleted", ""),
-        "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
-        "FollowOnRequired": worksheet.get("FollowOnRequired", False),
-        "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
-        "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
-        "WorksheetSubmitted": True,
-        "EngineerVisitLog": updated_log,
-        "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
-    }
+    worksheet_pdf_link = generate_and_upload_worksheet_pdf(
+        site_id,
+        jobs_list_id,
+        item_id,
+        worksheet,
+        fields,
+        updated_log,
+        outcome,
+    )
 
-    if outcome == "No Access" and worksheet.get("NoAccessReason"):
-        fields_to_update["NoAccessReason"] = worksheet.get("NoAccessReason")
-
-    if is_final_engineer:
-        fields_to_update["JobOutcome"] = outcome
-
-        if outcome == "Completed":
-            fields_to_update["Status"] = COMPLETED_STATUS
-            if is_notified(fields):
-                fields_to_update["TelegramNotified"] = True
-        else:
-            fields_to_update["Status"] = AWAITING_DEPLOYMENT_STATUS
-            fields_to_update["TelegramNotified"] = False
-
-        fields_to_update.update(clear_engineer_assignment_payload())
-    else:
-        fields_to_update.update(
-            remove_current_engineer_assignment_payload(
-                fields,
-                worksheet["engineer_lookup_id"],
-            )
-        )
+    fields_to_update = build_worksheet_update_fields(
+        worksheet,
+        fields,
+        updated_log,
+        outcome,
+        is_final_engineer,
+        worksheet_pdf_link,
+    )
 
     update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
 
