@@ -1348,6 +1348,45 @@ def get_review_keyboard():
     ])
 
 
+def get_logjob_site_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Use Remembered Site", callback_data="logjob_site_confirm|yes")],
+        [InlineKeyboardButton("✏️ Edit Address", callback_data="logjob_site_confirm|edit")],
+        [InlineKeyboardButton("❌ Manual Entry", callback_data="logjob_site_confirm|no")],
+        [InlineKeyboardButton("🔄 Restart", callback_data="logjob_site_confirm|restart")],
+        [InlineKeyboardButton("🚫 Cancel", callback_data="logjob_site_confirm|cancel")],
+    ])
+
+
+def get_logjob_time_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ ASAP", callback_data="logjob_time|asap")],
+        [
+            InlineKeyboardButton("🕗 08:00", callback_data="logjob_time|08:00"),
+            InlineKeyboardButton("🕚 11:00", callback_data="logjob_time|11:00"),
+            InlineKeyboardButton("🕑 14:00", callback_data="logjob_time|14:00"),
+        ],
+        [InlineKeyboardButton("✏️ Custom Time", callback_data="logjob_time|custom")],
+        [InlineKeyboardButton("🔄 Restart", callback_data="logjob_time|restart"), InlineKeyboardButton("🚫 Cancel", callback_data="logjob_time|cancel")],
+    ])
+
+
+def get_logjob_category_keyboard():
+    rows = []
+    for index, choice in enumerate(JOB_CATEGORY_CHOICES, start=1):
+        rows.append([InlineKeyboardButton(f"{index}. {choice}", callback_data=f"logjob_category|{index}")])
+    rows.append([InlineKeyboardButton("🔄 Restart", callback_data="logjob_category|restart"), InlineKeyboardButton("🚫 Cancel", callback_data="logjob_category|cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_logjob_review_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Create Job", callback_data="logjob_review|yes")],
+        [InlineKeyboardButton("🔄 Restart", callback_data="logjob_review|restart")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="logjob_review|cancel")],
+    ])
+
+
 NO_ACCESS_REASONS = {
     "no_answer": "No answer",
     "no_keys": "No keys / access available",
@@ -2797,9 +2836,10 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
+    message = update.effective_message
 
     if not user_can_use_helpdesk(role):
-        await update.message.reply_text(
+        await message.reply_text(
             "You do not have permission to log jobs.",
             reply_markup=get_main_menu(role),
         )
@@ -2813,7 +2853,7 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assignable_engineers = get_active_assignable_engineers(engineers)
 
         if not assignable_engineers:
-            await update.message.reply_text(
+            await message.reply_text(
                 "No active assignable engineers were found. Check the Engineers list has TelegramID, Role and Active set correctly.",
                 reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
             )
@@ -2826,7 +2866,7 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "role": role,
         }
 
-        await update.message.reply_text(
+        await message.reply_text(
             "Log new job.\n\nEnter the CDR/job number.\n\nExample: CDR012896",
             reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
         )
@@ -2834,7 +2874,7 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print(f"ERROR starting log job flow: {e}")
-        await update.message.reply_text(
+        await message.reply_text(
             "There was an error opening Log Job. Please check Railway logs.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
@@ -2897,11 +2937,7 @@ async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["site_candidate"] = candidate
         await update.message.reply_text(
             format_site_candidate(candidate),
-            reply_markup=ReplyKeyboardMarkup(
-                [["YES", "EDIT", "NO"]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
+            reply_markup=get_logjob_site_confirm_keyboard(),
         )
         return LOGJOB_SITE_CONFIRM
 
@@ -2954,7 +2990,10 @@ async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return LOGJOB_CUSTOMER_NAME
 
-    await update.message.reply_text("Reply YES to use it, EDIT to change the address, or NO to enter manually.")
+    await update.message.reply_text(
+        "Choose an option below, or type YES, EDIT, or NO.",
+        reply_markup=get_logjob_site_confirm_keyboard(),
+    )
     return LOGJOB_SITE_CONFIRM
 
 
@@ -3026,7 +3065,10 @@ async def logjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["date_display"] = datetime.fromisoformat(parsed).strftime("%d/%m/%Y")
     except Exception:
         job["date_display"] = parsed
-    await update.message.reply_text("Start/time required?\n\nUse HH:MM, 0800, 13:30, now, or asap.")
+    await update.message.reply_text(
+        "Start/time required?",
+        reply_markup=get_logjob_time_keyboard(),
+    )
     return LOGJOB_TIME
 
 
@@ -3034,12 +3076,15 @@ async def logjob_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     parsed = normalise_helpdesk_time(update.message.text)
     if not parsed:
-        await update.message.reply_text("Please enter a valid time, for example 08:00, 0800, 13:30, now, or asap.")
+        await update.message.reply_text(
+            "Please choose a time below, or type a valid custom time such as 08:30 or 13:45.",
+            reply_markup=get_logjob_time_keyboard(),
+        )
         return LOGJOB_TIME
     job["time"] = parsed
     await update.message.reply_text(
-        "Job category? Reply with a number:\n\n" +
-        "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
+        "Job category?",
+        reply_markup=get_logjob_category_keyboard(),
     )
     return LOGJOB_CATEGORY
 
@@ -3061,8 +3106,8 @@ async def logjob_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not selected:
         await update.message.reply_text(
-            "Please choose a valid category number:\n\n" +
-            "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
+            "Please choose a valid category below, or type the number/category name.",
+            reply_markup=get_logjob_category_keyboard(),
         )
         return LOGJOB_CATEGORY
 
@@ -3092,31 +3137,14 @@ async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_
         return LOGJOB_ASSIGN_ENGINEERS
 
     job["assigned_engineers"] = selected
-    await update.message.reply_text(build_log_job_review(job))
+    await update.message.reply_text(
+        build_log_job_review(job),
+        reply_markup=get_logjob_review_keyboard(),
+    )
     return LOGJOB_REVIEW
 
 
-async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("log_job")
-    role = job.get("role", "Helpdesk") if job else "Helpdesk"
-    answer = update.message.text.strip().lower()
-
-    if answer in ["no", "n", "cancel"]:
-        context.user_data.pop("log_job", None)
-        await update.message.reply_text(
-            "Job logging cancelled. Nothing has been created.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if answer in ["restart", "redo"]:
-        context.user_data.pop("log_job", None)
-        return await logjob_start(update, context)
-
-    if answer not in ["yes", "y"]:
-        await update.message.reply_text("Reply YES to create and send, NO to cancel, or RESTART to start again.")
-        return LOGJOB_REVIEW
-
+async def finish_logjob_create(message, context: ContextTypes.DEFAULT_TYPE, job, role):
     try:
         site_id = job["site_id"]
         jobs_list_id = job["jobs_list_id"]
@@ -3160,28 +3188,211 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data.pop("log_job", None)
 
-        message = (
+        message_text = (
             f"Job created in SharePoint: {job['cdr_number']}\n"
             f"Assigned to: {', '.join(e['name'] for e in job.get('assigned_engineers', []))}\n"
             f"Telegram sent: {'Yes' if sent_to_any else 'No'}"
         )
         if failed:
-            message += "\n\nSend issues:\n" + "\n".join(failed[:5])
+            message_text += "\n\nSend issues:\n" + "\n".join(failed[:5])
 
-        await update.message.reply_text(
-            message,
+        await message.reply_text(
+            message_text,
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
 
     except Exception as e:
         print(f"ERROR creating logged job: {e}")
-        await update.message.reply_text(
+        await message.reply_text(
             "There was an error creating the job. Nothing further has been sent. Please check Railway logs.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
 
+
+async def logjob_site_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("|", 1)[1]
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+
+    if not job:
+        await query.message.reply_text("Please start again using ➕ Log Job.")
+        return ConversationHandler.END
+
+    if action == "cancel":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if action == "restart":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text("Restarting Log Job.")
+        return await logjob_start(update, context)
+
+    candidate = job.get("site_candidate") or {}
+
+    if action == "yes":
+        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
+        job["site_address"] = candidate.get("address", "")
+        job["customer_name"] = candidate.get("customer_name", "")
+        job["customer_address"] = candidate.get("customer_address", "")
+        job["site_notes"] = candidate.get("notes", "")
+        await query.message.reply_text("Saved site details used.\n\nContact name/number?\n\nType N/A if there is no contact.")
+        return LOGJOB_CONTACT
+
+    if action == "edit":
+        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
+        job["customer_name"] = candidate.get("customer_name", "")
+        job["customer_address"] = candidate.get("customer_address", "")
+        job["site_notes"] = candidate.get("notes", "")
+        job["skip_site_notes_after_address"] = True
+        await query.message.reply_text(
+            "Enter the correct site address.\n\nThis will be used for the job and saved back to the Sites list."
+        )
+        return LOGJOB_SITE_ADDRESS
+
+    if action == "no":
+        job.pop("site_candidate", None)
+        job.pop("site_notes", None)
+        await query.message.reply_text("Manual entry selected.\n\nCustomer name?\n\nExample: Cleveland Fire Brigade")
+        return LOGJOB_CUSTOMER_NAME
+
+    return LOGJOB_SITE_CONFIRM
+
+
+async def logjob_time_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("|", 1)[1]
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+
+    if not job:
+        await query.message.reply_text("Please start again using ➕ Log Job.")
+        return ConversationHandler.END
+
+    if action == "cancel":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if action == "restart":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text("Restarting Log Job.")
+        return await logjob_start(update, context)
+
+    if action == "custom":
+        await query.message.reply_text("Enter the custom start time.\n\nExample: 08:30, 13:45, or 1430.")
+        return LOGJOB_TIME
+
+    parsed = normalise_helpdesk_time(action)
+    if not parsed:
+        await query.message.reply_text("Please choose a valid time.", reply_markup=get_logjob_time_keyboard())
+        return LOGJOB_TIME
+
+    job["time"] = parsed
+    await query.message.reply_text("Job category?", reply_markup=get_logjob_category_keyboard())
+    return LOGJOB_CATEGORY
+
+
+async def logjob_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("|", 1)[1]
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+
+    if not job:
+        await query.message.reply_text("Please start again using ➕ Log Job.")
+        return ConversationHandler.END
+
+    if action == "cancel":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if action == "restart":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text("Restarting Log Job.")
+        return await logjob_start(update, context)
+
+    if not action.isdigit() or not (1 <= int(action) <= len(JOB_CATEGORY_CHOICES)):
+        await query.message.reply_text("Please choose a valid category.", reply_markup=get_logjob_category_keyboard())
+        return LOGJOB_CATEGORY
+
+    job["category"] = JOB_CATEGORY_CHOICES[int(action) - 1]
+    await query.message.reply_text("Customer order number?\n\nType N/A if not available.")
+    return LOGJOB_ORDER_NUMBER
+
+
+async def logjob_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("|", 1)[1]
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+
+    if not job:
+        await query.message.reply_text("Please start again using ➕ Log Job.")
+        return ConversationHandler.END
+
+    if action == "cancel":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if action == "restart":
+        context.user_data.pop("log_job", None)
+        await query.message.reply_text("Restarting Log Job.")
+        return await logjob_start(update, context)
+
+    if action == "yes":
+        return await finish_logjob_create(query.message, context, job, role)
+
+    await query.message.reply_text("Choose Create Job, Restart, or Cancel.", reply_markup=get_logjob_review_keyboard())
+    return LOGJOB_REVIEW
+
+
+async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+    answer = update.message.text.strip().lower()
+
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("log_job", None)
+        await update.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer in ["restart", "redo"]:
+        context.user_data.pop("log_job", None)
+        return await logjob_start(update, context)
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text(
+            "Choose Create Job, Restart, or Cancel below, or type YES, NO, or RESTART.",
+            reply_markup=get_logjob_review_keyboard(),
+        )
+        return LOGJOB_REVIEW
+
+    return await finish_logjob_create(update.message, context, job, role)
 
 async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
@@ -6629,18 +6840,30 @@ logjob_handler = ConversationHandler(
         LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
         LOGJOB_CUSTOMER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_address)],
         LOGJOB_SITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_name)],
-        LOGJOB_SITE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_confirm)],
+        LOGJOB_SITE_CONFIRM: [
+            CallbackQueryHandler(logjob_site_confirm_button, pattern=r"^logjob_site_confirm\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_confirm),
+        ],
         LOGJOB_SITE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_address)],
         LOGJOB_SITE_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_notes)],
         LOGJOB_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_contact)],
         LOGJOB_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_task)],
         LOGJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_notes)],
         LOGJOB_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_date)],
-        LOGJOB_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_time)],
-        LOGJOB_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_category)],
+        LOGJOB_TIME: [
+            CallbackQueryHandler(logjob_time_button, pattern=r"^logjob_time\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_time),
+        ],
+        LOGJOB_CATEGORY: [
+            CallbackQueryHandler(logjob_category_button, pattern=r"^logjob_category\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_category),
+        ],
         LOGJOB_ORDER_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_order_number)],
         LOGJOB_ASSIGN_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_assign_engineers)],
-        LOGJOB_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_review)],
+        LOGJOB_REVIEW: [
+            CallbackQueryHandler(logjob_review_button, pattern=r"^logjob_review\|"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_review),
+        ],
     },
     fallbacks=[CommandHandler("cancel", logjob_cancel)],
 )
