@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "site-autofill-cancel-delete-v2"
+BUILD_VERSION = "admin-only-menu-switch-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -65,6 +65,7 @@ PHOTO_BASE_FOLDER = "15 - ENGINEER JOB PHOTOS"
 SIGNATURE_BASE_FOLDER = "16 - CLIENT SIGNATURES"
 VAN_CHECK_PHOTO_BASE_FOLDER = "17 - VAN CHECK PHOTOS"
 WORKSHEET_BASE_FOLDER = "18 - JOB WORKSHEETS"
+RECEIPT_BASE_FOLDER = "19 - RECEIPTS"
 
 DAY_ACTIVE_STATUS = "Active"
 DAY_CLOSED_STATUS = "Closed"
@@ -73,6 +74,7 @@ MENU_START_DAY = "🟢 Start Day"
 MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
+MENU_UPLOAD_RECEIPTS = "🧾 Upload Receipts"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
@@ -80,8 +82,6 @@ MENU_OPEN_JOBS = "📋 Open Jobs"
 MENU_FIND_JOB = "🔎 Find Job"
 MENU_CANCEL_JOB = "❌ Cancel Job"
 MENU_DELETE_JOB = "🗑 Delete Job"
-MENU_DISPATCH_BOARD = "🗂 Dispatch Board"
-MENU_EMERGENCY_JOB = "🚨 Emergency Job"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
 
 
@@ -143,15 +143,14 @@ CANCELJOB_CDR_NUMBER = 55
 CANCELJOB_CONFIRM = 56
 DELETEJOB_CDR_NUMBER = 57
 DELETEJOB_CONFIRM = 58
+RECEIPT_ENGINEER_NAME = 59
+RECEIPT_DATE = 60
+RECEIPT_UPLOADS = 61
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
 OPENJOBS_FILTER = 48
 OPENJOBS_SELECT = 49
-DISPATCH_SELECT_JOB = 50
-DISPATCH_SELECT_ENGINEER = 51
-DISPATCH_CONFIRM = 52
-
 VAN_CHECK_QUESTIONS = [
     "Are the tyres in good condition and correctly inflated? Reply Yes or No.",
     "Are all lights working? Reply Yes or No.",
@@ -467,12 +466,21 @@ def build_engineer_maps(engineers):
     return by_telegram_id, by_lookup_id
 
 
-def get_engineer_menu():
+def get_engineer_menu(include_helpdesk_menu=False):
+    rows = [
+        [MENU_START_DAY, MENU_MY_JOBS],
+        [MENU_END_DAY, MENU_BUG_IDEA],
+        [MENU_UPLOAD_RECEIPTS],
+    ]
+
+    # Only Admin users should be able to switch from the Engineer menu
+    # into the Helpdesk menu. Helpdesk users stay in the Helpdesk menu,
+    # and Engineer users stay in the Engineer menu.
+    if include_helpdesk_menu:
+        rows.append([MENU_HELPDESK])
+
     return ReplyKeyboardMarkup(
-        [
-            [MENU_START_DAY, MENU_MY_JOBS],
-            [MENU_END_DAY, MENU_BUG_IDEA],
-        ],
+        rows,
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -483,6 +491,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
         [MENU_CANCEL_JOB],
+        [MENU_UPLOAD_RECEIPTS],
     ]
 
     if include_engineer_menu:
@@ -497,17 +506,9 @@ def get_helpdesk_menu(include_engineer_menu=False):
 
 
 def get_admin_menu():
-    return ReplyKeyboardMarkup(
-        [
-            [MENU_START_DAY, MENU_MY_JOBS],
-            [MENU_END_DAY, MENU_BUG_IDEA],
-            [MENU_LOG_JOB, MENU_REASSIGN_JOB],
-            [MENU_OPEN_JOBS, MENU_FIND_JOB],
-            [MENU_CANCEL_JOB, MENU_DELETE_JOB],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    # Admin starts on the Engineer menu, with a switch button into Helpdesk.
+    # This keeps the two menus separate instead of showing every option at once.
+    return get_engineer_menu(include_helpdesk_menu=True)
 
 
 def get_main_menu(role="Engineer"):
@@ -1096,6 +1097,22 @@ def upload_van_check_photo_to_sharepoint(site_id, work_date, van_reg, file_name,
         file_name,
         file_bytes,
     )
+
+
+def upload_receipt_to_sharepoint(site_id, receipt_date, engineer_name, file_name, file_bytes):
+    folder_name = f"{receipt_date}/{safe_folder_name(engineer_name)}"
+    return upload_file_to_sharepoint(
+        site_id,
+        RECEIPT_BASE_FOLDER,
+        folder_name,
+        file_name,
+        file_bytes,
+    )
+
+
+def clean_receipt_file_name(value):
+    cleaned = "".join(ch for ch in str(value or "receipt").strip() if ch.isalnum() or ch in ["-", "_", "."])
+    return cleaned or "receipt"
 
 
 def get_engineer_for_telegram_id(telegram_id):
@@ -2019,7 +2036,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not current_engineer:
             await update.message.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2030,7 +2047,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if active_day:
             await update.message.reply_text(
                 "Your day is already active. You can now use 📋 My Jobs.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2056,7 +2073,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"ERROR starting day: {e}")
         await update.message.reply_text(
             "There was an error starting your day. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -2074,7 +2091,7 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if answer in ["no", "n"]:
         context.user_data.pop("start_day", None)
-        await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu())
+        await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     await update.message.reply_text("Starting your day. Please enter the van registration.")
@@ -2089,7 +2106,7 @@ async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_
 
     if answer == "no":
         context.user_data.pop("start_day", None)
-        await query.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu())
+        await query.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     await query.message.reply_text("Starting your day. Please enter the van registration.")
@@ -2104,7 +2121,7 @@ async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_day = context.user_data.get("start_day")
 
     if not start_day:
-        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     van_reg = update.message.text.strip().upper()
@@ -2240,7 +2257,7 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
     start_day = context.user_data.get("start_day")
 
     if not start_day:
-        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     mileage = normalise_mileage(update.message.text)
@@ -2266,7 +2283,7 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
             f"Start mileage recorded: {mileage}\n\n"
             f"Van check not due today. Last completed van check was {days_since} day(s) ago "
             f"on {last_check_date}. Your jobs are now unlocked.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -2290,7 +2307,7 @@ async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE)
     start_day = context.user_data.get("start_day")
 
     if not start_day:
-        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+        await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     answer = update.message.text.strip()
@@ -2331,7 +2348,7 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
         start_day = context.user_data.get("start_day")
 
         if not start_day:
-            await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu())
+            await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
         if update.message.text and update.message.text.strip().upper() == "DONE":
@@ -2351,7 +2368,7 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             await update.message.reply_text(
                 "Van check completed and day started. Your jobs are now unlocked. Tap 📋 My Jobs to view today's work.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2381,14 +2398,14 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
         print(f"ERROR saving van check/start day: {e}")
         await update.message.reply_text(
             "There was an error saving the van check. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
 
 async def startday_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("start_day", None)
-    await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu())
+    await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
 
 
@@ -2400,7 +2417,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not current_engineer:
             await update.message.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2409,7 +2426,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not active_day:
             await update.message.reply_text(
                 "You do not have an active day to end. Tap 🟢 Start Day when you begin work.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2421,7 +2438,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "You cannot end your day while you still have job(s) assigned for today. "
                 "Complete them, mark No Access, or mark Revisit Required first.\n\n"
                 f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2444,7 +2461,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"ERROR ending day: {e}")
         await update.message.reply_text(
             "There was an error ending your day. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -2462,7 +2479,7 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if answer in ["no", "n"]:
         context.user_data.pop("end_day", None)
-        await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu())
+        await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -2480,7 +2497,7 @@ async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TY
 
     if answer == "no":
         context.user_data.pop("end_day", None)
-        await query.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu())
+        await query.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     await query.message.reply_text(
@@ -2507,7 +2524,7 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         end_day = context.user_data.get("end_day")
 
         if not end_day:
-            await update.message.reply_text("Please try /endday again.", reply_markup=get_main_menu())
+            await update.message.reply_text("Please try /endday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
         # Re-check assigned jobs before closing the day in case one was added while the engineer was in the end-day flow.
@@ -2520,7 +2537,7 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Your day has not been ended because you still have job(s) assigned for today. "
                 "Complete them, mark No Access, or mark Revisit Required first.\n\n"
                 f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -2589,7 +2606,7 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Day ended. Your job buttons are now locked until you start your next day.\n\n"
             f"{pay_summary}",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -2597,14 +2614,14 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"ERROR saving end day: {e}")
         await update.message.reply_text(
             "There was an error saving your end day record. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
 
 async def endday_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("end_day", None)
-    await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu())
+    await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
 
 
@@ -2616,7 +2633,7 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not current_engineer:
             await update.message.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return
 
@@ -2628,17 +2645,17 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Status: Day active\n"
                 f"Engineer: {current_engineer['name']}\n"
                 f"Start time: {format_sharepoint_date(fields.get('StartTime', ''))} {str(fields.get('StartTime', ''))[11:16] if fields.get('StartTime') else ''}",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
         else:
             await update.message.reply_text(
                 "Status: No active day. Tap 🟢 Start Day before using job buttons.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
 
     except Exception as e:
         print(f"ERROR getting status: {e}")
-        await update.message.reply_text("There was an error checking your status.", reply_markup=get_main_menu())
+        await update.message.reply_text("There was an error checking your status.", reply_markup=get_main_menu(await get_role_for_update(update)))
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2656,6 +2673,9 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == MENU_BUG_IDEA:
         return await bugidea_start(update, context)
+
+    if text == MENU_UPLOAD_RECEIPTS:
+        return await receipt_start(update, context)
 
     if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
@@ -2689,9 +2709,16 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if text == MENU_ENGINEER_MENU:
+        if role.lower() != "admin":
+            await update.message.reply_text(
+                "Only Admin users can switch to the Engineer menu.",
+                reply_markup=get_helpdesk_menu(include_engineer_menu=False),
+            )
+            return
+
         await update.message.reply_text(
             "Engineer menu opened.",
-            reply_markup=get_engineer_menu(),
+            reply_markup=get_engineer_menu(include_helpdesk_menu=True),
         )
         return
 
@@ -2712,6 +2739,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == MENU_DELETE_JOB:
         return await deletejob_start(update, context)
+
+    if text == MENU_UPLOAD_RECEIPTS:
+        return await receipt_start(update, context)
 
     coming_next = {
         MENU_LOG_JOB: "Log Job",
@@ -3759,312 +3789,6 @@ async def openjobs_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-def job_is_dispatchable(fields):
-    """Jobs that are sensible to show on the dispatch board."""
-    bucket = open_job_bucket(fields)
-    return bucket in ["awaiting_dispatch", "assigned_not_started", "returned", "other_open"]
-
-
-def get_engineer_live_status_from_jobs(jobs_data, engineer_lookup_id):
-    today = datetime.now(UK_TZ).date()
-    live = []
-    assigned_today = 0
-    open_total = 0
-
-    for job in jobs_data:
-        fields = job.get("fields", {})
-        assigned_ids = get_assigned_engineer_ids(fields)
-        if str(engineer_lookup_id) not in assigned_ids:
-            continue
-
-        if not is_closed_job(fields):
-            open_total += 1
-
-        job_date = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "")
-        if job_date == today and not is_closed_job(fields):
-            assigned_today += 1
-            status = str(get_field_value(fields, "Status") or "").strip()
-            if status in [TRAVELLING_STATUS, ON_SITE_STATUS]:
-                cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "No CDR"
-                site = get_field_value(fields, "SiteName", "Site Name") or "No site"
-                live.append(f"{status} at {cdr} - {site}")
-
-    if live:
-        return "; ".join(live[:2]), assigned_today, open_total
-    if assigned_today:
-        return "Assigned today", assigned_today, open_total
-    if open_total:
-        return "Has open jobs", assigned_today, open_total
-    return "Available", assigned_today, open_total
-
-
-def format_dispatch_job_list(jobs, engineers, max_rows=12):
-    lines = ["Dispatch Board - jobs ready to move/send:\n"]
-
-    if not jobs:
-        lines.append("No dispatchable jobs found. Use ➕ Log Job or 📋 Open Jobs instead.")
-        return "\n".join(lines)
-
-    for index, job in enumerate(jobs[:max_rows], start=1):
-        fields = job.get("fields", {})
-        cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "No CDR"
-        site = get_field_value(fields, "SiteName", "Site Name") or "No site"
-        date = format_sharepoint_date(get_field_value(fields, "Date") or "") or "No date"
-        status = get_field_value(fields, "Status") or "Awaiting Dispatch"
-        assigned = get_current_assigned_engineers_from_job(fields, engineers)
-        assigned_names = ", ".join(e["name"] for e in assigned) or "Unassigned"
-        lines.append(f"{index}. {cdr} | {site} | {date} | {status} | {assigned_names}")
-
-    if len(jobs) > max_rows:
-        lines.append(f"...and {len(jobs) - max_rows} more. Use 📋 Open Jobs for wider filtering.")
-
-    lines.append("\nReply with the job number to assign/send, REFRESH to reload, or /cancel to exit.")
-    return "\n".join(lines)
-
-
-def format_dispatch_engineer_board(assignable_engineers, jobs_data):
-    lines = ["Choose engineer(s) for this job:\n"]
-    for index, engineer in enumerate(assignable_engineers, start=1):
-        live_status, assigned_today, open_total = get_engineer_live_status_from_jobs(jobs_data, engineer["lookup_id"])
-        warning = " ⚠️" if assigned_today >= 4 or live_status.startswith((TRAVELLING_STATUS, ON_SITE_STATUS)) else ""
-        lines.append(
-            f"{index}. {engineer['name']} - {live_status} | Today: {assigned_today} | Open: {open_total}{warning}"
-        )
-    lines.append("\nReply with engineer number(s), e.g. 1 or 1,3. Type BACK to choose a different job.")
-    return "\n".join(lines)
-
-
-def build_dispatch_review(data):
-    fields = data.get("job_fields", {})
-    current = ", ".join(e["name"] for e in data.get("current_engineers", [])) or "None"
-    selected = ", ".join(e["name"] for e in data.get("selected_engineers", [])) or "None"
-    return (
-        "Please review this dispatch change:\n\n"
-        f"CDR Number: {get_field_value(fields, 'CDRNumber', 'CDR Number', 'Title') or ''}\n"
-        f"Site: {get_field_value(fields, 'SiteName', 'Site Name') or ''}\n"
-        f"Current engineer(s): {current}\n"
-        f"New engineer(s): {selected}\n\n"
-        "Reply YES to update SharePoint and send the job to the selected engineer(s), NO to cancel, or BACK to choose engineers again."
-    )
-
-
-async def dispatch_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    role = await get_role_for_update(update)
-
-    if not user_can_use_helpdesk(role):
-        await update.message.reply_text(
-            "You do not have permission to use the Dispatch Board.",
-            reply_markup=get_main_menu(role),
-        )
-        return ConversationHandler.END
-
-    try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
-        jobs_data = get_list_items(site_id, jobs_list_id)
-        assignable = get_active_assignable_engineers(engineers)
-        dispatch_jobs = [job for job in jobs_data if job_is_dispatchable(job.get("fields", {}))]
-
-        def sort_key(job):
-            fields = job.get("fields", {})
-            bucket_order = {
-                "awaiting_dispatch": 0,
-                "returned": 1,
-                "assigned_not_started": 2,
-                "other_open": 3,
-            }.get(open_job_bucket(fields), 9)
-            date_value = sharepoint_date_to_uk_date(get_field_value(fields, "Date") or "") or datetime.min.date()
-            cdr = str(get_field_value(fields, "CDRNumber", "CDR Number", "Title") or "")
-            return (bucket_order, date_value, cdr)
-
-        dispatch_jobs.sort(key=sort_key)
-
-        context.user_data["dispatch_board"] = {
-            "site_id": site_id,
-            "jobs_list_id": jobs_list_id,
-            "engineers": engineers,
-            "assignable_engineers": assignable,
-            "jobs_data": jobs_data,
-            "dispatch_jobs": dispatch_jobs,
-            "role": role,
-        }
-
-        await update.message.reply_text(
-            format_dispatch_job_list(dispatch_jobs, engineers),
-            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
-        )
-        return DISPATCH_SELECT_JOB
-
-    except Exception as e:
-        print(f"ERROR opening Dispatch Board: {e}")
-        await update.message.reply_text(
-            "There was an error opening the Dispatch Board. Please check Railway logs.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-
-async def dispatch_select_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("dispatch_board")
-    if not data:
-        await update.message.reply_text("Please start again using 🗂 Dispatch Board.")
-        return ConversationHandler.END
-
-    text = update.message.text.strip().lower()
-    if text in ["refresh", "reload"]:
-        return await dispatch_start(update, context)
-
-    if not text.isdigit():
-        await update.message.reply_text("Reply with a job number, REFRESH to reload, or /cancel to exit.")
-        return DISPATCH_SELECT_JOB
-
-    index = int(text)
-    jobs = data.get("dispatch_jobs", [])
-    if index < 1 or index > len(jobs):
-        await update.message.reply_text("That number is not in the dispatch list. Reply with one of the job numbers shown.")
-        return DISPATCH_SELECT_JOB
-
-    selected_job = jobs[index - 1]
-    fields = selected_job.get("fields", {})
-    data["selected_job"] = selected_job
-    data["item_id"] = selected_job.get("id")
-    data["job_fields"] = fields
-    data["current_engineers"] = get_current_assigned_engineers_from_job(fields, data.get("engineers", []))
-
-    assignable = data.get("assignable_engineers", [])
-    if not assignable:
-        await update.message.reply_text("No active assignable engineers were found in SharePoint.")
-        return ConversationHandler.END
-
-    await update.message.reply_text(format_dispatch_engineer_board(assignable, data.get("jobs_data", [])))
-    return DISPATCH_SELECT_ENGINEER
-
-
-async def dispatch_select_engineer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("dispatch_board")
-    if not data:
-        await update.message.reply_text("Please start again using 🗂 Dispatch Board.")
-        return ConversationHandler.END
-
-    text = update.message.text.strip().lower()
-    if text in ["back", "jobs"]:
-        await update.message.reply_text(format_dispatch_job_list(data.get("dispatch_jobs", []), data.get("engineers", [])))
-        return DISPATCH_SELECT_JOB
-
-    selected, error = parse_engineer_selection(update.message.text, data.get("assignable_engineers", []))
-    if error:
-        await update.message.reply_text(error + "\n\n" + format_dispatch_engineer_board(data.get("assignable_engineers", []), data.get("jobs_data", [])))
-        return DISPATCH_SELECT_ENGINEER
-
-    data["selected_engineers"] = selected
-    await update.message.reply_text(build_dispatch_review(data))
-    return DISPATCH_CONFIRM
-
-
-async def dispatch_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data.get("dispatch_board")
-    role = data.get("role", "Helpdesk") if data else "Helpdesk"
-    if not data:
-        await update.message.reply_text("Please start again using 🗂 Dispatch Board.")
-        return ConversationHandler.END
-
-    answer = update.message.text.strip().lower()
-    if answer in ["no", "n", "cancel"]:
-        context.user_data.pop("dispatch_board", None)
-        await update.message.reply_text(
-            "Dispatch cancelled. Nothing has been changed.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if answer in ["back", "engineers"]:
-        await update.message.reply_text(format_dispatch_engineer_board(data.get("assignable_engineers", []), data.get("jobs_data", [])))
-        return DISPATCH_SELECT_ENGINEER
-
-    if answer not in ["yes", "y"]:
-        await update.message.reply_text("Reply YES to dispatch, NO to cancel, or BACK to choose engineers again.")
-        return DISPATCH_CONFIRM
-
-    try:
-        site_id = data["site_id"]
-        jobs_list_id = data["jobs_list_id"]
-        item_id = data["item_id"]
-        fields = data.get("job_fields", {})
-        selected_engineers = data.get("selected_engineers", [])
-        cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
-
-        note = f"Dispatched to: {', '.join(e['name'] for e in selected_engineers) or 'None'} via Dispatch Board"
-        updated_log = append_engineer_log(fields, "Helpdesk", "Dispatched", note)
-
-        payload = build_field_payload_for_list(
-            site_id,
-            jobs_list_id,
-            {
-                "Status": ASSIGNED_STATUS if selected_engineers else AWAITING_DEPLOYMENT_STATUS,
-                "TelegramNotified": False,
-                "Telegram Notified": False,
-                "EngineerVisitLog": updated_log,
-                "Engineer Visit Log": updated_log,
-            },
-        )
-        payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
-        payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in selected_engineers]
-        update_list_item_fields(site_id, jobs_list_id, item_id, payload)
-
-        send_fields = dict(fields)
-        send_fields.update({
-            "Status": ASSIGNED_STATUS if selected_engineers else AWAITING_DEPLOYMENT_STATUS,
-            "EngineerVisitLog": updated_log,
-        })
-        sent_to_any, failed = await send_created_job_to_engineers(
-            context.bot,
-            item_id,
-            send_fields,
-            selected_engineers,
-        )
-
-        final_payload = build_field_payload_for_list(
-            site_id,
-            jobs_list_id,
-            {
-                "TelegramNotified": bool(sent_to_any),
-                "Telegram Notified": bool(sent_to_any),
-            },
-        )
-        update_list_item_fields(site_id, jobs_list_id, item_id, final_payload)
-
-        context.user_data.pop("dispatch_board", None)
-        message = (
-            f"Dispatch updated: {cdr_number}\n"
-            f"Assigned engineer(s): {', '.join(e['name'] for e in selected_engineers) or 'None'}\n"
-        )
-        if failed:
-            message += "\nWarning - could not send to:\n" + "\n".join(failed)
-        elif sent_to_any:
-            message += "\nJob sent to engineer(s)."
-
-        await update.message.reply_text(
-            message,
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    except Exception as e:
-        print(f"ERROR confirming Dispatch Board update: {e}")
-        await update.message.reply_text("There was an error updating dispatch. Please check Railway logs.")
-        return ConversationHandler.END
-
-
-async def dispatch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    role = await get_role_for_update(update)
-    context.user_data.pop("dispatch_board", None)
-    await update.message.reply_text(
-        "Dispatch Board cancelled.",
-        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role),
-    )
-    return ConversationHandler.END
 
 async def canceljob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
@@ -4437,7 +4161,7 @@ HELPDESK_MENU_TEXTS = {
     MENU_REASSIGN_JOB,
     MENU_OPEN_JOBS,
     MENU_FIND_JOB,
-    MENU_EMERGENCY_JOB,
+    MENU_UPLOAD_RECEIPTS,
     MENU_ENGINEER_MENU,
 }
 
@@ -4446,6 +4170,7 @@ ALL_MENU_TEXTS = {
     MENU_MY_JOBS,
     MENU_END_DAY,
     MENU_BUG_IDEA,
+    MENU_UPLOAD_RECEIPTS,
     *HELPDESK_MENU_TEXTS,
 }
 
@@ -4481,7 +4206,7 @@ async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not current_engineer:
             await update.message.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -4503,7 +4228,7 @@ async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"ERROR starting bug/idea log: {e}")
         await update.message.reply_text(
             "There was an error opening the bug/idea log. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -4517,7 +4242,7 @@ async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bug_idea = context.user_data.get("bug_idea")
 
         if not bug_idea:
-            await update.message.reply_text("Please try again from the menu.", reply_markup=get_main_menu())
+            await update.message.reply_text("Please try again from the menu.", reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
         text_value = update.message.text.strip()
@@ -4557,7 +4282,7 @@ async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "Logged. Thanks — this has been sent to the office as a bug/idea.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
 
         return ConversationHandler.END
@@ -4566,14 +4291,191 @@ async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"ERROR saving bug/idea: {e}")
         await update.message.reply_text(
             "There was an error saving the bug/idea. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
 
 async def bugidea_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("bug_idea", None)
-    await update.message.reply_text("Bug/idea cancelled.", reply_markup=get_main_menu())
+    await update.message.reply_text("Bug/idea cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
+    return ConversationHandler.END
+
+
+async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        site_id = get_site_id()
+        user_id = str(update.effective_user.id)
+        engineer_name = ""
+
+        try:
+            engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+            engineers = get_list_items(site_id, engineers_list_id)
+            engineers_by_telegram, _ = build_engineer_maps(engineers)
+            current_engineer = engineers_by_telegram.get(user_id)
+            if current_engineer:
+                engineer_name = current_engineer.get("name", "")
+        except Exception as e:
+            print(f"WARNING: Could not auto-detect receipt engineer: {e}")
+
+        context.user_data["receipt_upload"] = {
+            "site_id": site_id,
+            "engineer_name": engineer_name,
+            "receipt_date": "",
+            "receipt_links": [],
+            "receipt_count": 0,
+        }
+
+        if engineer_name:
+            await update.message.reply_text(
+                f"Upload receipts started.\n\nEngineer detected: {engineer_name}\n\nReply YES to use this name, or type the correct engineer name.\n\nType /cancel to cancel."
+            )
+        else:
+            await update.message.reply_text(
+                "Upload receipts started.\n\nPlease enter the engineer name.\n\nType /cancel to cancel."
+            )
+
+        return RECEIPT_ENGINEER_NAME
+
+    except Exception as e:
+        print(f"ERROR starting receipt upload: {e}")
+        await update.message.reply_text(
+            "There was an error starting receipt upload. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
+
+async def receipt_engineer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, RECEIPT_ENGINEER_NAME)
+    if menu_result is not None:
+        return menu_result
+
+    data = context.user_data.get("receipt_upload")
+    if not data:
+        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Please enter the engineer name.")
+        return RECEIPT_ENGINEER_NAME
+
+    if text.lower() in ["yes", "y"] and data.get("engineer_name"):
+        pass
+    else:
+        data["engineer_name"] = text
+
+    await update.message.reply_text(
+        "Enter the receipt date.\n\nUse DD/MM/YYYY, YYYY-MM-DD, TODAY, or press/type TODAY."
+    )
+    return RECEIPT_DATE
+
+
+async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, RECEIPT_DATE)
+    if menu_result is not None:
+        return menu_result
+
+    data = context.user_data.get("receipt_upload")
+    if not data:
+        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    parsed_date = parse_helpdesk_job_date(update.message.text)
+    if not parsed_date:
+        await update.message.reply_text("Please enter a valid date, for example 12/05/2026 or TODAY.")
+        return RECEIPT_DATE
+
+    data["receipt_date"] = parsed_date
+
+    await update.message.reply_text(
+        f"Receipt upload ready.\n\nEngineer: {data['engineer_name']}\nDate: {parsed_date}\n\n"
+        "Now send receipt photos or PDF/image files.\n\nType DONE when finished."
+    )
+    return RECEIPT_UPLOADS
+
+
+async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, RECEIPT_UPLOADS)
+    if menu_result is not None:
+        return menu_result
+
+    data = context.user_data.get("receipt_upload")
+    if not data:
+        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    if update.message.text and update.message.text.strip().upper() == "DONE":
+        count = len(data.get("receipt_links", []))
+        if count == 0:
+            await update.message.reply_text("No receipts uploaded yet. Send at least one receipt, or type /cancel to cancel.")
+            return RECEIPT_UPLOADS
+
+        context.user_data.pop("receipt_upload", None)
+        await update.message.reply_text(
+            f"Receipts uploaded for finance.\n\nEngineer: {data['engineer_name']}\nDate: {data['receipt_date']}\nFiles uploaded: {count}",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
+    try:
+        file_bytes = None
+        extension = "jpg"
+        unique_id = "receipt"
+
+        if update.message.photo:
+            photo = update.message.photo[-1]
+            telegram_file = await context.bot.get_file(photo.file_id)
+            file_bytes = await telegram_file.download_as_bytearray()
+            unique_id = photo.file_unique_id
+            extension = "jpg"
+
+        elif update.message.document:
+            document = update.message.document
+            telegram_file = await context.bot.get_file(document.file_id)
+            file_bytes = await telegram_file.download_as_bytearray()
+            unique_id = document.file_unique_id
+            original_name = clean_receipt_file_name(document.file_name or "receipt")
+            if "." in original_name:
+                extension = original_name.rsplit(".", 1)[1].lower()
+            else:
+                extension = "bin"
+
+        else:
+            await update.message.reply_text("Please send a receipt photo/file, or type DONE when finished.")
+            return RECEIPT_UPLOADS
+
+        data["receipt_count"] = int(data.get("receipt_count", 0)) + 1
+        timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
+        engineer_part = safe_folder_name(data.get("engineer_name", "ENGINEER"))
+        file_name = f"{data['receipt_date']}_{engineer_part}_{timestamp}_{data['receipt_count']}_{unique_id}.{extension}"
+
+        receipt_link = upload_receipt_to_sharepoint(
+            data["site_id"],
+            data["receipt_date"],
+            data["engineer_name"],
+            file_name,
+            bytes(file_bytes),
+        )
+        data["receipt_links"].append(receipt_link)
+
+        await update.message.reply_text(
+            f"Receipt uploaded ({len(data['receipt_links'])}). Send another receipt, or type DONE."
+        )
+        return RECEIPT_UPLOADS
+
+    except Exception as e:
+        print(f"ERROR uploading receipt: {e}")
+        await update.message.reply_text(
+            "There was an error uploading that receipt. Please try again or ask the office to check Railway logs."
+        )
+        return RECEIPT_UPLOADS
+
+
+async def receipt_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("receipt_upload", None)
+    await update.message.reply_text("Receipt upload cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
 
 
@@ -4594,14 +4496,14 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not current_engineer:
             await update.message.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return
 
         if not engineer_has_active_day(site_id, user_id):
             await update.message.reply_text(
                 "Please start your day first using 🟢 Start Day or /startday. Your jobs are locked until your day has started.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return
 
@@ -4947,21 +4849,21 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
         if not current_engineer:
             await sender.reply_text(
                 "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
         if not engineer_has_active_day(site_id, user_id):
             await sender.reply_text(
                 "Please start your day first using 🟢 Start Day or /startday before updating jobs.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
         job = find_job_by_item_id(jobs_data, item_id) if item_id else find_job_by_cdr(jobs_data, cdr_number)
 
         if not job:
-            await sender.reply_text("Could not find this job. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+            await sender.reply_text("Could not find this job. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
         fields = job["fields"]
@@ -4969,18 +4871,18 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
         if is_closed_job(fields):
             await sender.reply_text(
                 "This job has already been closed or returned to the office. No further action is required.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
         assigned_ids = get_assigned_engineer_ids(fields)
         if current_engineer["lookup_id"] not in assigned_ids:
-            await sender.reply_text("You are not assigned to this job.", reply_markup=get_main_menu())
+            await sender.reply_text("You are not assigned to this job.", reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
         allowed, reason = can_click_action(fields, current_engineer["name"], outcome)
         if not allowed:
-            await sender.reply_text(reason, reply_markup=get_main_menu())
+            await sender.reply_text(reason, reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
         cdr = fields.get("CDRNumber", "")
@@ -5020,7 +4922,7 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         print(f"ERROR starting worksheet: {e}")
         target = update.callback_query.message if update.callback_query else update.message
-        await target.reply_text("There was an error starting the worksheet.", reply_markup=get_main_menu())
+        await target.reply_text("There was an error starting the worksheet.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
 
@@ -5068,7 +4970,7 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Use 📋 My Jobs, then tap Complete, Revisit or No Access on the job card.\n\n"
             "The old /complete CDR number method still works if needed: /complete CDR00001",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -5139,7 +5041,7 @@ async def worksheet_follow_on_required_button(update: Update, context: ContextTy
 
     worksheet = context.user_data.get("worksheet")
     if not worksheet:
-        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     answer = query.data.split("|", 1)[1]
@@ -5285,7 +5187,7 @@ async def worksheet_signature_required_button(update: Update, context: ContextTy
 
     worksheet = context.user_data.get("worksheet")
     if not worksheet:
-        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     signature_required = query.data.split("|", 1)[1] == "yes"
@@ -5384,7 +5286,7 @@ async def worksheet_signature_waiting_button(update: Update, context: ContextTyp
 
     worksheet = context.user_data.get("worksheet")
     if not worksheet:
-        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     action = query.data.split("|", 1)[1]
@@ -5970,7 +5872,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("worksheet", None)
             await update.message.reply_text(
                 "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -5979,7 +5881,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("worksheet", None)
             await update.message.reply_text(
                 "You are no longer assigned to this job. Worksheet has not been submitted.",
-                reply_markup=get_main_menu(),
+                reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
 
@@ -6028,7 +5930,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer completes."
         await update.message.reply_text(
             f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
 
         await notify_helpdesk(
@@ -6062,14 +5964,14 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
 
     worksheet = context.user_data.get("worksheet")
     if not worksheet:
-        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu())
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     action = query.data.split("|", 1)[1]
 
     if action == "cancel":
         context.user_data.pop("worksheet", None)
-        await query.message.reply_text("Worksheet cancelled. Nothing has been submitted.", reply_markup=get_main_menu())
+        await query.message.reply_text("Worksheet cancelled. Nothing has been submitted.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     if action == "restart":
@@ -6107,7 +6009,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("worksheet", None)
         await query.message.reply_text(
             "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -6116,7 +6018,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("worksheet", None)
         await query.message.reply_text(
             "You are no longer assigned to this job. Worksheet has not been submitted.",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
@@ -6165,7 +6067,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
     final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer completes."
     await query.message.reply_text(
         f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
-        reply_markup=get_main_menu(),
+        reply_markup=get_main_menu(await get_role_for_update(update)),
     )
 
     await notify_helpdesk(
@@ -6282,7 +6184,7 @@ async def remind_active_engineers_to_end_day(app):
                             "End of day reminder: if you have finished work, please tap 🏁 End Day. "
                             "This keeps timesheets, mileage and pay hours correct."
                         ),
-                        reply_markup=get_main_menu(),
+                        reply_markup=get_main_menu(await get_role_for_update(update)),
                     )
                 except Exception as e:
                     print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
@@ -6441,19 +6343,6 @@ openjobs_handler = ConversationHandler(
 )
 
 
-dispatch_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler("dispatch", dispatch_start),
-        MessageHandler(filters.Regex(f"^{re.escape(MENU_DISPATCH_BOARD)}$"), dispatch_start),
-    ],
-    states={
-        DISPATCH_SELECT_JOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_select_job)],
-        DISPATCH_SELECT_ENGINEER: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_select_engineer)],
-        DISPATCH_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispatch_confirm)],
-    },
-    fallbacks=[CommandHandler("cancel", dispatch_cancel)],
-)
-
 
 canceljob_handler = ConversationHandler(
     entry_points=[
@@ -6478,6 +6367,21 @@ deletejob_handler = ConversationHandler(
         DELETEJOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, deletejob_confirm)],
     },
     fallbacks=[CommandHandler("cancel", deletejob_cancel)],
+)
+
+
+receipt_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("receipts", receipt_start),
+        CommandHandler("uploadreceipts", receipt_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_UPLOAD_RECEIPTS)}$"), receipt_start),
+    ],
+    states={
+        RECEIPT_ENGINEER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_engineer_name)],
+        RECEIPT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_date)],
+        RECEIPT_UPLOADS: [MessageHandler((filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND)), receipt_uploads)],
+    },
+    fallbacks=[CommandHandler("cancel", receipt_cancel)],
 )
 
 
@@ -6528,13 +6432,14 @@ telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
+telegram_app.add_handler(receipt_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
