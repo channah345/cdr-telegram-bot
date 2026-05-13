@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "bot-site-first-logjob-v2"
+BUILD_VERSION = "logjob-simplified-worksheet-abort-fix-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -407,7 +407,7 @@ def get_current_engineer_visit_log_lines(fields, engineer_name):
     log = fields.get("EngineerVisitLog", "") or ""
     lines = [line for line in log.splitlines() if line.strip()]
 
-    reset_actions = ["Completed", "No Access", "Revisit Required"]
+    reset_actions = ["Completed", "No Access", "Revisit Required", "Aborted Attendance"]
     last_reset_index = -1
 
     for index, line in enumerate(lines):
@@ -895,25 +895,26 @@ def parse_engineer_selection(text, engineers):
 
 def build_log_job_review(job):
     assigned_names = ", ".join(engineer["name"] for engineer in job.get("assigned_engineers", [])) or "None"
+
+    contact_line = f"Contact: {job.get('contact', '')}\n" if job.get("contact") else ""
+    notes_line = f"Notes: {job.get('notes', '')}\n" if job.get("notes") else ""
+    order_line = f"Order Number: {job.get('order_number', '')}\n" if job.get("order_number") else ""
+
     return (
         "Please review the new job before I create it in SharePoint:\n\n"
-        f"CDR Number: {job.get('cdr_number', '')}\n"
-        f"Customer: {job.get('customer_name', '')}\n"
-        f"Customer Address: {job.get('customer_address', '')}\n"
-        f"Site: {job.get('site_name', '')}\n"
-        f"Site Address: {job.get('site_address', '')}\n"
-        f"Site Notes: {job.get('site_notes', '') or 'N/A'}\n"
-        f"Contact: {job.get('contact', '') or 'N/A'}\n"
+        f"CDR Number: {job.get('cdr_number', '')}\n\n"
+        f"Customer:\n{job.get('customer_name', '')}\n\n"
+        f"Site:\n{job.get('site_name', '')}\n\n"
+        f"{contact_line}"
         f"Task: {job.get('task', '')}\n"
-        f"Notes: {job.get('notes', '') or 'N/A'}\n"
+        f"{notes_line}"
         f"Date: {job.get('date_display', job.get('date', ''))}\n"
         f"Time: {job.get('time', '')}\n"
         f"Category: {job.get('category', '')}\n"
-        f"Order Number: {job.get('order_number', '') or 'N/A'}\n"
-        f"Assigned Engineer(s): {assigned_names}\n\n"
+        f"{order_line}"
+        f"Assigned To: {assigned_names}\n\n"
         "Reply YES to create and send, NO to cancel, or RESTART to start again."
     )
-
 
 def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=False):
     job_notes = job.get("notes", "") or ""
@@ -937,11 +938,11 @@ def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=Fals
             "Start Time": job["time"],
             "CustomerName": job["customer_name"],
             "Customer Name": job["customer_name"],
-            "CustomerAddress": job["customer_address"],
-            "Customer Address": job["customer_address"],
+            "CustomerAddress": job.get("customer_address", ""),
+            "Customer Address": job.get("customer_address", ""),
             "SiteName": job["site_name"],
             "Site Name": job["site_name"],
-            "Address": job["site_address"],
+            "Address": job.get("site_address", job.get("site_name", "")),
             "ContactName": job.get("contact", ""),
             "Contact Name": job.get("contact", ""),
             "Task": job["task"],
@@ -1348,45 +1349,6 @@ def get_review_keyboard():
     ])
 
 
-def get_logjob_site_confirm_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Use Remembered Site", callback_data="logjob_site_confirm|yes")],
-        [InlineKeyboardButton("✏️ Edit Address", callback_data="logjob_site_confirm|edit")],
-        [InlineKeyboardButton("❌ Manual Entry", callback_data="logjob_site_confirm|no")],
-        [InlineKeyboardButton("🔄 Restart", callback_data="logjob_site_confirm|restart")],
-        [InlineKeyboardButton("🚫 Cancel", callback_data="logjob_site_confirm|cancel")],
-    ])
-
-
-def get_logjob_time_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ ASAP", callback_data="logjob_time|asap")],
-        [
-            InlineKeyboardButton("🕗 08:00", callback_data="logjob_time|08:00"),
-            InlineKeyboardButton("🕚 11:00", callback_data="logjob_time|11:00"),
-            InlineKeyboardButton("🕑 14:00", callback_data="logjob_time|14:00"),
-        ],
-        [InlineKeyboardButton("✏️ Custom Time", callback_data="logjob_time|custom")],
-        [InlineKeyboardButton("🔄 Restart", callback_data="logjob_time|restart"), InlineKeyboardButton("🚫 Cancel", callback_data="logjob_time|cancel")],
-    ])
-
-
-def get_logjob_category_keyboard():
-    rows = []
-    for index, choice in enumerate(JOB_CATEGORY_CHOICES, start=1):
-        rows.append([InlineKeyboardButton(f"{index}. {choice}", callback_data=f"logjob_category|{index}")])
-    rows.append([InlineKeyboardButton("🔄 Restart", callback_data="logjob_category|restart"), InlineKeyboardButton("🚫 Cancel", callback_data="logjob_category|cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def get_logjob_review_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Create Job", callback_data="logjob_review|yes")],
-        [InlineKeyboardButton("🔄 Restart", callback_data="logjob_review|restart")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="logjob_review|cancel")],
-    ])
-
-
 NO_ACCESS_REASONS = {
     "no_answer": "No answer",
     "no_keys": "No keys / access available",
@@ -1467,13 +1429,22 @@ def get_job_buttons(item_id, address=None):
 
 
 def format_job(fields, engineer_name=None):
+    site_name = fields.get("SiteName", "") or ""
+    address = fields.get("Address", "") or ""
+    address_line = ""
+
+    # In the simplified log job flow, SiteName may already contain the full
+    # site name and address. Avoid showing the same text twice.
+    if address and normalise_field_name(address) != normalise_field_name(site_name):
+        address_line = f"Address: {address}\n"
+
     return (
         f"CDR Number: {fields.get('CDRNumber', '')}\n"
         f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
         f"Time: {fields.get('StartTime', '')}\n"
         f"Engineer: {engineer_name or ''}\n"
-        f"Site: {fields.get('SiteName', '')}\n"
-        f"Address: {fields.get('Address', '')}\n"
+        f"Site: {site_name}\n"
+        f"{address_line}"
         f"Task: {fields.get('Task', '')}\n"
         f"Notes: {fields.get('Notes', '')}\n"
         f"Contact: {fields.get('ContactName', '')}"
@@ -2836,10 +2807,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
-    message = update.effective_message
 
     if not user_can_use_helpdesk(role):
-        await message.reply_text(
+        await update.message.reply_text(
             "You do not have permission to log jobs.",
             reply_markup=get_main_menu(role),
         )
@@ -2853,7 +2823,7 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assignable_engineers = get_active_assignable_engineers(engineers)
 
         if not assignable_engineers:
-            await message.reply_text(
+            await update.message.reply_text(
                 "No active assignable engineers were found. Check the Engineers list has TelegramID, Role and Active set correctly.",
                 reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
             )
@@ -2866,7 +2836,7 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "role": role,
         }
 
-        await message.reply_text(
+        await update.message.reply_text(
             "Log new job.\n\nEnter the CDR/job number.\n\nExample: CDR012896",
             reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
         )
@@ -2874,7 +2844,7 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print(f"ERROR starting log job flow: {e}")
-        await message.reply_text(
+        await update.message.reply_text(
             "There was an error opening Log Job. Please check Railway logs.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
@@ -2894,58 +2864,58 @@ async def logjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     job["cdr_number"] = value
     await update.message.reply_text(
-        "Site name?\n\nExample: Stockton Fire Station, HQ, or St Peters School"
+        "Customer name and address?\n\n"
+        "Example:\n"
+        "FM4U\n"
+        "7-8 Delta Bank Road\n"
+        "Gateshead\n"
+        "NE11 9DJ"
     )
-    return LOGJOB_SITE_NAME
+    return LOGJOB_CUSTOMER_NAME
 
 
 async def logjob_customer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the customer name. This appears on the worksheet.")
+        await update.message.reply_text("Please enter the customer name/address. This appears on the worksheet.")
         return LOGJOB_CUSTOMER_NAME
+
     job["customer_name"] = value
-    await update.message.reply_text("Customer address?\n\nThis is the billing/client address for the worksheet. You can use multiple lines.")
-    return LOGJOB_CUSTOMER_ADDRESS
+    # Customer address is no longer asked separately. Keep the field blank so it does not duplicate on worksheets.
+    job["customer_address"] = ""
+
+    await update.message.reply_text(
+        "Site name and address?\n\n"
+        "Example:\n"
+        "Park View\n"
+        "Feetham Avenue, Forest Hall\n"
+        "Newcastle\n"
+        "NE12 9QN"
+    )
+    return LOGJOB_SITE_NAME
 
 
 async def logjob_customer_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("log_job")
-    value = update.message.text.strip()
-    if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the customer address. This appears on the worksheet.")
-        return LOGJOB_CUSTOMER_ADDRESS
-    job["customer_address"] = value
-    await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
-    return LOGJOB_SITE_ADDRESS
+    # Legacy state retained for safety only. New Log Job flow no longer asks this separately.
+    return await logjob_site_name(update, context)
 
 
 async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the site name.")
+        await update.message.reply_text("Please enter the site name/address.")
         return LOGJOB_SITE_NAME
 
     job["site_name"] = value
+    # Site address is no longer asked separately. Use the site block for Maps/address fields.
+    job["site_address"] = value
+    job["site_notes"] = ""
     job.pop("site_candidate", None)
-    job.pop("site_notes", None)
 
-    candidate = find_best_site_candidate(job["site_id"], job["jobs_list_id"], value)
-    if candidate:
-        job["site_candidate"] = candidate
-        await update.message.reply_text(
-            format_site_candidate(candidate),
-            reply_markup=get_logjob_site_confirm_keyboard(),
-        )
-        return LOGJOB_SITE_CONFIRM
-
-    await update.message.reply_text(
-        "No saved site was found. I’ll enter it manually.\n\nCustomer name?\n\nExample: Cleveland Fire Brigade"
-    )
-    return LOGJOB_CUSTOMER_NAME
-
+    await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
+    return LOGJOB_CONTACT
 
 async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
@@ -2959,41 +2929,25 @@ async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     if answer in ["yes", "y", "use", "use it", "correct"]:
         job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
         job["site_address"] = candidate.get("address", "")
-        job["customer_name"] = candidate.get("customer_name", "")
-        job["customer_address"] = candidate.get("customer_address", "")
-        job["site_notes"] = candidate.get("notes", "")
-        await update.message.reply_text(
-            "Saved site details used.\n\nContact name/number?\n\nType N/A if there is no contact.",
-            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
-        )
-        return LOGJOB_CONTACT
+        if candidate.get("notes"):
+            job["site_notes"] = candidate.get("notes", "")
+        await update.message.reply_text(prompt_for_site_notes(candidate.get("notes", "")))
+        return LOGJOB_SITE_NOTES
 
     if answer in ["edit", "change", "amend", "wrong address"]:
-        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
-        job["customer_name"] = candidate.get("customer_name", "")
-        job["customer_address"] = candidate.get("customer_address", "")
-        job["site_notes"] = candidate.get("notes", "")
-        job["skip_site_notes_after_address"] = True
         await update.message.reply_text(
             "Enter the correct site address.\n\n"
-            "This will be used for the job and saved back to the Sites list.",
-            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+            "This will be used for the job and saved back to the Sites list."
         )
         return LOGJOB_SITE_ADDRESS
 
     if answer in ["no", "n", "manual", "enter manually"]:
         job.pop("site_candidate", None)
         job.pop("site_notes", None)
-        await update.message.reply_text(
-            "Manual entry selected.\n\nCustomer name?\n\nExample: Cleveland Fire Brigade",
-            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
-        )
-        return LOGJOB_CUSTOMER_NAME
+        await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
+        return LOGJOB_SITE_ADDRESS
 
-    await update.message.reply_text(
-        "Choose an option below, or type YES, EDIT, or NO.",
-        reply_markup=get_logjob_site_confirm_keyboard(),
-    )
+    await update.message.reply_text("Reply YES to use it, EDIT to change the address, or NO to enter manually.")
     return LOGJOB_SITE_CONFIRM
 
 
@@ -3004,10 +2958,6 @@ async def logjob_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Please enter the site address.")
         return LOGJOB_SITE_ADDRESS
     job["site_address"] = value
-
-    if job.pop("skip_site_notes_after_address", False):
-        await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
-        return LOGJOB_CONTACT
 
     existing_notes = (job.get("site_candidate") or {}).get("notes", "")
     await update.message.reply_text(prompt_for_site_notes(existing_notes))
@@ -3065,10 +3015,7 @@ async def logjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["date_display"] = datetime.fromisoformat(parsed).strftime("%d/%m/%Y")
     except Exception:
         job["date_display"] = parsed
-    await update.message.reply_text(
-        "Start/time required?",
-        reply_markup=get_logjob_time_keyboard(),
-    )
+    await update.message.reply_text("Start/time required?\n\nUse HH:MM, 0800, 13:30, now, or asap.")
     return LOGJOB_TIME
 
 
@@ -3076,15 +3023,12 @@ async def logjob_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     parsed = normalise_helpdesk_time(update.message.text)
     if not parsed:
-        await update.message.reply_text(
-            "Please choose a time below, or type a valid custom time such as 08:30 or 13:45.",
-            reply_markup=get_logjob_time_keyboard(),
-        )
+        await update.message.reply_text("Please enter a valid time, for example 08:00, 0800, 13:30, now, or asap.")
         return LOGJOB_TIME
     job["time"] = parsed
     await update.message.reply_text(
-        "Job category?",
-        reply_markup=get_logjob_category_keyboard(),
+        "Job category? Reply with a number:\n\n" +
+        "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
     )
     return LOGJOB_CATEGORY
 
@@ -3106,8 +3050,8 @@ async def logjob_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not selected:
         await update.message.reply_text(
-            "Please choose a valid category below, or type the number/category name.",
-            reply_markup=get_logjob_category_keyboard(),
+            "Please choose a valid category number:\n\n" +
+            "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
         )
         return LOGJOB_CATEGORY
 
@@ -3137,14 +3081,31 @@ async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_
         return LOGJOB_ASSIGN_ENGINEERS
 
     job["assigned_engineers"] = selected
-    await update.message.reply_text(
-        build_log_job_review(job),
-        reply_markup=get_logjob_review_keyboard(),
-    )
+    await update.message.reply_text(build_log_job_review(job))
     return LOGJOB_REVIEW
 
 
-async def finish_logjob_create(message, context: ContextTypes.DEFAULT_TYPE, job, role):
+async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    job = context.user_data.get("log_job")
+    role = job.get("role", "Helpdesk") if job else "Helpdesk"
+    answer = update.message.text.strip().lower()
+
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("log_job", None)
+        await update.message.reply_text(
+            "Job logging cancelled. Nothing has been created.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer in ["restart", "redo"]:
+        context.user_data.pop("log_job", None)
+        return await logjob_start(update, context)
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to create and send, NO to cancel, or RESTART to start again.")
+        return LOGJOB_REVIEW
+
     try:
         site_id = job["site_id"]
         jobs_list_id = job["jobs_list_id"]
@@ -3184,215 +3145,30 @@ async def finish_logjob_create(message, context: ContextTypes.DEFAULT_TYPE, job,
         )
         update_list_item_fields(site_id, jobs_list_id, item_id, final_update)
 
-        upsert_site_record_from_job(job)
-
         context.user_data.pop("log_job", None)
 
-        message_text = (
+        message = (
             f"Job created in SharePoint: {job['cdr_number']}\n"
             f"Assigned to: {', '.join(e['name'] for e in job.get('assigned_engineers', []))}\n"
             f"Telegram sent: {'Yes' if sent_to_any else 'No'}"
         )
         if failed:
-            message_text += "\n\nSend issues:\n" + "\n".join(failed[:5])
+            message += "\n\nSend issues:\n" + "\n".join(failed[:5])
 
-        await message.reply_text(
-            message_text,
+        await update.message.reply_text(
+            message,
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
 
     except Exception as e:
         print(f"ERROR creating logged job: {e}")
-        await message.reply_text(
+        await update.message.reply_text(
             "There was an error creating the job. Nothing further has been sent. Please check Railway logs.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
 
-
-async def logjob_site_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split("|", 1)[1]
-    job = context.user_data.get("log_job")
-    role = job.get("role", "Helpdesk") if job else "Helpdesk"
-
-    if not job:
-        await query.message.reply_text("Please start again using ➕ Log Job.")
-        return ConversationHandler.END
-
-    if action == "cancel":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text(
-            "Job logging cancelled. Nothing has been created.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if action == "restart":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text("Restarting Log Job.")
-        return await logjob_start(update, context)
-
-    candidate = job.get("site_candidate") or {}
-
-    if action == "yes":
-        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
-        job["site_address"] = candidate.get("address", "")
-        job["customer_name"] = candidate.get("customer_name", "")
-        job["customer_address"] = candidate.get("customer_address", "")
-        job["site_notes"] = candidate.get("notes", "")
-        await query.message.reply_text("Saved site details used.\n\nContact name/number?\n\nType N/A if there is no contact.")
-        return LOGJOB_CONTACT
-
-    if action == "edit":
-        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
-        job["customer_name"] = candidate.get("customer_name", "")
-        job["customer_address"] = candidate.get("customer_address", "")
-        job["site_notes"] = candidate.get("notes", "")
-        job["skip_site_notes_after_address"] = True
-        await query.message.reply_text(
-            "Enter the correct site address.\n\nThis will be used for the job and saved back to the Sites list."
-        )
-        return LOGJOB_SITE_ADDRESS
-
-    if action == "no":
-        job.pop("site_candidate", None)
-        job.pop("site_notes", None)
-        await query.message.reply_text("Manual entry selected.\n\nCustomer name?\n\nExample: Cleveland Fire Brigade")
-        return LOGJOB_CUSTOMER_NAME
-
-    return LOGJOB_SITE_CONFIRM
-
-
-async def logjob_time_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split("|", 1)[1]
-    job = context.user_data.get("log_job")
-    role = job.get("role", "Helpdesk") if job else "Helpdesk"
-
-    if not job:
-        await query.message.reply_text("Please start again using ➕ Log Job.")
-        return ConversationHandler.END
-
-    if action == "cancel":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text(
-            "Job logging cancelled. Nothing has been created.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if action == "restart":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text("Restarting Log Job.")
-        return await logjob_start(update, context)
-
-    if action == "custom":
-        await query.message.reply_text("Enter the custom start time.\n\nExample: 08:30, 13:45, or 1430.")
-        return LOGJOB_TIME
-
-    parsed = normalise_helpdesk_time(action)
-    if not parsed:
-        await query.message.reply_text("Please choose a valid time.", reply_markup=get_logjob_time_keyboard())
-        return LOGJOB_TIME
-
-    job["time"] = parsed
-    await query.message.reply_text("Job category?", reply_markup=get_logjob_category_keyboard())
-    return LOGJOB_CATEGORY
-
-
-async def logjob_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split("|", 1)[1]
-    job = context.user_data.get("log_job")
-    role = job.get("role", "Helpdesk") if job else "Helpdesk"
-
-    if not job:
-        await query.message.reply_text("Please start again using ➕ Log Job.")
-        return ConversationHandler.END
-
-    if action == "cancel":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text(
-            "Job logging cancelled. Nothing has been created.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if action == "restart":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text("Restarting Log Job.")
-        return await logjob_start(update, context)
-
-    if not action.isdigit() or not (1 <= int(action) <= len(JOB_CATEGORY_CHOICES)):
-        await query.message.reply_text("Please choose a valid category.", reply_markup=get_logjob_category_keyboard())
-        return LOGJOB_CATEGORY
-
-    job["category"] = JOB_CATEGORY_CHOICES[int(action) - 1]
-    await query.message.reply_text("Customer order number?\n\nType N/A if not available.")
-    return LOGJOB_ORDER_NUMBER
-
-
-async def logjob_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split("|", 1)[1]
-    job = context.user_data.get("log_job")
-    role = job.get("role", "Helpdesk") if job else "Helpdesk"
-
-    if not job:
-        await query.message.reply_text("Please start again using ➕ Log Job.")
-        return ConversationHandler.END
-
-    if action == "cancel":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text(
-            "Job logging cancelled. Nothing has been created.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if action == "restart":
-        context.user_data.pop("log_job", None)
-        await query.message.reply_text("Restarting Log Job.")
-        return await logjob_start(update, context)
-
-    if action == "yes":
-        return await finish_logjob_create(query.message, context, job, role)
-
-    await query.message.reply_text("Choose Create Job, Restart, or Cancel.", reply_markup=get_logjob_review_keyboard())
-    return LOGJOB_REVIEW
-
-
-async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("log_job")
-    role = job.get("role", "Helpdesk") if job else "Helpdesk"
-    answer = update.message.text.strip().lower()
-
-    if answer in ["no", "n", "cancel"]:
-        context.user_data.pop("log_job", None)
-        await update.message.reply_text(
-            "Job logging cancelled. Nothing has been created.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if answer in ["restart", "redo"]:
-        context.user_data.pop("log_job", None)
-        return await logjob_start(update, context)
-
-    if answer not in ["yes", "y"]:
-        await update.message.reply_text(
-            "Choose Create Job, Restart, or Cancel below, or type YES, NO, or RESTART.",
-            reply_markup=get_logjob_review_keyboard(),
-        )
-        return LOGJOB_REVIEW
-
-    return await finish_logjob_create(update.message, context, job, role)
 
 async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_role_for_update(update)
@@ -3771,13 +3547,26 @@ def format_helpdesk_job_detail(job, engineers):
     worksheet_link = get_field_value(fields, "WorksheetLink", "Worksheet Link", "WorksheetPDF", "Worksheet PDF") or ""
     signature_received = "Yes" if bool_field(get_field_value(fields, "ClientSignatureReceived", "Client Signature Received")) else "No"
 
+    customer_detail = get_field_value(fields, 'CustomerName', 'Customer Name') or ''
+    customer_address_detail = get_field_value(fields, 'CustomerAddress', 'Customer Address') or ''
+    site_detail = get_field_value(fields, 'SiteName', 'Site Name') or ''
+    address_detail = get_field_value(fields, 'Address') or ''
+
+    customer_address_line = ''
+    if customer_address_detail and normalise_field_name(customer_address_detail) != normalise_field_name(customer_detail):
+        customer_address_line = f"Customer Address: {customer_address_detail}\n"
+
+    address_line = ''
+    if address_detail and normalise_field_name(address_detail) != normalise_field_name(site_detail):
+        address_line = f"Address: {address_detail}\n"
+
     return (
         "Job details:\n\n"
         f"CDR Number: {get_field_value(fields, 'CDRNumber', 'CDR Number', 'Title') or ''}\n"
-        f"Customer: {get_field_value(fields, 'CustomerName', 'Customer Name') or ''}\n"
-        f"Customer Address: {get_field_value(fields, 'CustomerAddress', 'Customer Address') or ''}\n"
-        f"Site: {get_field_value(fields, 'SiteName', 'Site Name') or ''}\n"
-        f"Address: {get_field_value(fields, 'Address') or ''}\n"
+        f"Customer: {customer_detail}\n"
+        f"{customer_address_line}"
+        f"Site: {site_detail}\n"
+        f"{address_line}"
         f"Date: {format_sharepoint_date(get_field_value(fields, 'Date') or '')}\n"
         f"Time: {get_field_value(fields, 'StartTime', 'Start Time') or ''}\n"
         f"Status: {get_field_value(fields, 'Status') or ''}\n"
@@ -4754,10 +4543,17 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if not engineer_has_active_day(site_id, user_id):
-            await update.message.reply_text(
-                "Please start your day first using 🟢 Start Day or /startday. Your jobs are locked until your day has started.",
-                reply_markup=get_main_menu(await get_role_for_update(update)),
-            )
+            role = await get_role_for_update(update)
+            if user_can_use_helpdesk(role):
+                await update.message.reply_text(
+                    "You are logged in as helpdesk/admin. Engineer jobs are locked until you start your engineer day. Use the Helpdesk menu for office actions.",
+                    reply_markup=get_main_menu(role),
+                )
+            else:
+                await update.message.reply_text(
+                    "Please start your day first using 🟢 Start Day or /startday. Your jobs are locked until your day has started.",
+                    reply_markup=get_main_menu(role),
+                )
             return
 
         found_any = False
@@ -6029,9 +5825,17 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=N
     customer_address = get_field_value(fields, "CustomerAddress", "Customer Address") or ""
     customer_details = "\n".join([v for v in [customer_name, customer_address] if str(v or "").strip()])
 
+    site_name_for_pdf = fields.get("SiteName", "") or ""
+    site_address_for_pdf = fields.get("Address", "") or ""
+
+    # SiteName may now include the site address as multi-line text. If Address
+    # contains the same value, do not duplicate it on the worksheet.
+    if normalise_field_name(site_address_for_pdf) == normalise_field_name(site_name_for_pdf):
+        site_address_for_pdf = ""
+
     site_details = "\n".join([v for v in [
-        fields.get("SiteName", ""),
-        fields.get("Address", ""),
+        site_name_for_pdf,
+        site_address_for_pdf,
     ] if str(v or "").strip()])
 
     order_number = get_field_value(fields, "CustomerOrderNumber", "Customer Order Number", "OrderNumber", "Order Number") or ""
@@ -6840,30 +6644,18 @@ logjob_handler = ConversationHandler(
         LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
         LOGJOB_CUSTOMER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_address)],
         LOGJOB_SITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_name)],
-        LOGJOB_SITE_CONFIRM: [
-            CallbackQueryHandler(logjob_site_confirm_button, pattern=r"^logjob_site_confirm\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_confirm),
-        ],
+        LOGJOB_SITE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_confirm)],
         LOGJOB_SITE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_address)],
         LOGJOB_SITE_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_notes)],
         LOGJOB_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_contact)],
         LOGJOB_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_task)],
         LOGJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_notes)],
         LOGJOB_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_date)],
-        LOGJOB_TIME: [
-            CallbackQueryHandler(logjob_time_button, pattern=r"^logjob_time\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_time),
-        ],
-        LOGJOB_CATEGORY: [
-            CallbackQueryHandler(logjob_category_button, pattern=r"^logjob_category\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_category),
-        ],
+        LOGJOB_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_time)],
+        LOGJOB_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_category)],
         LOGJOB_ORDER_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_order_number)],
         LOGJOB_ASSIGN_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_assign_engineers)],
-        LOGJOB_REVIEW: [
-            CallbackQueryHandler(logjob_review_button, pattern=r"^logjob_review\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_review),
-        ],
+        LOGJOB_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_review)],
     },
     fallbacks=[CommandHandler("cancel", logjob_cancel)],
 )
