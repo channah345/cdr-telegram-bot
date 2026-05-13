@@ -7051,7 +7051,7 @@ abortjob_handler = ConversationHandler(
 
 
 telegram_app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("my_id", my_id))
+telegram_app.add_handler(CommandHandler("my_id", my_id))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(CommandHandler("requestjob", request_job))
