@@ -52,7 +52,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "trade-group-summary-photo-albums-v1"
+BUILD_VERSION = "start-end-reminders-photo-albums-fix-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -180,6 +180,11 @@ msal_app = msal.ConfidentialClientApplication(
 )
 
 web_app = FastAPI()
+
+
+
+def is_group_chat(update):
+    return update.effective_chat and update.effective_chat.type != "private"
 
 
 def get_headers(content_type=True):
@@ -1715,10 +1720,10 @@ def get_trade_group_chat_id(fields):
 
 
 async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
-    """Send a job update and any engineer-uploaded photos to the correct CDR trade group.
+    """Send the trade group text summary and uploaded job photos.
 
-    This does not generate or send worksheets/PDFs. It posts the existing text
-    summary first, then sends any photos uploaded during that worksheet flow.
+    This does not generate or send worksheets/PDFs. Photos are sent as Telegram
+    media albums using the actual photo bytes captured during the worksheet flow.
     """
     chat_id, group_name = get_trade_group_chat_id(fields)
 
@@ -1733,27 +1738,38 @@ async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
         )
         await send_trade_group_photos(context, chat_id, worksheet)
     except Exception as e:
-        print(f"WARNING: Could not send text summary to {group_name}: {e}")
-        return
-
-    await send_trade_group_photos(context, chat_id, worksheet, group_name)
+        print(f"WARNING: Could not send trade group summary/photos to {group_name}: {e}")
 
 
 async def send_trade_group_photos(context, chat_id, worksheet):
-    """Send engineer job photos to a trade group as Telegram media groups.
+    """Send engineer photos as grouped Telegram albums.
 
-    This keeps photos clumped together as an album instead of posting one
-    separate message per photo. Telegram allows up to 10 photos per album.
+    The worksheet stores photo bytes under photo_files_for_group as each engineer
+    uploads photos. Telegram media groups support up to 10 images per album.
     """
-    photos = worksheet.get("telegram_photo_file_ids", []) or worksheet.get("photo_file_ids", []) or []
+    photo_items = worksheet.get("photo_files_for_group", []) or []
 
-    if not photos:
+    if not photo_items:
         return
 
     try:
-        for batch_start in range(0, len(photos), 10):
-            batch = photos[batch_start:batch_start + 10]
-            media = [InputMediaPhoto(media=file_id) for file_id in batch if file_id]
+        for batch_start in range(0, len(photo_items), 10):
+            batch = photo_items[batch_start:batch_start + 10]
+            media = []
+
+            for index, item in enumerate(batch):
+                if not isinstance(item, dict):
+                    continue
+
+                file_bytes = item.get("bytes")
+                file_name = item.get("file_name") or f"job_photo_{batch_start + index + 1}.jpg"
+
+                if not file_bytes:
+                    continue
+
+                buffer = BytesIO(file_bytes)
+                buffer.name = file_name
+                media.append(InputMediaPhoto(media=buffer))
 
             if media:
                 await context.bot.send_media_group(
@@ -2038,6 +2054,9 @@ def submit_signature(
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return
+
     chat = update.effective_chat
     user = update.effective_user
 
@@ -2053,6 +2072,9 @@ def run_signature_web_server():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return
+
     role = await get_role_for_update(update)
 
     if role.lower() == "inactive":
@@ -6541,6 +6563,44 @@ async def send_new_jobs(app):
         print(f"ERROR sending new jobs: {e}")
 
 
+async def remind_engineers_to_start_day(app):
+    """Daily 07:40 reminder to active engineers/admin engineers to start their day."""
+    try:
+        site_id = get_site_id()
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+
+        for engineer in engineers:
+            fields = engineer.get("fields", {})
+            engineer_name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
+            telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
+            role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
+            active_value = get_field_value(fields, "Active")
+
+            if active_value not in [None, ""] and not bool_field(active_value):
+                continue
+
+            if role not in ["engineer", "admin"]:
+                continue
+
+            if not telegram_id:
+                continue
+
+            try:
+                await app.bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "⏰ Start Day Reminder\n\n"
+                        f"Morning {engineer_name or 'Engineer'}, please tap 🟢 Start Day when you begin work today."
+                    ),
+                )
+            except Exception as e:
+                print(f"WARNING: Could not send start-day reminder to {telegram_id}: {e}")
+
+    except Exception as e:
+        print(f"ERROR sending start-day reminders: {e}")
+
+
 async def remind_active_engineers_to_end_day(app):
     """Daily reminder so engineers do not forget to close their day."""
     try:
@@ -6591,6 +6651,14 @@ async def post_init(app):
         send_new_jobs,
         trigger="interval",
         seconds=30,
+        args=[app],
+    )
+
+    scheduler.add_job(
+        remind_engineers_to_start_day,
+        trigger="cron",
+        hour=7,
+        minute=40,
         args=[app],
     )
 
