@@ -52,7 +52,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "worksheet-remove-engineer-notes-v1"
+BUILD_VERSION = "trade-group-summary-photos-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -1715,10 +1715,10 @@ def get_trade_group_chat_id(fields):
 
 
 async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
-    """Send a text-only job update to the correct CDR trade group.
+    """Send a job update and any engineer-uploaded photos to the correct CDR trade group.
 
-    This does not generate or send worksheets/PDFs. It is only an engineer
-    activity summary for Completed, No Access and Revisit Required outcomes.
+    This does not generate or send worksheets/PDFs. It posts the existing text
+    summary first, then sends any photos uploaded during that worksheet flow.
     """
     chat_id, group_name = get_trade_group_chat_id(fields)
 
@@ -1733,6 +1733,52 @@ async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
         )
     except Exception as e:
         print(f"WARNING: Could not send text summary to {group_name}: {e}")
+        return
+
+    await send_trade_group_photos(context, chat_id, worksheet, group_name)
+
+
+async def send_trade_group_photos(context, chat_id, worksheet, group_name):
+    """Send engineer-uploaded job photos underneath the trade group summary.
+
+    Photos are sent from the Telegram file bytes captured during the worksheet
+    upload step. SharePoint web links are still kept for records/worksheets,
+    but they are not reliable for Telegram to fetch directly because SharePoint
+    links are normally protected.
+    """
+    photo_files = worksheet.get("photo_files_for_group", []) or []
+
+    if not photo_files:
+        return
+
+    cdr_number = worksheet.get("cdr_number", "")
+    max_photos_to_send = 10
+
+    if len(photo_files) > max_photos_to_send:
+        print(f"WARNING: {len(photo_files)} photos uploaded for {cdr_number}; sending first {max_photos_to_send} to {group_name}.")
+
+    for index, photo_file in enumerate(photo_files[:max_photos_to_send], start=1):
+        try:
+            photo_bytes = photo_file.get("bytes")
+            file_name = photo_file.get("file_name") or f"{cdr_number}_photo_{index}.jpg"
+
+            if not photo_bytes:
+                continue
+
+            image_stream = BytesIO(photo_bytes)
+            image_stream.name = file_name
+
+            caption = None
+            if index == 1:
+                caption = f"{cdr_number} - engineer photo(s)" if cdr_number else "Engineer photo(s)"
+
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=image_stream,
+                caption=caption,
+            )
+        except Exception as e:
+            print(f"WARNING: Could not send photo {index} for {cdr_number} to {group_name}: {e}")
 
 
 async def notify_helpdesk(context, text):
@@ -5231,6 +5277,7 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
             "engineer_lookup_id": current_engineer["lookup_id"],
             "fields": fields,
             "photo_links": [],
+            "photo_files_for_group": [],
             "ClientSignatureRequired": False,
             "ClientSignatureReceived": False,
             "JobOutcome": outcome,
@@ -5452,6 +5499,10 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         worksheet["photo_links"].append(photo_link)
+        worksheet.setdefault("photo_files_for_group", []).append({
+            "file_name": file_name,
+            "bytes": bytes(file_bytes),
+        })
         return PHOTOS
 
     await update.message.reply_text("Please send the required van photos, or type DONE once all 3 have been uploaded.")
@@ -6183,6 +6234,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worksheet["FollowOnRequired"] = False
         worksheet["FollowOnNotes"] = ""
         worksheet["photo_links"] = []
+        worksheet["photo_files_for_group"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
 
@@ -6320,6 +6372,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         worksheet["FollowOnRequired"] = False
         worksheet["FollowOnNotes"] = ""
         worksheet["photo_links"] = []
+        worksheet["photo_files_for_group"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
 
