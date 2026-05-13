@@ -52,7 +52,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "trade-group-text-summary-v1"
+BUILD_VERSION = "worksheet-remove-engineer-notes-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -103,7 +103,6 @@ WORK_COMPLETED = 0
 MATERIALS_USED = 1
 FOLLOW_ON_REQUIRED = 2
 FOLLOW_ON_NOTES = 3
-ENGINEER_NOTES = 4
 PHOTOS = 5
 SIGNATURE_REQUIRED = 6
 SIGNATURE_WAITING = 7
@@ -1604,7 +1603,6 @@ def build_review_text(worksheet):
         f"Materials used:\n{worksheet.get('MaterialsUsed', '')}\n\n"
         f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
         f"Follow-on notes:\n{worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
-        f"Engineer notes:\n{worksheet.get('EngineerCompletionNotes', '')}\n\n"
         f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
         f"Client signature required: {signature_required}\n"
         f"Client signature received: {signature_received}\n\n"
@@ -1696,10 +1694,6 @@ def build_trade_group_text_summary(worksheet, fields, updated_log, outcome):
             lines.append(follow_on_notes)
     else:
         lines.extend(["", "Follow-on Required?: No"])
-
-    engineer_notes = str(worksheet.get("EngineerCompletionNotes", "") or "").strip()
-    if engineer_notes and engineer_notes.lower() not in ["n/a", "na", "none", "no"]:
-        lines.extend(["", f"Engineer Comments: {engineer_notes}"])
 
     return "\n".join(lines)
 
@@ -3039,7 +3033,7 @@ async def logjob_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return LOGJOB_TASK
     job["task"] = value
     await update.message.reply_text(
-        "Any extra engineer notes?",
+        "Any job notes/access notes?",
         reply_markup=get_skip_keyboard(),
     )
     return LOGJOB_NOTES
@@ -5373,8 +5367,12 @@ async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEF
         return FOLLOW_ON_NOTES
 
     context.user_data["worksheet"]["FollowOnNotes"] = ""
-    await update.message.reply_text("Any engineer notes? Type None if none.")
-    return ENGINEER_NOTES
+    await update.message.reply_text(
+        "Upload job photos now.\n\n"
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
+    )
+    return PHOTOS
 
 
 async def worksheet_follow_on_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5395,8 +5393,12 @@ async def worksheet_follow_on_required_button(update: Update, context: ContextTy
         return FOLLOW_ON_NOTES
 
     worksheet["FollowOnNotes"] = ""
-    await query.message.reply_text("Any engineer notes? Type None if none.")
-    return ENGINEER_NOTES
+    await query.message.reply_text(
+        "Upload job photos now.\n\n"
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
+    )
+    return PHOTOS
 
 
 async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5409,27 +5411,11 @@ async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAUL
         return FOLLOW_ON_NOTES
 
     context.user_data["worksheet"]["FollowOnNotes"] = update.message.text
-    await update.message.reply_text("Any engineer notes? Type None if none.")
-    return ENGINEER_NOTES
-
-
-async def worksheet_engineer_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    menu_result = await handle_menu_during_conversation(update, context, ENGINEER_NOTES)
-    if menu_result is not None:
-        return menu_result
-
-    if is_bot_menu_text(update.message.text):
-        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type engineer notes, or type None.")
-        return ENGINEER_NOTES
-
-    context.user_data["worksheet"]["EngineerCompletionNotes"] = update.message.text
-
     await update.message.reply_text(
         "Upload job photos now.\n\n"
         "Send one or more photos, then type DONE when finished.\n"
         "If no photos are needed, type DONE."
     )
-
     return PHOTOS
 
 
@@ -5716,10 +5702,6 @@ def build_visit_comment_extra(worksheet):
     else:
         parts.append("Follow-on Required: No")
 
-    engineer_notes = clean_engineer_log_extra(worksheet.get("EngineerCompletionNotes", ""))
-    if engineer_notes and engineer_notes.lower() not in ["none", "n/a", "no"]:
-        parts.append(f"Engineer Notes: {engineer_notes}")
-
     return " | ".join(parts) or "Worksheet submitted"
 
 
@@ -5758,8 +5740,6 @@ def build_engineer_comments_for_pdf(visits, worksheet, fields):
             comments += f"\n\nFollow-on Required: Yes\n{worksheet.get('FollowOnNotes', '')}"
         else:
             comments += "\n\nFollow-on Required: No"
-        if worksheet.get("EngineerCompletionNotes") and str(worksheet.get("EngineerCompletionNotes")).strip().lower() != "none":
-            comments += f"\n\nEngineer Notes: {worksheet.get('EngineerCompletionNotes')}"
         return comments
 
     return "\n\n".join(comment_blocks)
@@ -6150,7 +6130,6 @@ def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_fi
         "MaterialsUsed": worksheet.get("MaterialsUsed", ""),
         "FollowOnRequired": worksheet.get("FollowOnRequired", False),
         "FollowOnNotes": worksheet.get("FollowOnNotes", ""),
-        "EngineerCompletionNotes": worksheet.get("EngineerCompletionNotes", ""),
         "WorksheetSubmitted": True,
         "EngineerVisitLog": updated_log,
         "ClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
@@ -6203,7 +6182,6 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worksheet["MaterialsUsed"] = ""
         worksheet["FollowOnRequired"] = False
         worksheet["FollowOnNotes"] = ""
-        worksheet["EngineerCompletionNotes"] = ""
         worksheet["photo_links"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
@@ -6341,7 +6319,6 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         worksheet["MaterialsUsed"] = ""
         worksheet["FollowOnRequired"] = False
         worksheet["FollowOnNotes"] = ""
-        worksheet["EngineerCompletionNotes"] = ""
         worksheet["photo_links"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
@@ -6652,7 +6629,6 @@ worksheet_handler = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_required),
         ],
         FOLLOW_ON_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_notes)],
-        ENGINEER_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_engineer_notes)],
         PHOTOS: [
             MessageHandler(filters.PHOTO, worksheet_photos),
             MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_photos),
