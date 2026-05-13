@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "admin-only-menu-switch-v1"
+BUILD_VERSION = "helpdesk-bugtab-abort-job-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -146,6 +146,8 @@ DELETEJOB_CONFIRM = 58
 RECEIPT_ENGINEER_NAME = 59
 RECEIPT_DATE = 60
 RECEIPT_UPLOADS = 61
+ABORTJOB_REASON = 62
+ABORTJOB_NOTES = 63
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -491,7 +493,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
         [MENU_CANCEL_JOB],
-        [MENU_UPLOAD_RECEIPTS],
+        [MENU_BUG_IDEA, MENU_UPLOAD_RECEIPTS],
     ]
 
     if include_engineer_menu:
@@ -1356,6 +1358,15 @@ NO_ACCESS_REASONS = {
     "other": "Other / see notes",
 }
 
+ABORT_REASONS = {
+    "assigned_elsewhere": "Assigned to another job",
+    "cannot_attend": "Cannot attend today",
+    "ran_out_of_time": "Ran out of time",
+    "wrong_engineer": "Wrong engineer / skillset",
+    "vehicle_issue": "Vehicle issue",
+    "other": "Other reason",
+}
+
 
 def get_no_access_reason_keyboard(item_id):
     return InlineKeyboardMarkup([
@@ -1366,6 +1377,18 @@ def get_no_access_reason_keyboard(item_id):
         [InlineKeyboardButton("🚫 Access refused", callback_data=f"noaccess_reason|{item_id}|access_refused")],
         [InlineKeyboardButton("🚗 Parking / access issue", callback_data=f"noaccess_reason|{item_id}|parking_access_issue")],
         [InlineKeyboardButton("📝 Other / see notes", callback_data=f"noaccess_reason|{item_id}|other")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_outcome|{item_id}")],
+    ])
+
+
+def get_abort_reason_keyboard(item_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📌 Assigned elsewhere", callback_data=f"abort_reason|{item_id}|assigned_elsewhere")],
+        [InlineKeyboardButton("📅 Cannot attend today", callback_data=f"abort_reason|{item_id}|cannot_attend")],
+        [InlineKeyboardButton("⏱ Ran out of time", callback_data=f"abort_reason|{item_id}|ran_out_of_time")],
+        [InlineKeyboardButton("🛠 Wrong engineer / skillset", callback_data=f"abort_reason|{item_id}|wrong_engineer")],
+        [InlineKeyboardButton("🚐 Vehicle issue", callback_data=f"abort_reason|{item_id}|vehicle_issue")],
+        [InlineKeyboardButton("📝 Other reason", callback_data=f"abort_reason|{item_id}|other")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_outcome|{item_id}")],
     ])
 
@@ -1386,6 +1409,9 @@ def get_job_buttons(item_id, address=None):
         ],
         [
             InlineKeyboardButton("🚫 No Access", callback_data=f"noaccess|{item_id}"),
+        ],
+        [
+            InlineKeyboardButton("⏹ Abort Attendance", callback_data=f"abort_job|{item_id}"),
         ],
     ]
 
@@ -4533,6 +4559,182 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def get_engineer_job_for_callback(query, require_active_day=True):
+    site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+    engineers_by_telegram, _ = build_engineer_maps(engineers)
+
+    user_id = str(query.from_user.id)
+    current_engineer = engineers_by_telegram.get(user_id)
+
+    if not current_engineer:
+        await query.message.reply_text("You are not set up as an engineer.")
+        return None
+
+    if require_active_day and not engineer_has_active_day(site_id, user_id):
+        await query.message.reply_text(
+            "Please start your day first using 🟢 Start Day or /startday. Job buttons are locked until your day has started."
+        )
+        return None
+
+    return site_id, jobs_list_id, jobs_data, current_engineer, user_id
+
+
+async def abort_job_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        parts = query.data.split("|")
+        item_id = parts[1]
+
+        lookup = await get_engineer_job_for_callback(query, require_active_day=True)
+        if not lookup:
+            return ConversationHandler.END
+
+        site_id, jobs_list_id, jobs_data, current_engineer, user_id = lookup
+        job = find_job_by_item_id(jobs_data, item_id)
+
+        if not job:
+            await query.message.reply_text("Could not find this job.")
+            return ConversationHandler.END
+
+        fields = job.get("fields", {})
+
+        if is_closed_job(fields):
+            await query.message.reply_text(
+                "This job has already been closed or returned to the office. No further action is required."
+            )
+            return ConversationHandler.END
+
+        if current_engineer["lookup_id"] not in get_assigned_engineer_ids(fields):
+            await query.message.reply_text("You are not assigned to this job.")
+            return ConversationHandler.END
+
+        context.user_data["abort_job"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "item_id": item_id,
+            "fields": fields,
+            "engineer_name": current_engineer["name"],
+            "engineer_lookup_id": current_engineer["lookup_id"],
+            "user_id": user_id,
+        }
+
+        await query.message.reply_text(
+            "Why are you aborting attendance on this job?\n\n"
+            "This is for cases where you did not attend / cannot attend, and the job needs sending back for reassignment.",
+            reply_markup=get_abort_reason_keyboard(item_id),
+        )
+        return ABORTJOB_REASON
+
+    except Exception as e:
+        print(f"ERROR starting abort job: {e}")
+        await query.message.reply_text("There was an error starting the abort job flow. Please ask the office to check Railway logs.")
+        return ConversationHandler.END
+
+
+async def abort_job_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split("|")
+    reason_key = data[2] if len(data) > 2 else "other"
+    reason = ABORT_REASONS.get(reason_key, "Other reason")
+
+    abort_job = context.user_data.get("abort_job")
+    if not abort_job:
+        await query.message.reply_text("Abort job session expired. Please try again from the job button.")
+        return ConversationHandler.END
+
+    abort_job["reason"] = reason
+
+    await query.message.reply_text(
+        f"Abort reason selected: {reason}\n\n"
+        "Add a few lines explaining why, or type SKIP to submit with this reason only.\n\n"
+        "Type /cancel to cancel without changing the job."
+    )
+    return ABORTJOB_NOTES
+
+
+async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    abort_job = context.user_data.get("abort_job")
+
+    if not abort_job:
+        await update.message.reply_text("Abort job session expired. Please try again from the job button.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    notes = update.message.text.strip()
+    if notes.lower() in ["skip", "none", "n/a", "na"]:
+        notes = ""
+
+    try:
+        site_id = abort_job["site_id"]
+        jobs_list_id = abort_job["jobs_list_id"]
+        item_id = abort_job["item_id"]
+        fields = abort_job["fields"]
+        engineer_name = abort_job["engineer_name"]
+        engineer_lookup_id = abort_job["engineer_lookup_id"]
+        reason = abort_job.get("reason", "Other reason")
+
+        extra = reason
+        if notes:
+            extra += f" | Notes: {notes}"
+
+        updated_log = append_engineer_log(fields, engineer_name, "Aborted Attendance", extra)
+        assigned_ids = get_assigned_engineer_ids(fields)
+        is_final_engineer = len(assigned_ids) <= 1
+
+        update_fields = {
+            "EngineerVisitLog": updated_log,
+            "TelegramNotified": False,
+            "WorksheetSubmitted": False,
+        }
+
+        if is_final_engineer:
+            update_fields["Status"] = AWAITING_DEPLOYMENT_STATUS
+            update_fields["JobOutcome"] = "Aborted by Engineer"
+            update_fields.update(clear_engineer_assignment_payload())
+        else:
+            update_fields.update(remove_current_engineer_assignment_payload(fields, engineer_lookup_id))
+
+        update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+        update_active_day_live_status(site_id, abort_job["user_id"], "Aborted Attendance", get_job_reference(fields))
+
+        await update.message.reply_text(
+            f"Attendance aborted and sent back for reassignment.\n\n"
+            f"CDR Number: {fields.get('CDRNumber', '')}\n"
+            f"Reason: {reason}",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+
+        await notify_helpdesk(
+            context,
+            (
+                f"Job aborted by engineer\n\n"
+                f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                f"Engineer: {engineer_name}\n"
+                f"Site: {fields.get('SiteName', '')}\n"
+                f"Reason: {reason}\n"
+                f"Notes: {notes or 'None'}\n\n"
+                "Job has been returned for reassignment."
+            ),
+        )
+
+    except Exception as e:
+        print(f"ERROR aborting job: {e}")
+        await update.message.reply_text("There was an error aborting this job. Please ask the office to check Railway logs.", reply_markup=get_main_menu(await get_role_for_update(update)))
+    finally:
+        context.user_data.pop("abort_job", None)
+
+    return ConversationHandler.END
+
+
+async def abort_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("abort_job", None)
+    await update.message.reply_text("Abort job cancelled. No changes made.", reply_markup=get_main_menu(await get_role_for_update(update)))
+    return ConversationHandler.END
+
+
 async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -4576,6 +4778,10 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if current_engineer["lookup_id"] not in assigned_ids:
             await query.message.reply_text("You are not assigned to this job.")
+            return
+
+        if action == "abort_job":
+            await query.message.reply_text("Opening abort job flow. If nothing happens, tap the Abort Attendance button again.")
             return
 
         if action == "complete_help":
@@ -6424,6 +6630,18 @@ logjob_handler = ConversationHandler(
     fallbacks=[CommandHandler("cancel", logjob_cancel)],
 )
 
+abortjob_handler = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(abort_job_start, pattern="^abort_job\\|"),
+    ],
+    states={
+        ABORTJOB_REASON: [CallbackQueryHandler(abort_job_reason, pattern="^abort_reason\\|")],
+        ABORTJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, abort_job_notes)],
+    },
+    fallbacks=[CommandHandler("cancel", abort_job_cancel)],
+)
+
+
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
@@ -6439,6 +6657,7 @@ telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
+telegram_app.add_handler(abortjob_handler)
 telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
