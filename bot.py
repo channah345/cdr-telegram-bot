@@ -49,9 +49,8 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
-QUOTE_REMINDER_CHAT_ID = os.getenv("QUOTE_REMINDER_CHAT_ID") or os.getenv("OPERATIONS_DIRECTOR_TELEGRAM_ID") or HELPDESK_CHAT_ID
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "unassigned-jobs-quote-reminder-v2"
+BUILD_VERSION = "unassigned-jobs-quote-menu-bugfix-v3"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -3387,9 +3386,7 @@ def format_helpdesk_job_detail(job, engineers):
         "Job details:\n\n"
         f"CDR Number: {get_field_value(fields, 'CDRNumber', 'CDR Number', 'Title') or ''}\n"
         f"Customer: {customer_detail}\n"
-        f"{customer_address_line}"
         f"Site: {site_detail}\n"
-        f"{address_line}"
         f"Date: {format_sharepoint_date(get_field_value(fields, 'Date') or '')}\n"
         f"Time: {get_field_value(fields, 'StartTime', 'Start Time') or ''}\n"
         f"Status: {get_field_value(fields, 'Status') or ''}\n"
