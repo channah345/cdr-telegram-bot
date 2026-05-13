@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "receipt-upload-silent-userlocked-fix-v1"
+BUILD_VERSION = "bot-site-first-logjob-v2"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2853,8 +2853,10 @@ async def logjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return LOGJOB_CDR_NUMBER
 
     job["cdr_number"] = value
-    await update.message.reply_text("Customer name?\n\nExample: Cleveland Fire Brigade")
-    return LOGJOB_CUSTOMER_NAME
+    await update.message.reply_text(
+        "Site name?\n\nExample: Stockton Fire Station, HQ, or St Peters School"
+    )
+    return LOGJOB_SITE_NAME
 
 
 async def logjob_customer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2875,8 +2877,8 @@ async def logjob_customer_address(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Please enter the customer address. This appears on the worksheet.")
         return LOGJOB_CUSTOMER_ADDRESS
     job["customer_address"] = value
-    await update.message.reply_text("Site name?\n\nExample: Headquarters")
-    return LOGJOB_SITE_NAME
+    await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
+    return LOGJOB_SITE_ADDRESS
 
 
 async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2893,11 +2895,20 @@ async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candidate = find_best_site_candidate(job["site_id"], job["jobs_list_id"], value)
     if candidate:
         job["site_candidate"] = candidate
-        await update.message.reply_text(format_site_candidate(candidate))
+        await update.message.reply_text(
+            format_site_candidate(candidate),
+            reply_markup=ReplyKeyboardMarkup(
+                [["YES", "EDIT", "NO"]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
+        )
         return LOGJOB_SITE_CONFIRM
 
-    await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
-    return LOGJOB_SITE_ADDRESS
+    await update.message.reply_text(
+        "No saved site was found. I’ll enter it manually.\n\nCustomer name?\n\nExample: Cleveland Fire Brigade"
+    )
+    return LOGJOB_CUSTOMER_NAME
 
 
 async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2912,23 +2923,36 @@ async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     if answer in ["yes", "y", "use", "use it", "correct"]:
         job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
         job["site_address"] = candidate.get("address", "")
-        if candidate.get("notes"):
-            job["site_notes"] = candidate.get("notes", "")
-        await update.message.reply_text(prompt_for_site_notes(candidate.get("notes", "")))
-        return LOGJOB_SITE_NOTES
+        job["customer_name"] = candidate.get("customer_name", "")
+        job["customer_address"] = candidate.get("customer_address", "")
+        job["site_notes"] = candidate.get("notes", "")
+        await update.message.reply_text(
+            "Saved site details used.\n\nContact name/number?\n\nType N/A if there is no contact.",
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return LOGJOB_CONTACT
 
     if answer in ["edit", "change", "amend", "wrong address"]:
+        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
+        job["customer_name"] = candidate.get("customer_name", "")
+        job["customer_address"] = candidate.get("customer_address", "")
+        job["site_notes"] = candidate.get("notes", "")
+        job["skip_site_notes_after_address"] = True
         await update.message.reply_text(
             "Enter the correct site address.\n\n"
-            "This will be used for the job and saved back to the Sites list."
+            "This will be used for the job and saved back to the Sites list.",
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
         )
         return LOGJOB_SITE_ADDRESS
 
     if answer in ["no", "n", "manual", "enter manually"]:
         job.pop("site_candidate", None)
         job.pop("site_notes", None)
-        await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
-        return LOGJOB_SITE_ADDRESS
+        await update.message.reply_text(
+            "Manual entry selected.\n\nCustomer name?\n\nExample: Cleveland Fire Brigade",
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return LOGJOB_CUSTOMER_NAME
 
     await update.message.reply_text("Reply YES to use it, EDIT to change the address, or NO to enter manually.")
     return LOGJOB_SITE_CONFIRM
@@ -2941,6 +2965,10 @@ async def logjob_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Please enter the site address.")
         return LOGJOB_SITE_ADDRESS
     job["site_address"] = value
+
+    if job.pop("skip_site_notes_after_address", False):
+        await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
+        return LOGJOB_CONTACT
 
     existing_notes = (job.get("site_candidate") or {}).get("notes", "")
     await update.message.reply_text(prompt_for_site_notes(existing_notes))
