@@ -52,7 +52,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "start-end-reminders-photo-albums-fix-v1"
+BUILD_VERSION = "group-inbound-lockdown-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -185,6 +185,10 @@ web_app = FastAPI()
 
 def is_group_chat(update):
     return update.effective_chat and update.effective_chat.type != "private"
+
+
+def is_private_chat(update):
+    return update.effective_chat and update.effective_chat.type == "private"
 
 
 def get_headers(content_type=True):
@@ -2096,6 +2100,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         user_id = str(update.effective_user.id)
         site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
@@ -2146,6 +2153,9 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_CONFIRM)
     if menu_result is not None:
         return menu_result
@@ -2166,6 +2176,9 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -2181,6 +2194,9 @@ async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_VAN_REG)
     if menu_result is not None:
         return menu_result
@@ -2317,6 +2333,9 @@ def create_start_day_log(start_day, van_check_completed=False):
 
 
 async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_START_MILEAGE)
     if menu_result is not None:
         return menu_result
@@ -2367,6 +2386,9 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_VAN_CHECK)
     if menu_result is not None:
         return menu_result
@@ -2407,6 +2429,9 @@ async def startday_van_check(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, START_DAY_VAN_PHOTOS)
     if menu_result is not None:
         return menu_result
@@ -2477,6 +2502,9 @@ async def startday_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         user_id = str(update.effective_user.id)
         site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
@@ -2534,6 +2562,9 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, END_DAY_CONFIRM)
     if menu_result is not None:
         return menu_result
@@ -2557,6 +2588,9 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -2575,6 +2609,9 @@ async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, END_DAY_MILEAGE)
     if menu_result is not None:
         return menu_result
@@ -2687,12 +2724,18 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def endday_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     context.user_data.pop("end_day", None)
     await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
 
 
 async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         user_id = str(update.effective_user.id)
         site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
@@ -2757,6 +2800,9 @@ def get_active_helpdesk_users(engineers):
 
 
 async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return
+
     """Engineer one-tap request for another job.
 
     This does not start a conversation and does not change any SharePoint job.
@@ -2831,6 +2877,9 @@ async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     text = update.message.text
 
     if text == MENU_START_DAY:
@@ -2860,6 +2909,9 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def helpdesk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if not user_can_use_helpdesk(role):
@@ -2876,6 +2928,9 @@ async def helpdesk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     text = update.message.text
 
@@ -2955,6 +3010,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if not user_can_use_helpdesk(role):
@@ -3001,6 +3059,9 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     if not job:
         await update.message.reply_text("Please start again using ➕ Log Job.")
@@ -3024,6 +3085,9 @@ async def logjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_customer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -3046,11 +3110,17 @@ async def logjob_customer_name(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def logjob_customer_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     # Legacy state retained for safety only. New Log Job flow no longer asks this separately.
     return await logjob_site_name(update, context)
 
 
 async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -3069,6 +3139,9 @@ async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     job["contact"] = "" if is_blank_or_skip(value) else value
@@ -3077,6 +3150,9 @@ async def logjob_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -3091,6 +3167,9 @@ async def logjob_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     job["notes"] = "" if is_blank_or_skip(value) else value
@@ -3102,6 +3181,9 @@ async def logjob_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     if update.message.text.strip().lower() == "custom":
         await update.message.reply_text("Enter the date as DD/MM/YYYY.")
@@ -3127,6 +3209,9 @@ async def logjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     if update.message.text.strip().lower() == "custom":
         await update.message.reply_text("Enter the time as HH:MM, for example 13:30.")
@@ -3149,6 +3234,9 @@ async def logjob_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     text = update.message.text.strip()
 
@@ -3180,6 +3268,9 @@ async def logjob_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_order_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     job["order_number"] = "" if is_blank_or_skip(value) else value
@@ -3194,6 +3285,9 @@ async def logjob_order_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     engineers = job.get("assignable_engineers", [])
     text = update.message.text.strip()
@@ -3217,6 +3311,9 @@ async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     job = context.user_data.get("log_job")
     role = job.get("role", "Helpdesk") if job else "Helpdesk"
     answer = update.message.text.strip().lower()
@@ -3308,6 +3405,9 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     context.user_data.pop("log_job", None)
     await update.message.reply_text(
@@ -3318,6 +3418,9 @@ async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reassign_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         role = await get_role_for_update(update)
         if not user_can_use_helpdesk(role):
@@ -3359,6 +3462,9 @@ async def reassign_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reassign_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("reassign_job")
     if not data:
         await update.message.reply_text("Please start again using 🔁 Reassign Job.")
@@ -3409,6 +3515,9 @@ async def reassign_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def reassign_remove_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("reassign_job")
     if not data:
         await update.message.reply_text("Please start again using 🔁 Reassign Job.")
@@ -3430,6 +3539,9 @@ async def reassign_remove_engineers(update: Update, context: ContextTypes.DEFAUL
 
 
 async def reassign_assign_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("reassign_job")
     if not data:
         await update.message.reply_text("Please start again using 🔁 Reassign Job.")
@@ -3467,6 +3579,9 @@ async def reassign_assign_engineers(update: Update, context: ContextTypes.DEFAUL
 
 
 async def reassign_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("reassign_job")
     if not data:
         await update.message.reply_text("Please start again using 🔁 Reassign Job.")
@@ -3479,6 +3594,9 @@ async def reassign_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("reassign_job")
     role = data.get("role", "Helpdesk") if data else "Helpdesk"
     answer = update.message.text.strip().lower()
@@ -3585,6 +3703,9 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reassign_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     context.user_data.pop("reassign_job", None)
     await update.message.reply_text(
@@ -3862,6 +3983,9 @@ def format_openjobs_results(jobs, filter_key, engineers, max_rows=20):
 
 
 async def openjobs_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if not user_can_use_helpdesk(role):
@@ -3900,6 +4024,9 @@ async def openjobs_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def openjobs_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("open_jobs")
     if not data:
         await update.message.reply_text("Please start again using 📋 Open Jobs.")
@@ -3926,6 +4053,9 @@ async def openjobs_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def openjobs_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("open_jobs")
     if not data:
         await update.message.reply_text("Please start again using 📋 Open Jobs.")
@@ -3957,6 +4087,9 @@ async def openjobs_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def openjobs_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     context.user_data.pop("open_jobs", None)
     await update.message.reply_text(
@@ -3970,6 +4103,9 @@ async def openjobs_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def canceljob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if not user_can_use_helpdesk(role):
@@ -3989,6 +4125,9 @@ async def canceljob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def canceljob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("cancel_job") or {}
     cdr_number = update.message.text.strip()
 
@@ -4033,6 +4172,9 @@ async def canceljob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def canceljob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("cancel_job") or {}
     role = data.get("role") or await get_role_for_update(update)
     answer = update.message.text.strip().lower()
@@ -4090,6 +4232,9 @@ async def canceljob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def canceljob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     context.user_data.pop("cancel_job", None)
     await update.message.reply_text(
@@ -4100,6 +4245,9 @@ async def canceljob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deletejob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if str(role).lower() != "admin":
@@ -4120,6 +4268,9 @@ async def deletejob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deletejob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("delete_job") or {}
     cdr_number = update.message.text.strip()
 
@@ -4169,6 +4320,9 @@ async def deletejob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def deletejob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("delete_job") or {}
     answer = update.message.text.strip()
     cdr_number = str(data.get("cdr_number", "")).strip()
@@ -4207,6 +4361,9 @@ async def deletejob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deletejob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     context.user_data.pop("delete_job", None)
     await update.message.reply_text(
         "Hard Delete stopped. Nothing has been changed.",
@@ -4216,6 +4373,9 @@ async def deletejob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if not user_can_use_helpdesk(role):
@@ -4254,6 +4414,9 @@ async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def findjob_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("find_job")
     if not data:
         await update.message.reply_text("Please start again using 🔎 Find Job.")
@@ -4295,6 +4458,9 @@ async def findjob_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def findjob_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     data = context.user_data.get("find_job")
     if not data:
         await update.message.reply_text("Please start again using 🔎 Find Job.")
@@ -4326,6 +4492,9 @@ async def findjob_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def findjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     context.user_data.pop("find_job", None)
     await update.message.reply_text(
@@ -4378,6 +4547,9 @@ async def handle_menu_during_conversation(update: Update, context: ContextTypes.
 
 
 async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         user_id = str(update.effective_user.id)
         site_id, _, engineers, current_engineer = get_engineer_for_telegram_id(user_id)
@@ -4413,6 +4585,9 @@ async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, BUG_IDEA_TEXT)
     if menu_result is not None:
         return menu_result
@@ -4476,6 +4651,9 @@ async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def bugidea_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     context.user_data.pop("bug_idea", None)
     await update.message.reply_text("Bug/idea cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
@@ -4492,6 +4670,9 @@ def get_receipt_type_keyboard():
 
 
 async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         site_id = get_site_id()
         user_id = str(update.effective_user.id)
@@ -4539,6 +4720,9 @@ async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receipt_type_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -4568,6 +4752,9 @@ async def receipt_type_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, RECEIPT_DATE)
     if menu_result is not None:
         return menu_result
@@ -4593,6 +4780,9 @@ async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, RECEIPT_UPLOADS)
     if menu_result is not None:
         return menu_result
@@ -4680,10 +4870,16 @@ async def receipt_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     await update.message.reply_text(f"Your Telegram ID is: {update.effective_user.id}")
 
 
 async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     try:
         user_id = str(update.effective_user.id)
         today = datetime.now(UK_TZ).date()
@@ -4761,6 +4957,9 @@ async def get_engineer_job_for_callback(query, require_active_day=True):
 
 
 async def abort_job_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -4815,6 +5014,9 @@ async def abort_job_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def abort_job_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -4838,6 +5040,9 @@ async def abort_job_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     abort_job = context.user_data.get("abort_job")
 
     if not abort_job:
@@ -4911,12 +5116,18 @@ async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def abort_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     context.user_data.pop("abort_job", None)
     await update.message.reply_text("Abort job cancelled. No changes made.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
 
 
 async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -5315,6 +5526,9 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -5328,6 +5542,9 @@ async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def noaccess_reason_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     """Conversation entry point after an engineer chooses a No Access reason.
 
     This must be an entry point on the worksheet ConversationHandler; otherwise
@@ -5354,6 +5571,9 @@ async def noaccess_reason_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     if not context.args:
         await update.message.reply_text(
             "Use 📋 My Jobs, then tap Complete, Revisit or No Access on the job card.\n\n"
@@ -5370,6 +5590,9 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, WORK_COMPLETED)
     if menu_result is not None:
         return menu_result
@@ -5384,6 +5607,9 @@ async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT
 
 
 async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, MATERIALS_USED)
     if menu_result is not None:
         return menu_result
@@ -5401,6 +5627,9 @@ async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT
 
 
 async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, FOLLOW_ON_REQUIRED)
     if menu_result is not None:
         return menu_result
@@ -5428,6 +5657,9 @@ async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEF
 
 
 async def worksheet_follow_on_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -5454,6 +5686,9 @@ async def worksheet_follow_on_required_button(update: Update, context: ContextTy
 
 
 async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, FOLLOW_ON_NOTES)
     if menu_result is not None:
         return menu_result
@@ -5472,6 +5707,9 @@ async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAUL
 
 
 async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, PHOTOS)
     if menu_result is not None:
         return menu_result
@@ -5515,6 +5753,9 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def worksheet_signature_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, SIGNATURE_REQUIRED)
     if menu_result is not None:
         return menu_result
@@ -5566,6 +5807,9 @@ async def worksheet_signature_required(update: Update, context: ContextTypes.DEF
 
 
 async def worksheet_signature_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -5615,6 +5859,9 @@ async def worksheet_signature_required_button(update: Update, context: ContextTy
 
 
 async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, SIGNATURE_WAITING)
     if menu_result is not None:
         return menu_result
@@ -5665,6 +5912,9 @@ async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFA
 
 
 async def worksheet_signature_waiting_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -6221,6 +6471,9 @@ def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_fi
     return fields_to_update
 
 async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     menu_result = await handle_menu_during_conversation(update, context, REVIEW)
     if menu_result is not None:
         return menu_result
@@ -6356,6 +6609,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -6493,6 +6749,9 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     context.user_data.pop("worksheet", None)
     await update.message.reply_text("Worksheet cancelled. Nothing has been submitted.")
     return ConversationHandler.END
@@ -6690,14 +6949,14 @@ startday_handler = ConversationHandler(
     states={
         START_DAY_CONFIRM: [
             CallbackQueryHandler(startday_confirm_button, pattern=r"^startday_confirm\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, startday_confirm),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, startday_confirm),
         ],
-        START_DAY_VAN_REG: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_reg)],
-        START_DAY_START_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_start_mileage)],
-        START_DAY_VAN_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_check)],
+        START_DAY_VAN_REG: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, startday_van_reg)],
+        START_DAY_START_MILEAGE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, startday_start_mileage)],
+        START_DAY_VAN_CHECK: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, startday_van_check)],
         START_DAY_VAN_PHOTOS: [
-            MessageHandler(filters.PHOTO, startday_van_photos),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, startday_van_photos),
+            MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, startday_van_photos),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, startday_van_photos),
         ],
     },
     fallbacks=[CommandHandler("cancel", startday_cancel)],
@@ -6711,9 +6970,9 @@ endday_handler = ConversationHandler(
     states={
         END_DAY_CONFIRM: [
             CallbackQueryHandler(endday_confirm_button, pattern=r"^endday_confirm\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, endday_confirm),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, endday_confirm),
         ],
-        END_DAY_MILEAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, endday_mileage)],
+        END_DAY_MILEAGE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, endday_mileage)],
     },
     fallbacks=[CommandHandler("cancel", endday_cancel)],
 )
@@ -6726,28 +6985,28 @@ worksheet_handler = ConversationHandler(
         CommandHandler("complete", complete_start),
     ],
     states={
-        WORK_COMPLETED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_work_completed)],
-        MATERIALS_USED: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_materials_used)],
+        WORK_COMPLETED: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_work_completed)],
+        MATERIALS_USED: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_materials_used)],
         FOLLOW_ON_REQUIRED: [
             CallbackQueryHandler(worksheet_follow_on_required_button, pattern=r"^follow_on_required\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_required),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_follow_on_required),
         ],
-        FOLLOW_ON_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_follow_on_notes)],
+        FOLLOW_ON_NOTES: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_follow_on_notes)],
         PHOTOS: [
-            MessageHandler(filters.PHOTO, worksheet_photos),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_photos),
+            MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, worksheet_photos),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_photos),
         ],
         SIGNATURE_REQUIRED: [
             CallbackQueryHandler(worksheet_signature_required_button, pattern=r"^signature_required\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_required),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_signature_required),
         ],
         SIGNATURE_WAITING: [
             CallbackQueryHandler(worksheet_signature_waiting_button, pattern=r"^signature_waiting\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_signature_waiting),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_signature_waiting),
         ],
         REVIEW: [
             CallbackQueryHandler(worksheet_review_button, pattern=r"^review\|"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, worksheet_review),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_review),
         ],
     },
     fallbacks=[CommandHandler("cancel", worksheet_cancel)],
@@ -6760,7 +7019,7 @@ bugidea_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{MENU_BUG_IDEA}$"), bugidea_start),
     ],
     states={
-        BUG_IDEA_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bugidea_text)],
+        BUG_IDEA_TEXT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, bugidea_text)],
     },
     fallbacks=[CommandHandler("cancel", bugidea_cancel)],
 )
@@ -6773,11 +7032,11 @@ reassign_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_REASSIGN_JOB)}$"), reassign_start),
     ],
     states={
-        REASSIGN_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_cdr_number)],
-        REASSIGN_REMOVE_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_remove_engineers)],
-        REASSIGN_ASSIGN_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_assign_engineers)],
-        REASSIGN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_reason)],
-        REASSIGN_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reassign_review)],
+        REASSIGN_CDR_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_cdr_number)],
+        REASSIGN_REMOVE_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_remove_engineers)],
+        REASSIGN_ASSIGN_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_assign_engineers)],
+        REASSIGN_REASON: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_reason)],
+        REASSIGN_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_review)],
     },
     fallbacks=[CommandHandler("cancel", reassign_cancel)],
 )
@@ -6789,8 +7048,8 @@ openjobs_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_OPEN_JOBS)}$"), openjobs_start),
     ],
     states={
-        OPENJOBS_FILTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, openjobs_filter)],
-        OPENJOBS_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, openjobs_select)],
+        OPENJOBS_FILTER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, openjobs_filter)],
+        OPENJOBS_SELECT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, openjobs_select)],
     },
     fallbacks=[CommandHandler("cancel", openjobs_cancel)],
 )
@@ -6803,8 +7062,8 @@ canceljob_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_CANCEL_JOB)}$"), canceljob_start),
     ],
     states={
-        CANCELJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, canceljob_cdr_number)],
-        CANCELJOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, canceljob_confirm)],
+        CANCELJOB_CDR_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, canceljob_cdr_number)],
+        CANCELJOB_CONFIRM: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, canceljob_confirm)],
     },
     fallbacks=[CommandHandler("cancel", canceljob_cancel)],
 )
@@ -6816,8 +7075,8 @@ deletejob_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_DELETE_JOB)}$"), deletejob_start),
     ],
     states={
-        DELETEJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, deletejob_cdr_number)],
-        DELETEJOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, deletejob_confirm)],
+        DELETEJOB_CDR_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, deletejob_cdr_number)],
+        DELETEJOB_CONFIRM: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, deletejob_confirm)],
     },
     fallbacks=[CommandHandler("cancel", deletejob_cancel)],
 )
@@ -6832,7 +7091,7 @@ receipt_handler = ConversationHandler(
     ],
     states={
         RECEIPT_TYPE: [CallbackQueryHandler(receipt_type_button, pattern=r"^receipt_type\|")],
-        RECEIPT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_date)],
+        RECEIPT_DATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, receipt_date)],
         RECEIPT_UPLOADS: [MessageHandler((filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND)), receipt_uploads)],
     },
     fallbacks=[CommandHandler("cancel", receipt_cancel)],
@@ -6845,8 +7104,8 @@ findjob_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_FIND_JOB)}$"), findjob_start),
     ],
     states={
-        FINDJOB_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, findjob_search)],
-        FINDJOB_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, findjob_select)],
+        FINDJOB_SEARCH: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, findjob_search)],
+        FINDJOB_SELECT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, findjob_select)],
     },
     fallbacks=[CommandHandler("cancel", findjob_cancel)],
 )
@@ -6894,6 +7153,9 @@ def parse_quote_recipient_selection(text, recipients):
 
 
 async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
 
     if not user_can_use_helpdesk(role):
@@ -6931,6 +7193,9 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     reminder = context.user_data.get("quote_reminder")
     if not reminder:
         return await quote_reminder_start(update, context)
@@ -6946,6 +7211,9 @@ async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT
 
 
 async def quote_reminder_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -6958,6 +7226,9 @@ async def quote_reminder_client(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def quote_reminder_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -6970,6 +7241,9 @@ async def quote_reminder_address(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -6982,6 +7256,9 @@ async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def quote_reminder_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
@@ -7024,6 +7301,9 @@ async def send_quote_reminder(bot, chat_id, reminder):
 
 
 async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     reminder = context.user_data.get("quote_reminder")
     role = reminder.get("role", "Helpdesk") if reminder else "Helpdesk"
     answer = update.message.text.strip().lower()
@@ -7070,6 +7350,9 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def quote_reminder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
     role = await get_role_for_update(update)
     context.user_data.pop("quote_reminder", None)
     await update.message.reply_text(
@@ -7085,18 +7368,18 @@ logjob_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_LOG_JOB)}$"), logjob_start),
     ],
     states={
-        LOGJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_cdr_number)],
-        LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
-        LOGJOB_SITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_name)],
-        LOGJOB_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_contact)],
-        LOGJOB_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_task)],
-        LOGJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_notes)],
-        LOGJOB_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_date)],
-        LOGJOB_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_time)],
-        LOGJOB_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_category)],
-        LOGJOB_ORDER_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_order_number)],
-        LOGJOB_ASSIGN_ENGINEERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_assign_engineers)],
-        LOGJOB_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_review)],
+        LOGJOB_CDR_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_cdr_number)],
+        LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
+        LOGJOB_SITE_NAME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_site_name)],
+        LOGJOB_CONTACT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_contact)],
+        LOGJOB_TASK: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_task)],
+        LOGJOB_NOTES: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_notes)],
+        LOGJOB_DATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_date)],
+        LOGJOB_TIME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_time)],
+        LOGJOB_CATEGORY: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_category)],
+        LOGJOB_ORDER_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_order_number)],
+        LOGJOB_ASSIGN_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_assign_engineers)],
+        LOGJOB_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, logjob_review)],
     },
     fallbacks=[CommandHandler("cancel", logjob_cancel)],
 )
@@ -7107,12 +7390,12 @@ quote_reminder_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_QUOTE_REMINDER)}$"), quote_reminder_start),
     ],
     states={
-        QUOTE_RECIPIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_recipient)],
-        QUOTE_CLIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_client)],
-        QUOTE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_address)],
-        QUOTE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_time)],
-        QUOTE_SCOPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_scope)],
-        QUOTE_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_review)],
+        QUOTE_RECIPIENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_recipient)],
+        QUOTE_CLIENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_client)],
+        QUOTE_ADDRESS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_address)],
+        QUOTE_TIME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_time)],
+        QUOTE_SCOPE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_scope)],
+        QUOTE_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_review)],
     },
     fallbacks=[CommandHandler("cancel", quote_reminder_cancel)],
 )
@@ -7124,7 +7407,7 @@ abortjob_handler = ConversationHandler(
     ],
     states={
         ABORTJOB_REASON: [CallbackQueryHandler(abort_job_reason, pattern="^abort_reason\\|")],
-        ABORTJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, abort_job_notes)],
+        ABORTJOB_NOTES: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, abort_job_notes)],
     },
     fallbacks=[CommandHandler("cancel", abort_job_cancel)],
 )
