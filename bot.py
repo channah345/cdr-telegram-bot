@@ -50,14 +50,13 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "logjob-simplified-worksheet-abort-fix-v1"
+BUILD_VERSION = "ux-buttons-no-address-fields-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 DAY_LOGS_LIST = "Engineer Day Logs"
 BUG_IDEAS_LIST = "Bug Ideas"
 BOT_USERS_LIST = "Bot Users"
-SITES_LIST = "Sites"
 
 
 PHOTO_LIBRARY = "Documents"
@@ -599,198 +598,41 @@ JOB_CATEGORY_CHOICES = [
 
 
 def is_blank_or_skip(value):
-    return str(value or "").strip().lower() in ["", "skip", "none", "n/a", "na"]
+    return str(value or "").strip().lower() in ["", "skip", "none", "n/a", "na", "⏭️ skip", "n/a"]
 
 
-def normalise_site_lookup_text(value):
-    """Normalise site names for forgiving matching without being too clever."""
-    text = str(value or "").strip().lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
+def get_skip_keyboard():
+    return ReplyKeyboardMarkup([["⏭️ Skip"]], resize_keyboard=True, one_time_keyboard=False)
 
 
-def site_match_score(search_text, candidate_text):
-    search = normalise_site_lookup_text(search_text)
-    candidate = normalise_site_lookup_text(candidate_text)
-
-    if not search or not candidate:
-        return 0
-
-    if search == candidate:
-        return 100
-
-    if search in candidate or candidate in search:
-        return 90
-
-    search_words = set(search.split())
-    candidate_words = set(candidate.split())
-    if search_words and candidate_words:
-        overlap = len(search_words.intersection(candidate_words)) / max(len(search_words), len(candidate_words))
-    else:
-        overlap = 0
-
-    from difflib import SequenceMatcher
-    ratio = SequenceMatcher(None, search, candidate).ratio()
-    return int(max(overlap, ratio) * 100)
-
-
-def extract_site_fields_from_sites_item(item):
-    fields = item.get("fields", {})
-    return {
-        "source": "Sites",
-        "item_id": item.get("id"),
-        "site_name": str(get_field_value(fields, "SiteName", "Site Name", "Title") or "").strip(),
-        "address": str(get_field_value(fields, "Address", "SiteAddress", "Site Address") or "").strip(),
-        "customer_name": str(get_field_value(fields, "CustomerName", "Customer Name") or "").strip(),
-        "customer_address": str(get_field_value(fields, "CustomerAddress", "Customer Address") or "").strip(),
-        "notes": str(get_field_value(fields, "Notes", "SiteNotes", "Site Notes") or "").strip(),
-    }
-
-
-def extract_site_fields_from_job_item(item):
-    fields = item.get("fields", {})
-    return {
-        "source": "Previous Jobs",
-        "item_id": item.get("id"),
-        "site_name": str(get_field_value(fields, "SiteName", "Site Name") or "").strip(),
-        "address": str(get_field_value(fields, "Address", "SiteAddress", "Site Address") or "").strip(),
-        "customer_name": str(get_field_value(fields, "CustomerName", "Customer Name") or "").strip(),
-        "customer_address": str(get_field_value(fields, "CustomerAddress", "Customer Address") or "").strip(),
-        "notes": "",
-    }
-
-
-def find_best_site_candidate(site_id, jobs_list_id, site_name):
-    """
-    Search the master Sites list first, then fall back to previous Engineer Jobs.
-    Returns a dict with source/site_name/address/customer_name/notes, or None.
-    """
-    best = None
-    best_score = 0
-
-    try:
-        sites_list_id = get_list_id(site_id, SITES_LIST)
-        site_items = get_list_items(site_id, sites_list_id)
-        for item in site_items:
-            fields = item.get("fields", {})
-            active_value = get_field_value(fields, "Active")
-            if active_value not in [None, ""] and not bool_field(active_value):
-                continue
-
-            candidate = extract_site_fields_from_sites_item(item)
-            if not candidate["site_name"] or not candidate["address"]:
-                continue
-
-            score = site_match_score(site_name, candidate["site_name"])
-            if score > best_score:
-                best = candidate
-                best_score = score
-    except Exception as e:
-        print(f"INFO: Sites list lookup skipped: {e}")
-
-    if best and best_score >= 70:
-        return best
-
-    try:
-        jobs_data = get_list_items(site_id, jobs_list_id)
-        for item in jobs_data:
-            candidate = extract_site_fields_from_job_item(item)
-            if not candidate["site_name"] or not candidate["address"]:
-                continue
-
-            score = site_match_score(site_name, candidate["site_name"])
-            if score > best_score:
-                best = candidate
-                best_score = score
-    except Exception as e:
-        print(f"INFO: Previous job site lookup skipped: {e}")
-
-    if best and best_score >= 70:
-        return best
-
-    return None
-
-
-def format_site_candidate(candidate):
-    notes = candidate.get("notes", "")
-    notes_block = f"\n\nSite notes:\n{notes}" if notes else ""
-    return (
-        f"I found a possible saved site from {candidate.get('source', 'records')}:\n\n"
-        f"Site: {candidate.get('site_name', '')}\n"
-        f"Address: {candidate.get('address', '')}\n"
-        f"Customer: {candidate.get('customer_name', '') or 'N/A'}\n"
-        f"Customer Address: {candidate.get('customer_address', '') or 'N/A'}"
-        f"{notes_block}\n\n"
-        "Use this address?\n\n"
-        "Reply YES to use it, EDIT to change the address, or NO to enter manually."
+def get_date_keyboard():
+    return ReplyKeyboardMarkup(
+        [["Today", "Tomorrow"], ["Custom"]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
 
-def upsert_site_record_from_job(job):
-    """Create/update the Sites list after a successful job log. Non-critical: failures only warn."""
-    site_id = job.get("site_id")
-    if not site_id:
-        return
-
-    site_name = str(job.get("site_name", "")).strip()
-    address = str(job.get("site_address", "")).strip()
-    customer_name = str(job.get("customer_name", "")).strip()
-    customer_address = str(job.get("customer_address", "")).strip()
-    notes = str(job.get("site_notes", "")).strip()
-
-    if not site_name or not address:
-        return
-
-    try:
-        sites_list_id = get_list_id(site_id, SITES_LIST)
-        site_items = get_list_items(site_id, sites_list_id)
-
-        existing = None
-        best_score = 0
-        for item in site_items:
-            candidate = extract_site_fields_from_sites_item(item)
-            score = site_match_score(site_name, candidate.get("site_name", ""))
-            if score > best_score:
-                existing = item
-                best_score = score
-
-        fields = {
-            "Title": site_name,
-            "SiteName": site_name,
-            "Site Name": site_name,
-            "Address": address,
-            "CustomerName": customer_name,
-            "Customer Name": customer_name,
-            "CustomerAddress": customer_address,
-            "Customer Address": customer_address,
-            "Active": True,
-        }
-        if notes:
-            fields["Notes"] = notes
-
-        payload = build_field_payload_for_list(site_id, sites_list_id, fields)
-
-        if existing and best_score >= 90:
-            update_list_item_fields(site_id, sites_list_id, existing["id"], payload)
-        else:
-            create_list_item_fields(site_id, sites_list_id, payload)
-
-    except Exception as e:
-        print(f"WARNING: Could not update Sites list for {site_name}: {e}")
+def get_time_keyboard():
+    return ReplyKeyboardMarkup(
+        [["ASAP", "08:00"], ["11:00", "14:00"], ["Custom"]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 
-def prompt_for_site_notes(existing_notes=""):
-    if existing_notes:
-        return (
-            "Any permanent site notes to save or update?\n\n"
-            f"Current notes:\n{existing_notes}\n\n"
-            "Reply with updated notes, or type SKIP to leave them as they are."
-        )
+def get_category_keyboard():
+    rows = []
+    for i in range(0, len(JOB_CATEGORY_CHOICES), 2):
+        rows.append(JOB_CATEGORY_CHOICES[i:i + 2])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
 
-    return (
-        "Any permanent site notes to save for next time?\n\n"
-        "Examples: keys at reception, parking instructions, plant room location, asbestos register location.\n\n"
-        "Type notes, or type SKIP."
+
+def get_review_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        [["✅ Yes", "❌ No"], ["🔄 Restart"]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
 
@@ -918,13 +760,6 @@ def build_log_job_review(job):
 
 def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=False):
     job_notes = job.get("notes", "") or ""
-    site_notes = job.get("site_notes", "") or ""
-
-    if site_notes:
-        if job_notes:
-            job_notes = f"{job_notes}\n\nSite notes: {site_notes}"
-        else:
-            job_notes = f"Site notes: {site_notes}"
 
     payload = build_field_payload_for_list(
         site_id,
@@ -938,11 +773,8 @@ def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=Fals
             "Start Time": job["time"],
             "CustomerName": job["customer_name"],
             "Customer Name": job["customer_name"],
-            "CustomerAddress": job.get("customer_address", ""),
-            "Customer Address": job.get("customer_address", ""),
             "SiteName": job["site_name"],
             "Site Name": job["site_name"],
-            "Address": job.get("site_address", job.get("site_name", "")),
             "ContactName": job.get("contact", ""),
             "Contact Name": job.get("contact", ""),
             "Task": job["task"],
@@ -970,9 +802,7 @@ def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=Fals
         payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
         payload["EngineerLookupId"] = engineer_ids
 
-
     return payload
-
 
 def get_current_assigned_engineers_from_job(fields, engineers):
     """Return current assigned engineers with name, lookup_id and telegram_id where possible."""
@@ -1063,7 +893,7 @@ async def send_created_job_to_engineers(bot, item_id, fields, assigned_engineers
             await bot.send_message(
                 chat_id=engineer["telegram_id"],
                 text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
-                reply_markup=get_job_buttons(item_id, fields.get("Address", "")),
+                reply_markup=get_job_buttons(item_id, ""),
             )
             sent_to_any = True
         except Exception as e:
@@ -1429,22 +1259,12 @@ def get_job_buttons(item_id, address=None):
 
 
 def format_job(fields, engineer_name=None):
-    site_name = fields.get("SiteName", "") or ""
-    address = fields.get("Address", "") or ""
-    address_line = ""
-
-    # In the simplified log job flow, SiteName may already contain the full
-    # site name and address. Avoid showing the same text twice.
-    if address and normalise_field_name(address) != normalise_field_name(site_name):
-        address_line = f"Address: {address}\n"
-
     return (
         f"CDR Number: {fields.get('CDRNumber', '')}\n"
         f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
         f"Time: {fields.get('StartTime', '')}\n"
         f"Engineer: {engineer_name or ''}\n"
-        f"Site: {site_name}\n"
-        f"{address_line}"
+        f"Site: {fields.get('SiteName', '')}\n"
         f"Task: {fields.get('Task', '')}\n"
         f"Notes: {fields.get('Notes', '')}\n"
         f"Contact: {fields.get('ContactName', '')}"
@@ -1810,7 +1630,7 @@ def signature_page(cdr_number: str, token: str):
         return HTMLResponse("This job has already been signed.", status_code=200)
 
     site = fields.get("SiteName", "")
-    address = fields.get("Address", "")
+    address = ""
     task = fields.get("Task", "")
 
     html = f"""
@@ -1842,7 +1662,6 @@ def signature_page(cdr_number: str, token: str):
             <div class="job-box">
                 <p><strong>CDR Number:</strong> {cdr_number}</p>
                 <p><strong>Site:</strong> {site}</p>
-                <p><strong>Address:</strong> {address}</p>
                 <p><strong>Task:</strong> {task}</p>
             </div>
             <form method="post" action="/submit-signature" onsubmit="return submitForm()">
@@ -2864,7 +2683,7 @@ async def logjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     job["cdr_number"] = value
     await update.message.reply_text(
-        "Customer name and address?\n\n"
+        "Customer name/address?\n\n"
         "Example:\n"
         "FM4U\n"
         "7-8 Delta Bank Road\n"
@@ -2886,7 +2705,7 @@ async def logjob_customer_name(update: Update, context: ContextTypes.DEFAULT_TYP
     job["customer_address"] = ""
 
     await update.message.reply_text(
-        "Site name and address?\n\n"
+        "Site name/address?\n\n"
         "Example:\n"
         "Park View\n"
         "Feetham Avenue, Forest Hall\n"
@@ -2909,71 +2728,13 @@ async def logjob_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return LOGJOB_SITE_NAME
 
     job["site_name"] = value
-    # Site address is no longer asked separately. Use the site block for Maps/address fields.
-    job["site_address"] = value
-    job["site_notes"] = ""
-    job.pop("site_candidate", None)
+    # Site address is now included in SiteName/Site block. Do not write to a separate Address field.
+    job["site_address"] = ""
 
-    await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
-    return LOGJOB_CONTACT
-
-async def logjob_site_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("log_job")
-    if not job:
-        await update.message.reply_text("Please start again using ➕ Log Job.")
-        return ConversationHandler.END
-
-    answer = update.message.text.strip().lower()
-    candidate = job.get("site_candidate") or {}
-
-    if answer in ["yes", "y", "use", "use it", "correct"]:
-        job["site_name"] = candidate.get("site_name") or job.get("site_name", "")
-        job["site_address"] = candidate.get("address", "")
-        if candidate.get("notes"):
-            job["site_notes"] = candidate.get("notes", "")
-        await update.message.reply_text(prompt_for_site_notes(candidate.get("notes", "")))
-        return LOGJOB_SITE_NOTES
-
-    if answer in ["edit", "change", "amend", "wrong address"]:
-        await update.message.reply_text(
-            "Enter the correct site address.\n\n"
-            "This will be used for the job and saved back to the Sites list."
-        )
-        return LOGJOB_SITE_ADDRESS
-
-    if answer in ["no", "n", "manual", "enter manually"]:
-        job.pop("site_candidate", None)
-        job.pop("site_notes", None)
-        await update.message.reply_text("Site address?\n\nThis is the address sent to the engineer and used for Maps.")
-        return LOGJOB_SITE_ADDRESS
-
-    await update.message.reply_text("Reply YES to use it, EDIT to change the address, or NO to enter manually.")
-    return LOGJOB_SITE_CONFIRM
-
-
-async def logjob_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("log_job")
-    value = update.message.text.strip()
-    if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the site address.")
-        return LOGJOB_SITE_ADDRESS
-    job["site_address"] = value
-
-    existing_notes = (job.get("site_candidate") or {}).get("notes", "")
-    await update.message.reply_text(prompt_for_site_notes(existing_notes))
-    return LOGJOB_SITE_NOTES
-
-
-async def logjob_site_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    job = context.user_data.get("log_job")
-    value = update.message.text.strip()
-
-    if not is_blank_or_skip(value):
-        job["site_notes"] = value
-    elif not job.get("site_notes") and (job.get("site_candidate") or {}).get("notes"):
-        job["site_notes"] = (job.get("site_candidate") or {}).get("notes", "")
-
-    await update.message.reply_text("Contact name/number?\n\nType N/A if there is no contact.")
+    await update.message.reply_text(
+        "Contact name/number?",
+        reply_markup=get_skip_keyboard(),
+    )
     return LOGJOB_CONTACT
 
 
@@ -2992,7 +2753,10 @@ async def logjob_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please enter the task/job description.")
         return LOGJOB_TASK
     job["task"] = value
-    await update.message.reply_text("Any extra engineer notes?\n\nType N/A if none.")
+    await update.message.reply_text(
+        "Any extra engineer notes?",
+        reply_markup=get_skip_keyboard(),
+    )
     return LOGJOB_NOTES
 
 
@@ -3000,35 +2764,56 @@ async def logjob_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     value = update.message.text.strip()
     job["notes"] = "" if is_blank_or_skip(value) else value
-    await update.message.reply_text("Job date?\n\nUse today, tomorrow, or DD/MM/YYYY.")
+    await update.message.reply_text(
+        "Job date?",
+        reply_markup=get_date_keyboard(),
+    )
     return LOGJOB_DATE
 
 
 async def logjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
+    if update.message.text.strip().lower() == "custom":
+        await update.message.reply_text("Enter the date as DD/MM/YYYY.")
+        return LOGJOB_DATE
+
     parsed = parse_helpdesk_job_date(update.message.text)
     if not parsed:
-        await update.message.reply_text("Please enter a valid date, for example today, tomorrow, or 13/05/2026.")
+        await update.message.reply_text(
+            "Please enter a valid date, for example today, tomorrow, or 13/05/2026.",
+            reply_markup=get_date_keyboard(),
+        )
         return LOGJOB_DATE
     job["date"] = parsed
     try:
         job["date_display"] = datetime.fromisoformat(parsed).strftime("%d/%m/%Y")
     except Exception:
         job["date_display"] = parsed
-    await update.message.reply_text("Start/time required?\n\nUse HH:MM, 0800, 13:30, now, or asap.")
+    await update.message.reply_text(
+        "Start/time required?",
+        reply_markup=get_time_keyboard(),
+    )
     return LOGJOB_TIME
 
 
 async def logjob_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
+    if update.message.text.strip().lower() == "custom":
+        await update.message.reply_text("Enter the time as HH:MM, for example 13:30.")
+        return LOGJOB_TIME
+
     parsed = normalise_helpdesk_time(update.message.text)
     if not parsed:
-        await update.message.reply_text("Please enter a valid time, for example 08:00, 0800, 13:30, now, or asap.")
+        await update.message.reply_text(
+            "Please enter a valid time, for example 08:00, 0800, 13:30, now, or asap.",
+            reply_markup=get_time_keyboard(),
+        )
         return LOGJOB_TIME
     job["time"] = parsed
     await update.message.reply_text(
-        "Job category? Reply with a number:\n\n" +
-        "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
+        "Job category? Tap a button or reply with a number:\n\n" +
+        "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1)),
+        reply_markup=get_category_keyboard(),
     )
     return LOGJOB_CATEGORY
 
@@ -3050,13 +2835,17 @@ async def logjob_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not selected:
         await update.message.reply_text(
-            "Please choose a valid category number:\n\n" +
-            "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1))
+            "Please choose a valid category number or tap a category button:\n\n" +
+            "\n".join(f"{i}. {choice}" for i, choice in enumerate(JOB_CATEGORY_CHOICES, start=1)),
+            reply_markup=get_category_keyboard(),
         )
         return LOGJOB_CATEGORY
 
     job["category"] = selected
-    await update.message.reply_text("Customer order number?\n\nType N/A if not available.")
+    await update.message.reply_text(
+        "Customer order number?",
+        reply_markup=get_skip_keyboard(),
+    )
     return LOGJOB_ORDER_NUMBER
 
 
@@ -3081,7 +2870,7 @@ async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_
         return LOGJOB_ASSIGN_ENGINEERS
 
     job["assigned_engineers"] = selected
-    await update.message.reply_text(build_log_job_review(job))
+    await update.message.reply_text(build_log_job_review(job), reply_markup=get_review_reply_keyboard())
     return LOGJOB_REVIEW
 
 
@@ -3089,6 +2878,7 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     role = job.get("role", "Helpdesk") if job else "Helpdesk"
     answer = update.message.text.strip().lower()
+    answer = answer.replace("✅", "").replace("❌", "").replace("🔄", "").strip()
 
     if answer in ["no", "n", "cancel"]:
         context.user_data.pop("log_job", None)
@@ -3345,6 +3135,7 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.get("reassign_job")
     role = data.get("role", "Helpdesk") if data else "Helpdesk"
     answer = update.message.text.strip().lower()
+    answer = answer.replace("✅", "").replace("❌", "").replace("🔄", "").strip()
 
     if answer in ["no", "n", "cancel"]:
         context.user_data.pop("reassign_job", None)
@@ -3470,7 +3261,6 @@ def job_matches_search(fields, search_text):
         fields.get("Customer Name", ""),
         fields.get("SiteName", ""),
         fields.get("Site Name", ""),
-        fields.get("Address", ""),
         fields.get("Task", ""),
         fields.get("Notes", ""),
         fields.get("ContactName", ""),
@@ -3548,17 +3338,7 @@ def format_helpdesk_job_detail(job, engineers):
     signature_received = "Yes" if bool_field(get_field_value(fields, "ClientSignatureReceived", "Client Signature Received")) else "No"
 
     customer_detail = get_field_value(fields, 'CustomerName', 'Customer Name') or ''
-    customer_address_detail = get_field_value(fields, 'CustomerAddress', 'Customer Address') or ''
     site_detail = get_field_value(fields, 'SiteName', 'Site Name') or ''
-    address_detail = get_field_value(fields, 'Address') or ''
-
-    customer_address_line = ''
-    if customer_address_detail and normalise_field_name(customer_address_detail) != normalise_field_name(customer_detail):
-        customer_address_line = f"Customer Address: {customer_address_detail}\n"
-
-    address_line = ''
-    if address_detail and normalise_field_name(address_detail) != normalise_field_name(site_detail):
-        address_line = f"Address: {address_detail}\n"
 
     return (
         "Job details:\n\n"
@@ -4569,7 +4349,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 found_any = True
                 await update.message.reply_text(
                     "Today's job:\n\n" + format_job(fields, current_engineer["name"]),
-                    reply_markup=get_job_buttons(item_id, fields.get("Address", "")),
+                    reply_markup=get_job_buttons(item_id, ""),
                 )
 
         if not found_any:
@@ -5821,22 +5601,8 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=N
     date_logged = format_sharepoint_date(fields.get("Date", ""))
     date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
 
-    customer_name = get_field_value(fields, "CustomerName", "Customer Name") or get_field_value(fields, "ClientName", "Client Name") or ""
-    customer_address = get_field_value(fields, "CustomerAddress", "Customer Address") or ""
-    customer_details = "\n".join([v for v in [customer_name, customer_address] if str(v or "").strip()])
-
-    site_name_for_pdf = fields.get("SiteName", "") or ""
-    site_address_for_pdf = fields.get("Address", "") or ""
-
-    # SiteName may now include the site address as multi-line text. If Address
-    # contains the same value, do not duplicate it on the worksheet.
-    if normalise_field_name(site_address_for_pdf) == normalise_field_name(site_name_for_pdf):
-        site_address_for_pdf = ""
-
-    site_details = "\n".join([v for v in [
-        site_name_for_pdf,
-        site_address_for_pdf,
-    ] if str(v or "").strip()])
+    customer_details = get_field_value(fields, "CustomerName", "Customer Name") or get_field_value(fields, "ClientName", "Client Name") or ""
+    site_details = fields.get("SiteName", "") or ""
 
     order_number = get_field_value(fields, "CustomerOrderNumber", "Customer Order Number", "OrderNumber", "Order Number") or ""
     job_category = get_field_value(fields, "JobCategory", "Job Category") or ""
@@ -6370,7 +6136,7 @@ async def send_new_jobs(app):
                     await app.bot.send_message(
                         chat_id=engineer["telegram_id"],
                         text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
-                        reply_markup=get_job_buttons(item_id, fields.get("Address", "")),
+                        reply_markup=get_job_buttons(item_id, ""),
                     )
                     sent_to_any_engineer = True
                 except Exception as e:
@@ -6642,11 +6408,7 @@ logjob_handler = ConversationHandler(
     states={
         LOGJOB_CDR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_cdr_number)],
         LOGJOB_CUSTOMER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_name)],
-        LOGJOB_CUSTOMER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_customer_address)],
         LOGJOB_SITE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_name)],
-        LOGJOB_SITE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_confirm)],
-        LOGJOB_SITE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_address)],
-        LOGJOB_SITE_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_site_notes)],
         LOGJOB_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_contact)],
         LOGJOB_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_task)],
         LOGJOB_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, logjob_notes)],
