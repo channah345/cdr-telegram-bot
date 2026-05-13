@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto
 try:
     from telegram.warnings import PTBUserWarning
 except Exception:
@@ -52,7 +52,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "trade-group-summary-photos-v1"
+BUILD_VERSION = "trade-group-summary-photo-albums-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -1731,6 +1731,7 @@ async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
             chat_id=chat_id,
             text=message,
         )
+        await send_trade_group_photos(context, chat_id, worksheet)
     except Exception as e:
         print(f"WARNING: Could not send text summary to {group_name}: {e}")
         return
@@ -1738,47 +1739,29 @@ async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
     await send_trade_group_photos(context, chat_id, worksheet, group_name)
 
 
-async def send_trade_group_photos(context, chat_id, worksheet, group_name):
-    """Send engineer-uploaded job photos underneath the trade group summary.
+async def send_trade_group_photos(context, chat_id, worksheet):
+    """Send engineer job photos to a trade group as Telegram media groups.
 
-    Photos are sent from the Telegram file bytes captured during the worksheet
-    upload step. SharePoint web links are still kept for records/worksheets,
-    but they are not reliable for Telegram to fetch directly because SharePoint
-    links are normally protected.
+    This keeps photos clumped together as an album instead of posting one
+    separate message per photo. Telegram allows up to 10 photos per album.
     """
-    photo_files = worksheet.get("photo_files_for_group", []) or []
+    photos = worksheet.get("telegram_photo_file_ids", []) or worksheet.get("photo_file_ids", []) or []
 
-    if not photo_files:
+    if not photos:
         return
 
-    cdr_number = worksheet.get("cdr_number", "")
-    max_photos_to_send = 10
+    try:
+        for batch_start in range(0, len(photos), 10):
+            batch = photos[batch_start:batch_start + 10]
+            media = [InputMediaPhoto(media=file_id) for file_id in batch if file_id]
 
-    if len(photo_files) > max_photos_to_send:
-        print(f"WARNING: {len(photo_files)} photos uploaded for {cdr_number}; sending first {max_photos_to_send} to {group_name}.")
-
-    for index, photo_file in enumerate(photo_files[:max_photos_to_send], start=1):
-        try:
-            photo_bytes = photo_file.get("bytes")
-            file_name = photo_file.get("file_name") or f"{cdr_number}_photo_{index}.jpg"
-
-            if not photo_bytes:
-                continue
-
-            image_stream = BytesIO(photo_bytes)
-            image_stream.name = file_name
-
-            caption = None
-            if index == 1:
-                caption = f"{cdr_number} - engineer photo(s)" if cdr_number else "Engineer photo(s)"
-
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=image_stream,
-                caption=caption,
-            )
-        except Exception as e:
-            print(f"WARNING: Could not send photo {index} for {cdr_number} to {group_name}: {e}")
+            if media:
+                await context.bot.send_media_group(
+                    chat_id=chat_id,
+                    media=media,
+                )
+    except Exception as e:
+        print(f"WARNING: Could not send trade group photo album: {e}")
 
 
 async def notify_helpdesk(context, text):
