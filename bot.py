@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "unassigned-jobs-quote-menu-bugfix-v3"
+BUILD_VERSION = "request-job-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -74,6 +74,7 @@ MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
 MENU_UPLOAD_RECEIPTS = "🧾 Upload Receipts"
+MENU_REQUEST_JOB = "📣 Request Job"
 MENU_QUOTE_REMINDER = "📌 Quote Reminder"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
@@ -480,6 +481,7 @@ def get_engineer_menu(include_helpdesk_menu=False):
         [MENU_START_DAY, MENU_MY_JOBS],
         [MENU_END_DAY, MENU_BUG_IDEA],
         [MENU_UPLOAD_RECEIPTS],
+        [MENU_REQUEST_JOB],
     ]
 
     # Only Admin users should be able to switch from the Engineer menu
@@ -2531,6 +2533,57 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("There was an error checking your status.", reply_markup=get_main_menu(await get_role_for_update(update)))
 
 
+
+async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Engineer one-tap request for another job.
+
+    This does not start a conversation and does not change any SharePoint job.
+    It simply notifies the helpdesk chat that the engineer is ready / requesting work.
+    """
+    try:
+        user_id = str(update.effective_user.id)
+        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+        role = get_bot_user_role(site_id, user_id)
+
+        if str(role).lower() not in ["engineer", "admin"]:
+            await update.message.reply_text(
+                "This option is for engineers to request another job.",
+                reply_markup=get_main_menu(role),
+            )
+            return
+
+        engineer_name = current_engineer["name"] if current_engineer else (update.effective_user.full_name or user_id)
+
+        if not HELPDESK_CHAT_ID:
+            await update.message.reply_text(
+                "Helpdesk notifications are not set up yet. Please ask the office to check HELPDESK_CHAT_ID.",
+                reply_markup=get_main_menu(role),
+            )
+            return
+
+        await context.bot.send_message(
+            chat_id=HELPDESK_CHAT_ID,
+            text=(
+                "📣 Engineer job request\n\n"
+                f"Engineer: {engineer_name}\n"
+                f"Time: {now_log_time()}\n\n"
+                "The engineer has requested another job / next instruction."
+            ),
+        )
+
+        await update.message.reply_text(
+            "Request sent to Helpdesk.",
+            reply_markup=get_main_menu(role),
+        )
+
+    except Exception as e:
+        print(f"ERROR sending job request: {e}")
+        await update.message.reply_text(
+            "There was an error sending the request. Please ask the office to check Railway logs.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+
+
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -2549,6 +2602,9 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
+
+    if text == MENU_REQUEST_JOB:
+        return await request_job(update, context)
 
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
@@ -2618,6 +2674,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
+
+    if text == MENU_REQUEST_JOB:
+        return await request_job(update, context)
 
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
@@ -6746,6 +6805,7 @@ abortjob_handler = ConversationHandler(
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
+telegram_app.add_handler(CommandHandler("requestjob", request_job))
 telegram_app.add_handler(CommandHandler("helpdesk", helpdesk_start))
 telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
@@ -6760,7 +6820,7 @@ telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_QUOTE_REMINDER}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
