@@ -52,7 +52,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "group-inbound-lockdown-v1"
+BUILD_VERSION = "engineer-reminders-fixed-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -6822,27 +6822,59 @@ async def send_new_jobs(app):
         print(f"ERROR sending new jobs: {e}")
 
 
+def get_engineer_role_from_fields(fields):
+    """Return the menu role for a user row from the Engineers list."""
+    role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
+
+    if role == "admin":
+        return "Admin"
+
+    if role == "helpdesk":
+        return "Helpdesk"
+
+    return "Engineer"
+
+
+def engineer_row_is_active(fields):
+    active_value = get_field_value(fields, "Active")
+    return active_value in [None, ""] or bool_field(active_value)
+
+
+def build_telegram_role_map(engineers):
+    role_map = {}
+
+    for engineer in engineers:
+        fields = engineer.get("fields", {})
+        telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
+
+        if telegram_id:
+            role_map[telegram_id] = get_engineer_role_from_fields(fields)
+
+    return role_map
+
+
 async def remind_engineers_to_start_day(app):
-    """Daily 07:40 reminder to active engineers/admin engineers to start their day."""
+    """Daily 07:40 private reminder to active engineers/admins to start their day."""
     try:
         site_id = get_site_id()
         engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
         engineers = get_list_items(site_id, engineers_list_id)
 
+        sent_to = set()
+
         for engineer in engineers:
             fields = engineer.get("fields", {})
             engineer_name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
             telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
-            role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
-            active_value = get_field_value(fields, "Active")
+            role = get_engineer_role_from_fields(fields)
 
-            if active_value not in [None, ""] and not bool_field(active_value):
+            if not engineer_row_is_active(fields):
                 continue
 
-            if role not in ["engineer", "admin"]:
+            if role.lower() not in ["engineer", "admin"]:
                 continue
 
-            if not telegram_id:
+            if not telegram_id or telegram_id in sent_to:
                 continue
 
             try:
@@ -6852,7 +6884,9 @@ async def remind_engineers_to_start_day(app):
                         "⏰ Start Day Reminder\n\n"
                         f"Morning {engineer_name or 'Engineer'}, please tap 🟢 Start Day when you begin work today."
                     ),
+                    reply_markup=get_main_menu(role),
                 )
+                sent_to.add(telegram_id)
             except Exception as e:
                 print(f"WARNING: Could not send start-day reminder to {telegram_id}: {e}")
 
@@ -6861,33 +6895,49 @@ async def remind_engineers_to_start_day(app):
 
 
 async def remind_active_engineers_to_end_day(app):
-    """Daily reminder so engineers do not forget to close their day."""
+    """Daily 16:45 private reminder only for engineers with an active day log today."""
     try:
         site_id = get_site_id()
         day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
         day_logs = get_list_items(site_id, day_logs_list_id)
+        engineers = get_list_items(site_id, engineers_list_id)
+        role_map = build_telegram_role_map(engineers)
         today = get_today_iso()
+        sent_to = set()
 
         for log in day_logs:
             fields = log.get("fields", {})
-            status = str(fields.get("Status", ""))
-            telegram_id = str(fields.get("EngineerTelegramID") or fields.get("Engineer Telegram ID") or "")
+            status = str(fields.get("Status", "")).strip()
+            telegram_id = str(fields.get("EngineerTelegramID") or fields.get("Engineer Telegram ID") or "").strip()
             raw_work_date = fields.get("WorkDate") or fields.get("Work Date") or ""
             parsed_work_date = sharepoint_date_to_uk_date(raw_work_date)
             log_date = parsed_work_date.isoformat() if parsed_work_date else str(raw_work_date)[:10]
 
-            if status == DAY_ACTIVE_STATUS and telegram_id and log_date == today:
-                try:
-                    await app.bot.send_message(
-                        chat_id=telegram_id,
-                        text=(
-                            "End of day reminder: if you have finished work, please tap 🏁 End Day. "
-                            "This keeps timesheets, mileage and pay hours correct."
-                        ),
-                        reply_markup=get_main_menu(await get_role_for_update(update)),
-                    )
-                except Exception as e:
-                    print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
+            if status != DAY_ACTIVE_STATUS:
+                continue
+
+            if not telegram_id or telegram_id in sent_to:
+                continue
+
+            if log_date != today:
+                continue
+
+            role = role_map.get(telegram_id, "Engineer")
+
+            try:
+                await app.bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "⏰ End Day Reminder\n\n"
+                        "If you have finished work, please tap 🏁 End Day. "
+                        "This keeps timesheets, mileage and pay hours correct."
+                    ),
+                    reply_markup=get_main_menu(role),
+                )
+                sent_to.add(telegram_id)
+            except Exception as e:
+                print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
 
     except Exception as e:
         print(f"ERROR sending end-day reminders: {e}")
