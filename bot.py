@@ -48,9 +48,11 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
+CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
+CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "request-job-helpdesk-users-v2"
+BUILD_VERSION = "trade-group-text-summary-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -73,7 +75,7 @@ MENU_START_DAY = "🟢 Start Day"
 MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
-MENU_UPLOAD_RECEIPTS = "🧾 Upload Receipts"
+MENU_UPLOAD_RECEIPTS = "🧾 Receipts / Returns"
 MENU_REQUEST_JOB = "📣 Request Job"
 MENU_QUOTE_REMINDER = "📌 Quote Reminder"
 MENU_HELPDESK = "🧰 Helpdesk"
@@ -144,7 +146,7 @@ CANCELJOB_CDR_NUMBER = 55
 CANCELJOB_CONFIRM = 56
 DELETEJOB_CDR_NUMBER = 57
 DELETEJOB_CONFIRM = 58
-RECEIPT_ENGINEER_NAME = 59
+RECEIPT_TYPE = 59
 RECEIPT_DATE = 60
 RECEIPT_UPLOADS = 61
 ABORTJOB_REASON = 62
@@ -952,8 +954,14 @@ def upload_van_check_photo_to_sharepoint(site_id, work_date, van_reg, file_name,
     )
 
 
-def upload_receipt_to_sharepoint(site_id, receipt_date, engineer_name, file_name, file_bytes):
-    folder_name = f"{receipt_date}/{safe_folder_name(engineer_name)}"
+def upload_receipt_to_sharepoint(site_id, receipt_date, engineer_name, file_name, file_bytes, upload_type="Receipt"):
+    upload_type = str(upload_type or "Receipt").strip().lower()
+
+    if upload_type == "return":
+        folder_name = f"Returns/{receipt_date}/{safe_folder_name(engineer_name)}"
+    else:
+        folder_name = f"{receipt_date}/{safe_folder_name(engineer_name)}"
+
     return upload_file_to_sharepoint(
         site_id,
         RECEIPT_BASE_FOLDER,
@@ -1606,6 +1614,133 @@ def build_review_text(worksheet):
     )
 
 
+def format_time_for_group(value):
+    return str(value or "").strip() or "N/A"
+
+
+def yes_no(value):
+    return "Yes" if value else "No"
+
+
+def build_trade_group_text_summary(worksheet, fields, updated_log, outcome):
+    """Build a WhatsApp-style text update for the relevant trade group.
+
+    This is deliberately separate from worksheet PDF generation. It only uses
+    fields the engineer actually interacts with during the job/worksheet flow.
+    """
+    cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "")
+    engineer_name = worksheet.get("engineer_name", "")
+    date_to_attend = format_sharepoint_date(fields.get("Date", ""))
+    start_time = fields.get("StartTime", "") or fields.get("Start Time", "")
+    site_name = fields.get("SiteName", "") or ""
+    task = fields.get("Task", "") or ""
+    category = get_field_value(fields, "JobCategory", "Job Category") or ""
+
+    travel_time = ""
+    on_site_time = ""
+    off_site_time = ""
+
+    try:
+        visits = parse_engineer_visit_log(updated_log)
+        matching_visits = [
+            visit for visit in visits
+            if str(visit.get("engineer", "")).strip().lower() == str(engineer_name).strip().lower()
+        ]
+        if matching_visits:
+            visit = matching_visits[-1]
+            travel_time = visit.get("travel", "")
+            on_site_time = visit.get("on_site", "")
+            off_site_time = visit.get("off_site", "")
+    except Exception as e:
+        print(f"WARNING: Could not parse visit times for electrical group summary: {e}")
+
+    date_line = date_to_attend
+    if start_time:
+        date_line = f"{date_line} {start_time}".strip()
+
+    lines = [
+        "🔧 JOB UPDATE",
+        "",
+        f"Date To Attend: {date_line}",
+        f"Job Location: {site_name}",
+        f"Job Number: {cdr_number}",
+        f"Description: {task}",
+    ]
+
+    if category:
+        lines.append(f"Job Type: {category}")
+
+    lines.extend([
+        f"Travel: {format_time_for_group(travel_time)}",
+        f"On Site: {format_time_for_group(on_site_time)}",
+        f"Off Site: {format_time_for_group(off_site_time)}",
+        f"Photos Taken?: {yes_no(len(worksheet.get('photo_links', [])) > 0)}",
+        f"Outcome: {outcome}",
+    ])
+
+    if outcome == "No Access" and worksheet.get("NoAccessReason"):
+        lines.append(f"No Access Reason: {worksheet.get('NoAccessReason')}")
+
+    work_completed = str(worksheet.get("WorkCompleted", "") or "").strip()
+    if work_completed and work_completed.lower() not in ["n/a", "na", "none", "no"]:
+        lines.extend(["", f"Work Completed / Comments: {work_completed}"])
+
+    materials_used = str(worksheet.get("MaterialsUsed", "") or "").strip()
+    if materials_used and materials_used.lower() not in ["n/a", "na", "none", "no"]:
+        lines.extend(["", f"Materials Used: {materials_used}"])
+
+    if worksheet.get("FollowOnRequired"):
+        follow_on_notes = str(worksheet.get("FollowOnNotes", "") or "").strip()
+        lines.extend(["", "Follow-on Required?: Yes"])
+        if follow_on_notes and follow_on_notes.lower() not in ["n/a", "na", "none", "no"]:
+            lines.append(follow_on_notes)
+    else:
+        lines.extend(["", "Follow-on Required?: No"])
+
+    engineer_notes = str(worksheet.get("EngineerCompletionNotes", "") or "").strip()
+    if engineer_notes and engineer_notes.lower() not in ["n/a", "na", "none", "no"]:
+        lines.extend(["", f"Engineer Comments: {engineer_notes}"])
+
+    return "\n".join(lines)
+
+
+def get_trade_group_chat_id(fields):
+    """Route job outcome summaries to the correct trade Telegram group."""
+    category = str(get_field_value(fields, "JobCategory", "Job Category") or "").strip().lower()
+
+    electrical_categories = {"electrical", "fire"}
+    mechanical_categories = {"mechanical", "plumbing", "hvac", "catering"}
+
+    if category in electrical_categories:
+        return CDR_ELECTRICAL_CHAT_ID, "CDR Electrical"
+
+    if category in mechanical_categories:
+        return CDR_MECHANICAL_CHAT_ID, "CDR Mechanical"
+
+    return None, ""
+
+
+async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
+    """Send a text-only job update to the correct CDR trade group.
+
+    This does not generate or send worksheets/PDFs. It is only an engineer
+    activity summary for Completed, No Access and Revisit Required outcomes.
+    """
+    chat_id, group_name = get_trade_group_chat_id(fields)
+
+    if not chat_id:
+        return
+
+    try:
+        message = build_trade_group_text_summary(worksheet, fields, updated_log, outcome)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+        )
+    except Exception as e:
+        print(f"WARNING: Could not send text summary to {group_name}: {e}")
+
+
 async def notify_helpdesk(context, text):
     if HELPDESK_CHAT_ID:
         try:
@@ -1876,6 +2011,18 @@ def submit_signature(
 </body>
 </html>
 """)
+
+
+
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    await update.message.reply_text(
+        f"📌 Chat ID:\n{chat.id}\n\n"
+        f"💬 Chat Type:\n{chat.type}\n\n"
+        f"👤 User:\n{user.full_name}"
+    )
 
 
 def run_signature_web_server():
@@ -4289,6 +4436,16 @@ async def bugidea_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def get_receipt_type_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🧾 Receipts", callback_data="receipt_type|receipt"),
+            InlineKeyboardButton("↩️ Returns", callback_data="receipt_type|return"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="receipt_type|cancel")],
+    ])
+
+
 async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         site_id = get_site_id()
@@ -4303,11 +4460,11 @@ async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if current_engineer:
                 engineer_name = current_engineer.get("name", "")
         except Exception as e:
-            print(f"WARNING: Could not auto-detect receipt engineer: {e}")
+            print(f"WARNING: Could not auto-detect receipt/return engineer: {e}")
 
         if not engineer_name:
             await update.message.reply_text(
-                "I could not match your Telegram account to an engineer record, so I cannot upload receipts under your name. Please ask the office to check your Engineers list record has your Telegram ID and EngineerName.",
+                "I could not match your Telegram account to an engineer record, so I cannot upload receipts/returns under your name. Please ask the office to check your Engineers list record has your Telegram ID and EngineerName.",
                 reply_markup=get_main_menu(await get_role_for_update(update)),
             )
             return ConversationHandler.END
@@ -4315,37 +4472,54 @@ async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["receipt_upload"] = {
             "site_id": site_id,
             "engineer_name": engineer_name,
+            "upload_type": "",
             "receipt_date": "",
             "receipt_links": [],
             "receipt_count": 0,
         }
 
         await update.message.reply_text(
-            f"""Upload receipts started.
-
-Engineer: {engineer_name}
-
-Enter the receipt date.
-
-Use DD/MM/YYYY, YYYY-MM-DD, or TODAY.
-
-Type /cancel to cancel."""
+            f"Receipts / Returns upload started.\n\nEngineer: {engineer_name}\n\nWhat are you uploading?",
+            reply_markup=get_receipt_type_keyboard(),
         )
-        return RECEIPT_DATE
+        return RECEIPT_TYPE
 
     except Exception as e:
-        print(f"ERROR starting receipt upload: {e}")
+        print(f"ERROR starting receipts/returns upload: {e}")
         await update.message.reply_text(
-            "There was an error starting receipt upload. Please ask the office to check Railway logs.",
+            "There was an error starting receipts/returns upload. Please ask the office to check Railway logs.",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
 
 
-async def receipt_engineer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Retired: receipt uploads are now locked to the logged-in Telegram user's
-    # EngineerName from SharePoint so nobody can submit receipts under another name.
-    return await receipt_date(update, context)
+async def receipt_type_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data.get("receipt_upload")
+    if not data:
+        await query.message.reply_text("Please start again from 🧾 Receipts / Returns.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    selected = query.data.split("|", 1)[1]
+
+    if selected == "cancel":
+        context.user_data.pop("receipt_upload", None)
+        await query.message.reply_text("Receipts / Returns upload cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    if selected not in ["receipt", "return"]:
+        await query.message.reply_text("Please choose Receipts or Returns.", reply_markup=get_receipt_type_keyboard())
+        return RECEIPT_TYPE
+
+    data["upload_type"] = "Return" if selected == "return" else "Receipt"
+    label = "returns" if selected == "return" else "receipts"
+
+    await query.message.reply_text(
+        f"Uploading {label}.\n\nEngineer: {data['engineer_name']}\n\nEnter the date.\n\nUse DD/MM/YYYY, YYYY-MM-DD, or TODAY.\n\nType /cancel to cancel."
+    )
+    return RECEIPT_DATE
 
 
 async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4355,7 +4529,7 @@ async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = context.user_data.get("receipt_upload")
     if not data:
-        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        await update.message.reply_text("Please start again from 🧾 Receipts / Returns.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
     parsed_date = parse_helpdesk_job_date(update.message.text)
@@ -4364,10 +4538,11 @@ async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return RECEIPT_DATE
 
     data["receipt_date"] = parsed_date
+    upload_label = "Returns" if str(data.get("upload_type", "")).lower() == "return" else "Receipts"
 
     await update.message.reply_text(
-        f"Receipt upload ready.\n\nEngineer: {data['engineer_name']}\nDate: {parsed_date}\n\n"
-        "Now send all receipt photos/PDFs/files.\n\nType DONE when finished."
+        f"{upload_label} upload ready.\n\nEngineer: {data['engineer_name']}\nDate: {parsed_date}\n\n"
+        "Now send all photos/PDFs/files.\n\nType DONE when finished."
     )
     return RECEIPT_UPLOADS
 
@@ -4379,18 +4554,20 @@ async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = context.user_data.get("receipt_upload")
     if not data:
-        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        await update.message.reply_text("Please start again from 🧾 Receipts / Returns.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
+
+    upload_label = "Returns" if str(data.get("upload_type", "")).lower() == "return" else "Receipts"
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
         count = len(data.get("receipt_links", []))
         if count == 0:
-            await update.message.reply_text("No receipts uploaded yet. Send at least one receipt, or type /cancel to cancel.")
+            await update.message.reply_text(f"No {upload_label.lower()} uploaded yet. Send at least one file, or type /cancel to cancel.")
             return RECEIPT_UPLOADS
 
         context.user_data.pop("receipt_upload", None)
         await update.message.reply_text(
-            f"Receipts uploaded for finance.\n\nEngineer: {data['engineer_name']}\nDate: {data['receipt_date']}\nFiles uploaded: {count}",
+            f"{upload_label} uploaded for finance.\n\nEngineer: {data['engineer_name']}\nDate: {data['receipt_date']}\nFiles uploaded: {count}",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
@@ -4419,13 +4596,15 @@ async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 extension = "bin"
 
         else:
-            await update.message.reply_text("Please send a receipt photo/file, or type DONE when finished.")
+            await update.message.reply_text(f"Please send a {upload_label.lower()} photo/file, or type DONE when finished.")
             return RECEIPT_UPLOADS
 
         data["receipt_count"] = int(data.get("receipt_count", 0)) + 1
         timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
         engineer_part = safe_folder_name(data.get("engineer_name", "ENGINEER"))
-        file_name = f"{data['receipt_date']}_{engineer_part}_{timestamp}_{data['receipt_count']}_{unique_id}.{extension}"
+        upload_type = str(data.get("upload_type") or "Receipt")
+        type_part = "return" if upload_type.lower() == "return" else "receipt"
+        file_name = f"{data['receipt_date']}_{engineer_part}_{timestamp}_{data['receipt_count']}_{type_part}_{unique_id}.{extension}"
 
         receipt_link = upload_receipt_to_sharepoint(
             data["site_id"],
@@ -4433,24 +4612,25 @@ async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["engineer_name"],
             file_name,
             bytes(file_bytes),
+            upload_type,
         )
         data["receipt_links"].append(receipt_link)
 
-        # Intentionally no per-file confirmation. Engineers can upload all receipts
+        # Intentionally no per-file confirmation. Engineers can upload all receipts/returns
         # and type DONE once finished to avoid Telegram message spam.
         return RECEIPT_UPLOADS
 
     except Exception as e:
-        print(f"ERROR uploading receipt: {e}")
+        print(f"ERROR uploading receipt/return: {e}")
         await update.message.reply_text(
-            "There was an error uploading that receipt. Please try again or ask the office to check Railway logs."
+            "There was an error uploading that file. Please try again or ask the office to check Railway logs."
         )
         return RECEIPT_UPLOADS
 
 
 async def receipt_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("receipt_upload", None)
-    await update.message.reply_text("Receipt upload cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
+    await update.message.reply_text("Receipts / Returns upload cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
 
 
@@ -6103,7 +6283,10 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             get_job_reference(fields),
         )
 
-        final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer completes."
+        if outcome == "Completed":
+            final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer submits."
+        else:
+            final_pdf_text = ""
         await update.message.reply_text(
             f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
             reply_markup=get_main_menu(await get_role_for_update(update)),
@@ -6123,6 +6306,9 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
             ),
         )
+
+        if outcome in ["Completed", "No Access", "Revisit Required"]:
+            await notify_trade_group(context, worksheet, fields, updated_log, outcome)
 
         context.user_data.pop("worksheet", None)
         return ConversationHandler.END
@@ -6240,7 +6426,10 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         get_job_reference(fields),
     )
 
-    final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer completes."
+    if outcome == "Completed":
+        final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer submits."
+    else:
+        final_pdf_text = ""
     await query.message.reply_text(
         f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
         reply_markup=get_main_menu(await get_role_for_update(update)),
@@ -6260,6 +6449,9 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
             f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
         ),
     )
+
+    if outcome in ["Completed", "No Access", "Revisit Required"]:
+        await notify_trade_group(context, worksheet, fields, updated_log, outcome)
 
     context.user_data.pop("worksheet", None)
     return ConversationHandler.END
@@ -6555,9 +6747,11 @@ receipt_handler = ConversationHandler(
     entry_points=[
         CommandHandler("receipts", receipt_start),
         CommandHandler("uploadreceipts", receipt_start),
+        CommandHandler("returns", receipt_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_UPLOAD_RECEIPTS)}$"), receipt_start),
     ],
     states={
+        RECEIPT_TYPE: [CallbackQueryHandler(receipt_type_button, pattern=r"^receipt_type\|")],
         RECEIPT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_date)],
         RECEIPT_UPLOADS: [MessageHandler((filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND)), receipt_uploads)],
     },
@@ -6857,6 +7051,7 @@ abortjob_handler = ConversationHandler(
 
 
 telegram_app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("my_id", my_id))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(CommandHandler("requestjob", request_job))
