@@ -5500,9 +5500,29 @@ def parse_engineer_visit_log(log_text):
         extra = (match.group(5) or "").strip()
         key = engineer.lower()
 
-        # Office/helpdesk audit lines are useful in SharePoint, but they are not
-        # engineer attendances and should not appear on the customer worksheet.
-        if key in ["helpdesk", "admin", "office"] or action in ["Reassigned", "Job logged via Telegram"]:
+        # Office/helpdesk/internal audit lines are useful in SharePoint, but they are not
+        # customer-facing engineer attendances and must not appear on the worksheet.
+        internal_actions = {
+            "Reassigned",
+            "Cancelled",
+            "Hard Deleted",
+            "Job logged via Telegram",
+            "Aborted Attendance",
+        }
+
+        is_internal_actor = key in ["helpdesk", "admin", "office"]
+        is_internal_action = action in internal_actions or action.startswith("Job logged via Telegram")
+
+        if action == "Aborted Attendance":
+            # If an engineer travelled/on-site then aborted, remove that incomplete
+            # attendance from the customer worksheet entirely. It stays in SharePoint
+            # for audit, but it is not a client visit/no-access/completion record.
+            current = active_by_engineer.pop(key, None)
+            if current and current in visits:
+                visits.remove(current)
+            continue
+
+        if is_internal_actor or is_internal_action:
             continue
 
         if action == "Travelling":
