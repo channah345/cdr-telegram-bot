@@ -49,8 +49,9 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
+QUOTE_REMINDER_CHAT_ID = os.getenv("QUOTE_REMINDER_CHAT_ID") or os.getenv("OPERATIONS_DIRECTOR_TELEGRAM_ID") or HELPDESK_CHAT_ID
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "ux-buttons-no-address-fields-v1"
+BUILD_VERSION = "unassigned-jobs-quote-reminder-v2"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -74,6 +75,7 @@ MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
 MENU_UPLOAD_RECEIPTS = "🧾 Upload Receipts"
+MENU_QUOTE_REMINDER = "📌 Quote Reminder"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
@@ -147,6 +149,13 @@ RECEIPT_DATE = 60
 RECEIPT_UPLOADS = 61
 ABORTJOB_REASON = 62
 ABORTJOB_NOTES = 63
+QUOTE_CLIENT = 64
+QUOTE_ADDRESS = 65
+QUOTE_DATE = 66
+QUOTE_TIME = 67
+QUOTE_SCOPE = 68
+QUOTE_REVIEW = 69
+QUOTE_RECIPIENT = 70
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -493,6 +502,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
         [MENU_CANCEL_JOB],
         [MENU_BUG_IDEA, MENU_UPLOAD_RECEIPTS],
+        [MENU_QUOTE_REMINDER],
     ]
 
     if include_engineer_menu:
@@ -592,6 +602,7 @@ JOB_CATEGORY_CHOICES = [
     "Plumbing",
     "HVAC",
     "Fire",
+    "Catering",
     "Building Fabric",
     "Other",
 ]
@@ -631,6 +642,14 @@ def get_category_keyboard():
 def get_review_reply_keyboard():
     return ReplyKeyboardMarkup(
         [["✅ Yes", "❌ No"], ["🔄 Restart"]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def get_assign_engineer_keyboard():
+    return ReplyKeyboardMarkup(
+        [["⏭️ Skip for now"], ["/cancel"]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -783,7 +802,7 @@ def build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=Fals
             "Customer Order Number": job.get("order_number", ""),
             "JobCategory": job.get("category", ""),
             "Job Category": job.get("category", ""),
-            "Status": ASSIGNED_STATUS,
+            "Status": ASSIGNED_STATUS if job.get("assigned_engineers") else AWAITING_DEPLOYMENT_STATUS,
             "TelegramNotified": bool(telegram_notified),
             "Telegram Notified": bool(telegram_notified),
             "WorksheetGenerated": False,
@@ -893,7 +912,7 @@ async def send_created_job_to_engineers(bot, item_id, fields, assigned_engineers
             await bot.send_message(
                 chat_id=engineer["telegram_id"],
                 text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
-                reply_markup=get_job_buttons(item_id, ""),
+                reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
             )
             sent_to_any = True
         except Exception as e:
@@ -1224,7 +1243,7 @@ def get_abort_reason_keyboard(item_id):
     ])
 
 
-def get_job_buttons(item_id, address=None):
+def get_job_buttons(item_id, maps_query=None):
     rows = [
         [
             InlineKeyboardButton("🚗 Start Travelling", callback_data=f"status|{item_id}|Travelling"),
@@ -1246,10 +1265,10 @@ def get_job_buttons(item_id, address=None):
         ],
     ]
 
-    if address:
+    if maps_query:
         maps_url = (
             "https://www.google.com/maps/search/?api=1&query="
-            + quote_plus(str(address))
+            + quote_plus(str(maps_query))
         )
         rows.append([
             InlineKeyboardButton("🗺 Open Maps", url=maps_url)
@@ -2532,7 +2551,10 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_ENGINEER_MENU]:
+    if text == MENU_QUOTE_REMINDER:
+        return await quote_reminder_start(update, context)
+
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -2598,6 +2620,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
 
+    if text == MENU_QUOTE_REMINDER:
+        return await quote_reminder_start(update, context)
+
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
@@ -2605,6 +2630,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_FIND_JOB: "Find Job",
         MENU_CANCEL_JOB: "Cancel Job",
         MENU_DELETE_JOB: "Delete Job",
+        MENU_QUOTE_REMINDER: "Quote Reminder",
         MENU_HELPDESK: "Helpdesk",
     }
 
@@ -2855,8 +2881,10 @@ async def logjob_order_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     job["order_number"] = "" if is_blank_or_skip(value) else value
     engineers = job.get("assignable_engineers", [])
     await update.message.reply_text(
-        "Assign engineer(s). Reply with the number, or multiple numbers separated by commas.\n\n" +
-        format_engineer_selection_list(engineers)
+        "Assign engineer(s), or tap Skip for now to create the job as Awaiting Dispatch.\n\n"
+        "Reply with the number, or multiple numbers separated by commas.\n\n" +
+        format_engineer_selection_list(engineers),
+        reply_markup=get_assign_engineer_keyboard(),
     )
     return LOGJOB_ASSIGN_ENGINEERS
 
@@ -2864,9 +2892,19 @@ async def logjob_order_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def logjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.user_data.get("log_job")
     engineers = job.get("assignable_engineers", [])
-    selected, error = parse_engineer_selection(update.message.text, engineers)
+    text = update.message.text.strip()
+
+    if is_blank_or_skip(text) or text.lower() in ["skip for now", "⏭️ skip for now", "awaiting dispatch", "unassigned", "0"]:
+        job["assigned_engineers"] = []
+        await update.message.reply_text(build_log_job_review(job), reply_markup=get_review_reply_keyboard())
+        return LOGJOB_REVIEW
+
+    selected, error = parse_engineer_selection(text, engineers)
     if error:
-        await update.message.reply_text(error + "\n\n" + format_engineer_selection_list(engineers))
+        await update.message.reply_text(
+            error + "\n\nOr tap Skip for now to create the job as Awaiting Dispatch.\n\n" + format_engineer_selection_list(engineers),
+            reply_markup=get_assign_engineer_keyboard(),
+        )
         return LOGJOB_ASSIGN_ENGINEERS
 
     job["assigned_engineers"] = selected
@@ -2915,12 +2953,16 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as folder_error:
             print(f"WARNING: Could not pre-create job folders for {job['cdr_number']}: {folder_error}")
 
-        sent_to_any, failed = await send_created_job_to_engineers(
-            context.bot,
-            item_id,
-            created_fields,
-            job.get("assigned_engineers", []),
-        )
+        assigned_engineers = job.get("assigned_engineers", [])
+        if assigned_engineers:
+            sent_to_any, failed = await send_created_job_to_engineers(
+                context.bot,
+                item_id,
+                created_fields,
+                assigned_engineers,
+            )
+        else:
+            sent_to_any, failed = False, []
 
         final_update = build_field_payload_for_list(
             site_id,
@@ -2937,9 +2979,10 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data.pop("log_job", None)
 
+        assigned_text = ', '.join(e['name'] for e in job.get('assigned_engineers', [])) or 'None - Awaiting Dispatch'
         message = (
             f"Job created in SharePoint: {job['cdr_number']}\n"
-            f"Assigned to: {', '.join(e['name'] for e in job.get('assigned_engineers', []))}\n"
+            f"Assigned to: {assigned_text}\n"
             f"Telegram sent: {'Yes' if sent_to_any else 'No'}"
         )
         if failed:
@@ -4349,7 +4392,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 found_any = True
                 await update.message.reply_text(
                     "Today's job:\n\n" + format_job(fields, current_engineer["name"]),
-                    reply_markup=get_job_buttons(item_id, ""),
+                    reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
                 )
 
         if not found_any:
@@ -6136,7 +6179,7 @@ async def send_new_jobs(app):
                     await app.bot.send_message(
                         chat_id=engineer["telegram_id"],
                         text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
-                        reply_markup=get_job_buttons(item_id, ""),
+                        reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
                     )
                     sent_to_any_engineer = True
                 except Exception as e:
@@ -6196,6 +6239,9 @@ async def remind_active_engineers_to_end_day(app):
         print(f"ERROR sending end-day reminders: {e}")
 
 
+GLOBAL_SCHEDULER = None
+
+
 async def post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -6203,6 +6249,7 @@ async def post_init(app):
     except Exception as e:
         print(f"Could not remove webhook: {e}")
 
+    global GLOBAL_SCHEDULER
     scheduler = AsyncIOScheduler(timezone=UK_TZ)
 
     scheduler.add_job(
@@ -6221,6 +6268,7 @@ async def post_init(app):
     )
 
     scheduler.start()
+    GLOBAL_SCHEDULER = scheduler
     print("Scheduler started.")
 
 
@@ -6400,6 +6448,233 @@ findjob_handler = ConversationHandler(
 )
 
 
+def get_quote_reminder_recipients(site_id):
+    engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+    engineers = get_list_items(site_id, engineers_list_id)
+    recipients = []
+
+    for item in engineers:
+        fields = item.get("fields", {})
+        active_value = get_field_value(fields, "Active")
+        if active_value not in [None, ""] and not bool_field(active_value):
+            continue
+
+        name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
+        telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
+        role = str(get_field_value(fields, "Role") or "Engineer").strip()
+
+        if name and telegram_id:
+            recipients.append({"name": name, "telegram_id": telegram_id, "role": role})
+
+    recipients.sort(key=lambda value: value["name"].lower())
+    return recipients
+
+
+def format_quote_recipient_list(recipients):
+    return "\n".join(
+        f"{index}. {recipient['name']} ({recipient.get('role', 'User')})"
+        for index, recipient in enumerate(recipients, start=1)
+    )
+
+
+def parse_quote_recipient_selection(text, recipients):
+    value = str(text or "").strip()
+    if not value.isdigit():
+        return None, "Please reply with the recipient number."
+
+    index = int(value)
+    if index < 1 or index > len(recipients):
+        return None, f"Recipient number {index} is not in the list."
+
+    return recipients[index - 1], ""
+
+
+async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "You do not have permission to create quote reminders.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        recipients = get_quote_reminder_recipients(site_id)
+        if not recipients:
+            await update.message.reply_text(
+                "No active Telegram users were found to send the quote reminder to.",
+                reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+            )
+            return ConversationHandler.END
+
+        context.user_data["quote_reminder"] = {"role": role, "recipients": recipients}
+        await update.message.reply_text(
+            "Quote reminder.\n\nWho should this be sent to? Reply with the number.\n\n" +
+            format_quote_recipient_list(recipients),
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+        )
+        return QUOTE_RECIPIENT
+
+    except Exception as e:
+        print(f"ERROR starting quote reminder: {e}")
+        await update.message.reply_text(
+            "There was an error opening Quote Reminder. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminder = context.user_data.get("quote_reminder")
+    if not reminder:
+        return await quote_reminder_start(update, context)
+
+    recipient, error = parse_quote_recipient_selection(update.message.text, reminder.get("recipients", []))
+    if error:
+        await update.message.reply_text(error + "\n\n" + format_quote_recipient_list(reminder.get("recipients", [])))
+        return QUOTE_RECIPIENT
+
+    reminder["recipient"] = recipient
+    await update.message.reply_text("Enter the client name.")
+    return QUOTE_CLIENT
+
+
+async def quote_reminder_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminder = context.user_data.get("quote_reminder")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the client name.")
+        return QUOTE_CLIENT
+
+    reminder["client"] = value
+    await update.message.reply_text("Enter the address / site to attend.")
+    return QUOTE_ADDRESS
+
+
+async def quote_reminder_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminder = context.user_data.get("quote_reminder")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the address / site to attend.")
+        return QUOTE_ADDRESS
+
+    reminder["address"] = value
+    await update.message.reply_text("Enter the time/date for the quote visit. Example: Today 14:00 or 15/05/2026 10:00.")
+    return QUOTE_TIME
+
+
+async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminder = context.user_data.get("quote_reminder")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter the time/date for the quote visit.")
+        return QUOTE_TIME
+
+    reminder["time"] = value
+    await update.message.reply_text("What is the job to scope / quote?")
+    return QUOTE_SCOPE
+
+
+async def quote_reminder_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminder = context.user_data.get("quote_reminder")
+    value = update.message.text.strip()
+    if is_blank_or_skip(value):
+        await update.message.reply_text("Please enter what needs to be scoped / quoted.")
+        return QUOTE_SCOPE
+
+    reminder["scope"] = value
+    await update.message.reply_text(
+        build_quote_reminder_review(reminder),
+        reply_markup=get_review_reply_keyboard(),
+    )
+    return QUOTE_REVIEW
+
+
+def build_quote_reminder_review(reminder):
+    recipient = reminder.get("recipient", {})
+    return (
+        "Please review this quote reminder:\n\n"
+        f"Send to: {recipient.get('name', '')}\n"
+        f"Client: {reminder.get('client', '')}\n"
+        f"Address: {reminder.get('address', '')}\n"
+        f"Time: {reminder.get('time', '')}\n"
+        f"Scope: {reminder.get('scope', '')}\n\n"
+        "Reply YES to send it now, NO to cancel, or RESTART to start again."
+    )
+
+
+async def send_quote_reminder(bot, chat_id, reminder):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "📌 Quote reminder\n\n"
+            f"Client: {reminder.get('client', '')}\n"
+            f"Address: {reminder.get('address', '')}\n"
+            f"Time: {reminder.get('time', '')}\n"
+            f"Scope: {reminder.get('scope', '')}\n\n"
+            f"Sent by: {reminder.get('set_by', 'Helpdesk')}"
+        ),
+    )
+
+
+async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminder = context.user_data.get("quote_reminder")
+    role = reminder.get("role", "Helpdesk") if reminder else "Helpdesk"
+    answer = update.message.text.strip().lower()
+    answer = answer.replace("✅", "").replace("❌", "").replace("🔄", "").strip()
+
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("quote_reminder", None)
+        await update.message.reply_text(
+            "Quote reminder cancelled.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if answer in ["restart", "redo"]:
+        context.user_data.pop("quote_reminder", None)
+        return await quote_reminder_start(update, context)
+
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to send it, NO to cancel, or RESTART to start again.")
+        return QUOTE_REVIEW
+
+    try:
+        recipient = reminder.get("recipient", {})
+        chat_id = recipient.get("telegram_id")
+        if not chat_id:
+            raise Exception("Selected recipient has no Telegram ID")
+
+        reminder["set_by"] = update.effective_user.full_name or "Helpdesk"
+        await send_quote_reminder(context.bot, chat_id, reminder)
+        context.user_data.pop("quote_reminder", None)
+        await update.message.reply_text(
+            f"Quote reminder sent to {recipient.get('name', 'recipient')}.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR sending quote reminder: {e}")
+        await update.message.reply_text(
+            "There was an error sending the quote reminder. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def quote_reminder_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("quote_reminder", None)
+    await update.message.reply_text(
+        "Quote reminder cancelled.",
+        reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+    )
+    return ConversationHandler.END
+
+
 logjob_handler = ConversationHandler(
     entry_points=[
         CommandHandler("logjob", logjob_start),
@@ -6421,6 +6696,23 @@ logjob_handler = ConversationHandler(
     },
     fallbacks=[CommandHandler("cancel", logjob_cancel)],
 )
+
+quote_reminder_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("quotereminder", quote_reminder_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_QUOTE_REMINDER)}$"), quote_reminder_start),
+    ],
+    states={
+        QUOTE_RECIPIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_recipient)],
+        QUOTE_CLIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_client)],
+        QUOTE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_address)],
+        QUOTE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_time)],
+        QUOTE_SCOPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_scope)],
+        QUOTE_REVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_reminder_review)],
+    },
+    fallbacks=[CommandHandler("cancel", quote_reminder_cancel)],
+)
+
 
 abortjob_handler = ConversationHandler(
     entry_points=[
@@ -6444,13 +6736,14 @@ telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(receipt_handler)
 telegram_app.add_handler(logjob_handler)
+telegram_app.add_handler(quote_reminder_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_QUOTE_REMINDER}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
