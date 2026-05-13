@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "request-job-v1"
+BUILD_VERSION = "request-job-helpdesk-users-v2"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2534,15 +2534,45 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+def get_active_helpdesk_users(engineers):
+    """Return active Helpdesk users from the Engineers list with Telegram IDs.
+
+    Admin users are intentionally excluded unless their Role is set to Helpdesk.
+    This keeps engineer job requests going to helpdesk phones only.
+    """
+    users = []
+    seen_telegram_ids = set()
+
+    for item in engineers:
+        fields = item.get("fields", {})
+        role = str(get_field_value(fields, "Role") or "").strip().lower()
+        if role != "helpdesk":
+            continue
+
+        active_value = get_field_value(fields, "Active")
+        if active_value not in [None, ""] and not bool_field(active_value):
+            continue
+
+        telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
+        if not telegram_id or telegram_id in seen_telegram_ids:
+            continue
+
+        name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "Helpdesk").strip()
+        users.append({"name": name, "telegram_id": telegram_id})
+        seen_telegram_ids.add(telegram_id)
+
+    return users
+
+
 async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Engineer one-tap request for another job.
 
     This does not start a conversation and does not change any SharePoint job.
-    It simply notifies the helpdesk chat that the engineer is ready / requesting work.
+    It privately notifies every active Helpdesk user in the Engineers list.
     """
     try:
         user_id = str(update.effective_user.id)
-        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+        site_id, engineers_list_id, _, current_engineer = get_engineer_for_telegram_id(user_id)
         role = get_bot_user_role(site_id, user_id)
 
         if str(role).lower() not in ["engineer", "admin"]:
@@ -2553,26 +2583,50 @@ async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         engineer_name = current_engineer["name"] if current_engineer else (update.effective_user.full_name or user_id)
+        engineers = get_list_items(site_id, engineers_list_id)
+        helpdesk_users = get_active_helpdesk_users(engineers)
 
-        if not HELPDESK_CHAT_ID:
+        if not helpdesk_users:
             await update.message.reply_text(
-                "Helpdesk notifications are not set up yet. Please ask the office to check HELPDESK_CHAT_ID.",
+                "No active Helpdesk users with Telegram IDs were found. Please ask the office to check the Engineers list Role, Active and TelegramID columns.",
                 reply_markup=get_main_menu(role),
             )
             return
 
-        await context.bot.send_message(
-            chat_id=HELPDESK_CHAT_ID,
-            text=(
-                "📣 Engineer job request\n\n"
-                f"Engineer: {engineer_name}\n"
-                f"Time: {now_log_time()}\n\n"
-                "The engineer has requested another job / next instruction."
-            ),
+        message = (
+            "📣 Job Request\n\n"
+            f"Engineer: {engineer_name}\n"
+            f"Time: {now_log_time()}\n\n"
+            f"{engineer_name} is requesting another job / next instruction."
         )
 
+        sent_count = 0
+        failed = []
+
+        for helpdesk_user in helpdesk_users:
+            try:
+                await context.bot.send_message(
+                    chat_id=helpdesk_user["telegram_id"],
+                    text=message,
+                )
+                sent_count += 1
+            except Exception as send_error:
+                failed.append(helpdesk_user["name"])
+                print(f"WARNING: Could not send job request to {helpdesk_user['name']}: {send_error}")
+
+        if sent_count == 0:
+            await update.message.reply_text(
+                "I found Helpdesk users, but could not send the request. Please check their Telegram IDs and that they have started the bot.",
+                reply_markup=get_main_menu(role),
+            )
+            return
+
+        reply = f"Request sent to {sent_count} Helpdesk user(s)."
+        if failed:
+            reply += f"\n\nNot sent to: {', '.join(failed)}"
+
         await update.message.reply_text(
-            "Request sent to Helpdesk.",
+            reply,
             reply_markup=get_main_menu(role),
         )
 
