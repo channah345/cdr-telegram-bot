@@ -50,7 +50,7 @@ SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "receipt-upload-silent-userlocked-v1"
+BUILD_VERSION = "receipt-upload-silent-userlocked-fix-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -4385,6 +4385,106 @@ async def receipt_engineer_name(update: Update, context: ContextTypes.DEFAULT_TY
     # Retired: receipt uploads are now locked to the logged-in Telegram user's
     # EngineerName from SharePoint so nobody can submit receipts under another name.
     return await receipt_date(update, context)
+
+
+async def receipt_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, RECEIPT_DATE)
+    if menu_result is not None:
+        return menu_result
+
+    data = context.user_data.get("receipt_upload")
+    if not data:
+        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    parsed_date = parse_helpdesk_job_date(update.message.text)
+    if not parsed_date:
+        await update.message.reply_text("Please enter a valid date, for example 12/05/2026 or TODAY.")
+        return RECEIPT_DATE
+
+    data["receipt_date"] = parsed_date
+
+    await update.message.reply_text(
+        f"Receipt upload ready.\n\nEngineer: {data['engineer_name']}\nDate: {parsed_date}\n\n"
+        "Now send all receipt photos/PDFs/files.\n\nType DONE when finished."
+    )
+    return RECEIPT_UPLOADS
+
+
+async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    menu_result = await handle_menu_during_conversation(update, context, RECEIPT_UPLOADS)
+    if menu_result is not None:
+        return menu_result
+
+    data = context.user_data.get("receipt_upload")
+    if not data:
+        await update.message.reply_text("Please start again from 🧾 Upload Receipts.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    if update.message.text and update.message.text.strip().upper() == "DONE":
+        count = len(data.get("receipt_links", []))
+        if count == 0:
+            await update.message.reply_text("No receipts uploaded yet. Send at least one receipt, or type /cancel to cancel.")
+            return RECEIPT_UPLOADS
+
+        context.user_data.pop("receipt_upload", None)
+        await update.message.reply_text(
+            f"Receipts uploaded for finance.\n\nEngineer: {data['engineer_name']}\nDate: {data['receipt_date']}\nFiles uploaded: {count}",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
+    try:
+        file_bytes = None
+        extension = "jpg"
+        unique_id = "receipt"
+
+        if update.message.photo:
+            photo = update.message.photo[-1]
+            telegram_file = await context.bot.get_file(photo.file_id)
+            file_bytes = await telegram_file.download_as_bytearray()
+            unique_id = photo.file_unique_id
+            extension = "jpg"
+
+        elif update.message.document:
+            document = update.message.document
+            telegram_file = await context.bot.get_file(document.file_id)
+            file_bytes = await telegram_file.download_as_bytearray()
+            unique_id = document.file_unique_id
+            original_name = clean_receipt_file_name(document.file_name or "receipt")
+            if "." in original_name:
+                extension = original_name.rsplit(".", 1)[1].lower()
+            else:
+                extension = "bin"
+
+        else:
+            await update.message.reply_text("Please send a receipt photo/file, or type DONE when finished.")
+            return RECEIPT_UPLOADS
+
+        data["receipt_count"] = int(data.get("receipt_count", 0)) + 1
+        timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
+        engineer_part = safe_folder_name(data.get("engineer_name", "ENGINEER"))
+        file_name = f"{data['receipt_date']}_{engineer_part}_{timestamp}_{data['receipt_count']}_{unique_id}.{extension}"
+
+        receipt_link = upload_receipt_to_sharepoint(
+            data["site_id"],
+            data["receipt_date"],
+            data["engineer_name"],
+            file_name,
+            bytes(file_bytes),
+        )
+        data["receipt_links"].append(receipt_link)
+
+        # Intentionally no per-file confirmation. Engineers can upload all receipts
+        # and type DONE once finished to avoid Telegram message spam.
+        return RECEIPT_UPLOADS
+
+    except Exception as e:
+        print(f"ERROR uploading receipt: {e}")
+        await update.message.reply_text(
+            "There was an error uploading that receipt. Please try again or ask the office to check Railway logs."
+        )
+        return RECEIPT_UPLOADS
 
 
 async def receipt_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
