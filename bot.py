@@ -54,7 +54,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "worksheet-docx-engineer-summary-green-folder-v1"
+BUILD_VERSION = "quote-multiple-recipients-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -7464,15 +7464,32 @@ def format_quote_recipient_list(recipients):
 
 
 def parse_quote_recipient_selection(text, recipients):
-    value = str(text or "").strip()
-    if not value.isdigit():
-        return None, "Please reply with the recipient number."
+    value = str(text or "").replace(";", ",").strip()
+    selected = []
+    seen_ids = set()
 
-    index = int(value)
-    if index < 1 or index > len(recipients):
-        return None, f"Recipient number {index} is not in the list."
+    if not value:
+        return None, "Please reply with recipient number(s), e.g. 1 or 1,2."
 
-    return recipients[index - 1], ""
+    for part in [p.strip() for p in value.split(",") if p.strip()]:
+        if not part.isdigit():
+            return None, "Please reply with recipient number(s), e.g. 1 or 1,2."
+
+        index = int(part)
+        if index < 1 or index > len(recipients):
+            return None, f"Recipient number {index} is not in the list."
+
+        recipient = recipients[index - 1]
+        recipient_id = str(recipient.get("telegram_id") or recipient.get("name") or index)
+
+        if recipient_id not in seen_ids:
+            selected.append(recipient)
+            seen_ids.add(recipient_id)
+
+    if not selected:
+        return None, "Please select at least one recipient."
+
+    return selected, ""
 
 
 async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7523,12 +7540,13 @@ async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT
     if not reminder:
         return await quote_reminder_start(update, context)
 
-    recipient, error = parse_quote_recipient_selection(update.message.text, reminder.get("recipients", []))
+    recipients, error = parse_quote_recipient_selection(update.message.text, reminder.get("recipients", []))
     if error:
         await update.message.reply_text(error + "\n\n" + format_quote_recipient_list(reminder.get("recipients", [])))
         return QUOTE_RECIPIENT
 
-    reminder["recipient"] = recipient
+    reminder["recipients_selected"] = recipients
+    reminder["recipient"] = recipients[0]
     await update.message.reply_text("Enter the client name.")
     return QUOTE_CLIENT
 
@@ -7649,16 +7667,34 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
         return QUOTE_REVIEW
 
     try:
-        recipient = reminder.get("recipient", {})
-        chat_id = recipient.get("telegram_id")
-        if not chat_id:
-            raise Exception("Selected recipient has no Telegram ID")
-
+        recipients_to_send = reminder.get("recipients_selected") or [reminder.get("recipient", {})]
         reminder["set_by"] = update.effective_user.full_name or "Helpdesk"
-        await send_quote_reminder(context.bot, chat_id, reminder)
+
+        sent_names = []
+        failed_names = []
+
+        for recipient in recipients_to_send:
+            chat_id = recipient.get("telegram_id")
+            if not chat_id:
+                failed_names.append(recipient.get("name", "Unknown"))
+                continue
+
+            try:
+                await send_quote_reminder(context.bot, chat_id, reminder)
+                sent_names.append(recipient.get("name", "recipient"))
+            except Exception as send_error:
+                failed_names.append(f"{recipient.get('name', 'Unknown')}: {send_error}")
+
+        if not sent_names:
+            raise Exception("No quote reminders were sent. " + "; ".join(failed_names))
+
         context.user_data.pop("quote_reminder", None)
+        message = f"Quote reminder sent to {', '.join(sent_names)}."
+        if failed_names:
+            message += f"\n\nFailed: {'; '.join(failed_names)}"
+
         await update.message.reply_text(
-            f"Quote reminder sent to {recipient.get('name', 'recipient')}.",
+            message,
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
