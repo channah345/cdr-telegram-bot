@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-stable-logo-v17"
+BUILD_VERSION = "dashboard-stable-logo-v18"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2747,13 +2747,7 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
         @media (max-width:960px) {{ .panel-grid {{ grid-template-columns:1fr; }} }}
         @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
     
-.brand-logo {
-    height: 44px;
-    width: auto;
-    max-width: 180px;
-    object-fit: contain;
-    display: block;
-}
+
 
 </style>
 </head>
