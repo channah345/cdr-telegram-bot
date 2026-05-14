@@ -7808,7 +7808,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             signature_text = (
                 f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
                 "Signed Digitally: Yes\n"
-                "Signature image is saved against the job in SharePoint."
+                "Signature image is saved against the job record in SharePoint."
             )
         else:
             signature_text = "Client signature required but not received."
@@ -7816,16 +7816,15 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         signature_text = "Client signature not required."
 
     body = []
-    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="center", spacing_after=60))
-    body.append(docx_paragraph(
-        "CDR M&E Services Ltd\n"
-        "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\n"
-        "Telephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\n"
-        "VAT Number: 397715249 | Company No.: 13744971",
-        size=17,
-        align="center",
-        spacing_after=160,
+    body.append(docx_table(
+        [["CDR M&E Services Ltd", "JOB WORKSHEET"],
+         ["6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\nTelephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\nVAT Number: 397715249 | Company No.: 13744971", f"Job Number: {cdr_number}\nDate Complete: {date_complete}"]],
+        header_first=True,
+        header_orange=False,
+        widths=[6200, 4120],
+        label_columns={0, 1},
     ))
+    body.append(docx_spacer(110))
 
     body.append(docx_table(
         [["Customer Details", "Site Details"], [customer_details, site_details]],
@@ -7847,7 +7846,8 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     body.append(docx_spacer(110))
 
     body.append(docx_section("Description", task))
-    body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
+    body.append(docx_table([["Visits"]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH]))
+    body.append(docx_table(visit_rows, header_first=True, header_orange=False, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
     body.append(docx_spacer(110))
     body.append(docx_section("Engineer Comment", comments))
     body.append(docx_section("Client Signature", signature_text))
@@ -8759,6 +8759,35 @@ def parse_quote_recipient_selection(text, recipients):
     return selected, ""
 
 
+def get_quote_recipient_inline_keyboard(recipients):
+    rows = []
+    for index, recipient in enumerate(recipients, start=1):
+        rows.append([InlineKeyboardButton(
+            f"{index}. {recipient.get('name', 'Recipient')}",
+            callback_data=f"quote_recipient|{index}",
+        )])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="quote_recipient|cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_quote_time_inline_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("ASAP", callback_data="quote_time|ASAP")],
+        [InlineKeyboardButton("08:00", callback_data="quote_time|08:00"), InlineKeyboardButton("11:00", callback_data="quote_time|11:00")],
+        [InlineKeyboardButton("14:00", callback_data="quote_time|14:00"), InlineKeyboardButton("✏️ Custom", callback_data="quote_time|custom")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="quote_time|cancel")],
+    ])
+
+
+def get_quote_review_inline_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Send task / activity", callback_data="quote_review|yes")],
+        [InlineKeyboardButton("🔄 Restart", callback_data="quote_review|restart")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="quote_review|no")],
+    ])
+
+
+
 async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -8767,7 +8796,7 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not user_can_use_helpdesk(role):
         await update.message.reply_text(
-            "You do not have permission to create task / activitys.",
+            "You do not have permission to create tasks / activities.",
             reply_markup=get_main_menu(role),
         )
         return ConversationHandler.END
@@ -8784,9 +8813,8 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
         context.user_data["quote_reminder"] = {"role": role, "recipients": recipients}
         await update.message.reply_text(
-            "Quote reminder.\n\nWho should this be sent to? Reply with the number.\n\n" +
-            format_quote_recipient_list(recipients),
-            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+            "Task / Activity.\n\nWho should this be sent to?",
+            reply_markup=get_quote_recipient_inline_keyboard(recipients),
         )
         return QUOTE_RECIPIENT
 
@@ -8797,6 +8825,40 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
+
+
+async def quote_reminder_recipient_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    reminder = context.user_data.get("quote_reminder")
+    if not reminder:
+        await query.message.reply_text("Task / Activity has expired. Please start again.")
+        return ConversationHandler.END
+
+    value = query.data.split("|", 1)[1]
+    role = reminder.get("role", "Helpdesk")
+
+    if value == "cancel":
+        context.user_data.pop("quote_reminder", None)
+        await query.message.reply_text(
+            "Task / Activity cancelled.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    recipients = reminder.get("recipients", [])
+    try:
+        index = int(value)
+        recipient = recipients[index - 1]
+    except Exception:
+        await query.message.reply_text("Please select a recipient from the buttons.")
+        return QUOTE_RECIPIENT
+
+    reminder["recipients_selected"] = [recipient]
+    reminder["recipient"] = recipient
+    await query.message.reply_text(f"Selected: {recipient.get('name', '')}\n\nEnter the client name.")
+    return QUOTE_CLIENT
 
 
 async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8844,8 +8906,40 @@ async def quote_reminder_address(update: Update, context: ContextTypes.DEFAULT_T
         return QUOTE_ADDRESS
 
     reminder["address"] = value
-    await update.message.reply_text("Enter the time/date for the quote visit. Example: Today 14:00 or 15/05/2026 10:00.")
+    await update.message.reply_text(
+        "Select the time for this task / activity.",
+        reply_markup=get_quote_time_inline_keyboard(),
+    )
     return QUOTE_TIME
+
+
+async def quote_reminder_time_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    reminder = context.user_data.get("quote_reminder")
+    if not reminder:
+        await query.message.reply_text("Task / Activity has expired. Please start again.")
+        return ConversationHandler.END
+
+    value = query.data.split("|", 1)[1]
+    role = reminder.get("role", "Helpdesk")
+
+    if value == "cancel":
+        context.user_data.pop("quote_reminder", None)
+        await query.message.reply_text(
+            "Task / Activity cancelled.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+    if value == "custom":
+        await query.message.reply_text("Enter the custom time/date. Example: Today 14:00 or 15/05/2026 10:00.")
+        return QUOTE_TIME
+
+    reminder["time"] = value
+    await query.message.reply_text("What is the job/task/activity?")
+    return QUOTE_SCOPE
 
 
 async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8855,11 +8949,11 @@ async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the time/date for the quote visit.")
+        await update.message.reply_text("Please select a time or enter the custom time/date.")
         return QUOTE_TIME
 
     reminder["time"] = value
-    await update.message.reply_text("What is the job to scope / quote?")
+    await update.message.reply_text("What is the job/task/activity?")
     return QUOTE_SCOPE
 
 
@@ -8870,13 +8964,13 @@ async def quote_reminder_scope(update: Update, context: ContextTypes.DEFAULT_TYP
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter what needs to be scoped / quoted.")
+        await update.message.reply_text("Please enter the job/task/activity details.")
         return QUOTE_SCOPE
 
     reminder["scope"] = value
     await update.message.reply_text(
         build_quote_reminder_review(reminder),
-        reply_markup=get_review_reply_keyboard(),
+        reply_markup=get_quote_review_inline_keyboard(),
     )
     return QUOTE_REVIEW
 
@@ -8890,7 +8984,7 @@ def build_quote_reminder_review(reminder):
         f"Address: {reminder.get('address', '')}\n"
         f"Time: {reminder.get('time', '')}\n"
         f"Scope: {reminder.get('scope', '')}\n\n"
-        "Reply YES to send it now, NO to cancel, or RESTART to start again."
+        "Use the buttons below to send, cancel, or restart."
     )
 
 
@@ -8898,7 +8992,7 @@ async def send_quote_reminder(bot, chat_id, reminder):
     await bot.send_message(
         chat_id=chat_id,
         text=(
-            "📌 Quote reminder\n\n"
+            "📌 Task / Activity\n\n"
             f"Client: {reminder.get('client', '')}\n"
             f"Address: {reminder.get('address', '')}\n"
             f"Time: {reminder.get('time', '')}\n"
@@ -8906,6 +9000,28 @@ async def send_quote_reminder(bot, chat_id, reminder):
             f"Sent by: {reminder.get('set_by', 'Helpdesk')}"
         ),
     )
+
+
+async def quote_reminder_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    class _MessageProxy:
+        def __init__(self, message, text):
+            self._message = message
+            self.text = text
+        async def reply_text(self, *args, **kwargs):
+            return await self._message.reply_text(*args, **kwargs)
+
+    class _UpdateProxy:
+        def __init__(self, original_update, text):
+            self.effective_chat = original_update.effective_chat
+            self.effective_user = original_update.effective_user
+            self.message = _MessageProxy(query.message, text)
+
+    value = query.data.split("|", 1)[1]
+    mapped = {"yes": "yes", "no": "no", "restart": "restart"}.get(value, "")
+    return await quote_reminder_review(_UpdateProxy(update, mapped), context)
 
 
 async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8920,7 +9036,7 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
     if answer in ["no", "n", "cancel"]:
         context.user_data.pop("quote_reminder", None)
         await update.message.reply_text(
-            "Quote reminder cancelled.",
+            "Task / Activity cancelled.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
@@ -8930,7 +9046,7 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
         return await quote_reminder_start(update, context)
 
     if answer not in ["yes", "y"]:
-        await update.message.reply_text("Reply YES to send it, NO to cancel, or RESTART to start again.")
+        await update.message.reply_text("Use the buttons to send it, cancel, or restart.")
         return QUOTE_REVIEW
 
     try:
@@ -8953,10 +9069,10 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
                 failed_names.append(f"{recipient.get('name', 'Unknown')}: {send_error}")
 
         if not sent_names:
-            raise Exception("No task / activitys were sent. " + "; ".join(failed_names))
+            raise Exception("No tasks / activities were sent. " + "; ".join(failed_names))
 
         context.user_data.pop("quote_reminder", None)
-        message = f"Quote reminder sent to {', '.join(sent_names)}."
+        message = f"Task / Activity sent to {', '.join(sent_names)}."
         if failed_names:
             message += f"\n\nFailed: {'; '.join(failed_names)}"
 
@@ -8982,7 +9098,7 @@ async def quote_reminder_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     role = await get_role_for_update(update)
     context.user_data.pop("quote_reminder", None)
     await update.message.reply_text(
-        "Quote reminder cancelled.",
+        "Task / Activity cancelled.",
         reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
     )
     return ConversationHandler.END
@@ -9016,12 +9132,21 @@ quote_reminder_handler = ConversationHandler(
         MessageHandler(filters.Regex(f"^{re.escape(MENU_QUOTE_REMINDER)}$"), quote_reminder_start),
     ],
     states={
-        QUOTE_RECIPIENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_recipient)],
+        QUOTE_RECIPIENT: [
+            CallbackQueryHandler(quote_reminder_recipient_button, pattern=r"^quote_recipient\|"),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_recipient),
+        ],
         QUOTE_CLIENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_client)],
         QUOTE_ADDRESS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_address)],
-        QUOTE_TIME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_time)],
+        QUOTE_TIME: [
+            CallbackQueryHandler(quote_reminder_time_button, pattern=r"^quote_time\|"),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_time),
+        ],
         QUOTE_SCOPE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_scope)],
-        QUOTE_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_review)],
+        QUOTE_REVIEW: [
+            CallbackQueryHandler(quote_reminder_review_button, pattern=r"^quote_review\|"),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_review),
+        ],
     },
     fallbacks=[CommandHandler("cancel", quote_reminder_cancel)],
 )
