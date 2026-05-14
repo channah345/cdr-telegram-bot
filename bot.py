@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "live-dashboard-v12"
+BUILD_VERSION = "dashboard-pages-v13"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2497,8 +2497,267 @@ def dashboard_metric_summary(rows, jobs_data):
     }
 
 
+
+def dashboard_job_date(fields):
+    return parse_sharepoint_date_to_date(get_field_value(fields, "Date", "Job Date", "Created"))
+
+
+def dashboard_job_is_open(fields):
+    status = str(get_field_value(fields, "Status") or "").strip()
+    outcome = str(get_field_value(fields, "JobOutcome", "Job Outcome") or "").strip()
+    if status == COMPLETED_STATUS or outcome == "Completed":
+        return False
+    return True
+
+
+def dashboard_job_rows(jobs_data):
+    today = datetime.now(UK_TZ).date()
+    rows = []
+
+    for job in jobs_data or []:
+        fields = job.get("fields", {})
+        cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+        site = get_field_value(fields, "SiteName", "Site Name") or ""
+        customer = get_field_value(fields, "CustomerName", "Customer Name") or ""
+        status = str(get_field_value(fields, "Status") or "").strip() or "No Status"
+        outcome = str(get_field_value(fields, "JobOutcome", "Job Outcome") or "").strip()
+        category = get_field_value(fields, "JobCategory", "Job Category") or ""
+        task = get_field_value(fields, "Task") or ""
+        job_date = dashboard_job_date(fields)
+        date_text = job_date.strftime("%d/%m/%Y") if job_date else ""
+        assigned_names = []
+        engineer_values = fields.get("Engineer", [])
+        if isinstance(engineer_values, list):
+            for engineer in engineer_values:
+                value = engineer.get("LookupValue")
+                if value:
+                    assigned_names.append(str(value))
+        assigned = ", ".join(assigned_names) or "Unassigned"
+        open_job = dashboard_job_is_open(fields)
+        overdue = open_job and job_date and job_date < today
+
+        rows.append({
+            "cdr": cdr,
+            "site": site,
+            "customer": customer,
+            "status": status,
+            "outcome": outcome,
+            "category": category,
+            "task": str(task)[:150],
+            "date": date_text,
+            "date_obj": job_date,
+            "assigned": assigned,
+            "open": open_job,
+            "overdue": overdue,
+            "awaiting": status in [AWAITING_DEPLOYMENT_STATUS, LEGACY_AWAITING_DEPLOYMENT_STATUS, "Awaiting Dispatch", "Awaiting Deployment"],
+            "completed_today": (status == COMPLETED_STATUS or outcome == "Completed") and job_date == today,
+            "revisit": outcome == "Revisit Required" or status == "Revisit Required",
+            "no_access": outcome == "No Access" or status == "No Access",
+        })
+
+    def sort_key(row):
+        if row["overdue"]:
+            rank = 0
+        elif row["awaiting"]:
+            rank = 1
+        elif row["open"]:
+            rank = 2
+        elif row["completed_today"]:
+            rank = 3
+        else:
+            rank = 4
+        return (rank, row["date_obj"] or today, row["cdr"])
+
+    rows.sort(key=sort_key)
+    return rows
+
+
+def dashboard_ops_summary(rows, job_rows):
+    active = sum(1 for row in rows if row.get("css") not in ["not-started", "ended"])
+    return {
+        "active_engineers": active,
+        "open_jobs": sum(1 for job in job_rows if job["open"]),
+        "awaiting_dispatch": sum(1 for job in job_rows if job["awaiting"]),
+        "overdue": sum(1 for job in job_rows if job["overdue"]),
+        "completed_today": sum(1 for job in job_rows if job["completed_today"]),
+        "revisit": sum(1 for job in job_rows if job["revisit"]),
+        "no_access": sum(1 for job in job_rows if job["no_access"]),
+    }
+
+
+def dashboard_nav(view, token):
+    token_part = f"&token={quote_plus(str(token))}" if token else ""
+    items = [
+        ("engineers", "Engineer Board"),
+        ("ops", "Ops Board"),
+        ("jobs", "Open Jobs"),
+        ("sla", "SLA / Overdue"),
+        ("reports", "Reports"),
+    ]
+    links = []
+    for key, label in items:
+        href = f"/dashboard?view={key}{token_part}"
+        active = "active" if view == key else ""
+        links.append(f"<a class='{active}' href='{html_safe(href)}'>{html_safe(label)}</a>")
+    return "".join(links)
+
+
+def dashboard_job_status_class(row):
+    if row.get("overdue"):
+        return "danger"
+    if row.get("awaiting"):
+        return "amber"
+    if row.get("completed_today"):
+        return "good"
+    if row.get("open"):
+        return "blue"
+    return "muted"
+
+
+def render_job_table(job_rows, mode="open"):
+    if mode == "sla":
+        filtered = [job for job in job_rows if job["overdue"]]
+    elif mode == "reports":
+        filtered = [job for job in job_rows if job["completed_today"] or job["revisit"] or job["no_access"]]
+    else:
+        filtered = [job for job in job_rows if job["open"]]
+
+    filtered = filtered[:80]
+    if not filtered:
+        return "<div class='empty'>No jobs to show for this view.</div>"
+
+    rows_html = []
+    for job in filtered:
+        rows_html.append(f"""
+            <tr>
+                <td><strong>{html_safe(job['cdr'])}</strong><br><span>{html_safe(job['date'])}</span></td>
+                <td><strong>{html_safe(job['site'])}</strong><br><span>{html_safe(job['customer'])}</span></td>
+                <td>{html_safe(job['assigned'])}</td>
+                <td><span class='pill {dashboard_job_status_class(job)}'>{html_safe(job['status'])}</span></td>
+                <td>{html_safe(job['task'])}</td>
+            </tr>
+        """)
+
+    return f"""
+    <div class='table-wrap'>
+        <table>
+            <thead><tr><th>Job</th><th>Site / Customer</th><th>Engineer</th><th>Status</th><th>Task</th></tr></thead>
+            <tbody>{''.join(rows_html)}</tbody>
+        </table>
+    </div>
+    """
+
+
+def render_dashboard_page(view, token, generated, summary, rows, job_rows, engineer_cards_html):
+    view = view or "engineers"
+    nav = dashboard_nav(view, token)
+    ops = dashboard_ops_summary(rows, job_rows)
+
+    top_metrics = f"""
+        <div class='summary-card'><span>Active Engineers</span><strong>{html_safe(ops['active_engineers'])}</strong></div>
+        <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(ops['open_jobs'])}</strong></div>
+        <div class='summary-card amber'><span>Awaiting Dispatch</span><strong>{html_safe(ops['awaiting_dispatch'])}</strong></div>
+        <div class='summary-card danger'><span>Overdue</span><strong>{html_safe(ops['overdue'])}</strong></div>
+        <div class='summary-card good'><span>Completed Today</span><strong>{html_safe(ops['completed_today'])}</strong></div>
+        <div class='summary-card blue'><span>Revisit</span><strong>{html_safe(ops['revisit'])}</strong></div>
+        <div class='summary-card'><span>No Access</span><strong>{html_safe(ops['no_access'])}</strong></div>
+    """
+
+    if view == "ops":
+        content = f"""
+            <section class='summary'>{top_metrics}</section>
+            <section class='panel-grid'>
+                <div class='panel'><h2>Priority Queue</h2>{render_job_table(job_rows, 'open')}</div>
+                <div class='panel'><h2>Engineer Snapshot</h2><div class='mini-grid'>{engineer_cards_html}</div></div>
+            </section>
+        """
+        title = "Ops Board"
+    elif view == "jobs":
+        content = f"<section class='summary'>{top_metrics}</section><section class='panel'><h2>Open Jobs</h2>{render_job_table(job_rows, 'open')}</section>"
+        title = "Open Jobs"
+    elif view == "sla":
+        content = f"<section class='summary'>{top_metrics}</section><section class='panel'><h2>SLA / Overdue Jobs</h2>{render_job_table(job_rows, 'sla')}</section>"
+        title = "SLA / Overdue"
+    elif view == "reports":
+        content = f"""
+            <section class='summary'>{top_metrics}</section>
+            <section class='panel-grid'>
+                <div class='panel'><h2>Today / Exceptions</h2>{render_job_table(job_rows, 'reports')}</div>
+                <div class='panel'><h2>Notes</h2><div class='empty'>This page is read-only for now. Next stage can add weekly reports, engineer performance and client summaries.</div></div>
+            </section>
+        """
+        title = "Reports"
+    else:
+        metric_cards = f"""
+            <div class='summary-card'><span>Active</span><strong>{html_safe(summary['active'])}</strong></div>
+            <div class='summary-card good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong></div>
+            <div class='summary-card blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong></div>
+            <div class='summary-card amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong></div>
+            <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong></div>
+            <div class='summary-card'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong></div>
+            <div class='summary-card'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong></div>
+        """
+        content = f"<section class='summary'>{metric_cards}</section><section class='grid'>{engineer_cards_html if engineer_cards_html else '<p>No engineers found.</p>'}</section>"
+        title = "Engineer Dashboard"
+
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CDR {html_safe(title)}</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <meta http-equiv='refresh' content='30'>
+    <style>
+        :root {{
+            --orange:#f58220; --dark:#0f172a; --muted:#64748b; --bg:#eef2f7; --card:#ffffff; --line:#e5e7eb;
+            --green:#16a34a; --blue:#2563eb; --amber:#f59e0b; --red:#dc2626; --purple:#7c3aed; --grey:#6b7280;
+        }}
+        body {{ margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--dark); }}
+        header {{ background:#0b1220; color:white; padding:18px 28px; box-shadow:0 3px 18px rgba(0,0,0,.20); }}
+        .header-row {{ display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; }}
+        header h1 {{ margin:0; font-size:29px; letter-spacing:-.5px; }}
+        header .sub {{ color:#cbd5e1; font-size:14px; margin-top:5px; }}
+        .logo {{ font-weight:900; color:var(--orange); font-size:31px; letter-spacing:2px; }}
+        nav {{ margin-top:16px; display:flex; gap:8px; flex-wrap:wrap; }}
+        nav a {{ color:#e5e7eb; text-decoration:none; padding:9px 13px; border-radius:999px; background:#1f2937; font-weight:800; font-size:13px; }}
+        nav a.active {{ background:var(--orange); color:#111827; }}
+        .wrap {{ padding:22px; }}
+        .summary {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:18px; }}
+        .summary-card {{ background:#fff; border-radius:16px; padding:14px 16px; box-shadow:0 6px 18px rgba(15,23,42,.08); border-top:5px solid #334155; }}
+        .summary-card.good {{ border-top-color:var(--green); }} .summary-card.blue {{ border-top-color:var(--blue); }} .summary-card.amber {{ border-top-color:var(--amber); }} .summary-card.danger {{ border-top-color:var(--red); }}
+        .summary-card span {{ display:block; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }}
+        .summary-card strong {{ display:block; margin-top:6px; font-size:24px; }}
+        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap:18px; align-items:stretch; }}
+        .mini-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:14px; }}
+        .panel-grid {{ display:grid; grid-template-columns: 1.35fr .9fr; gap:18px; align-items:start; }}
+        .panel {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); }}
+        .panel h2 {{ margin:0 0 14px 0; }}
+        .card {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); border-left:9px solid #9ca3af; min-height:265px; }}
+        .card.on-site {{ border-left-color:var(--green); }} .card.travelling {{ border-left-color:var(--blue); }} .card.active {{ border-left-color:var(--purple); }} .card.idle {{ border-left-color:var(--amber); }} .card.ended {{ border-left-color:var(--grey); opacity:.88; }} .card.not-started {{ border-left-color:var(--red); opacity:.82; }}
+        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }} .identity {{ display:flex; gap:12px; align-items:center; }}
+        .avatar {{ width:42px; height:42px; border-radius:14px; display:flex; align-items:center; justify-content:center; background:#111827; color:#fff; font-weight:900; }}
+        h2 {{ margin:0; font-size:21px; }} .status {{ display:inline-block; margin-top:7px; padding:6px 10px; background:#f1f5f9; border-radius:999px; font-size:13px; font-weight:800; }}
+        .util {{ min-width:72px; text-align:center; background:#334155; color:white; border-radius:15px; padding:9px 10px; font-weight:900; font-size:16px; }} .util-good {{ background:var(--green); }} .util-mid {{ background:var(--amber); color:#111827; }} .util-low {{ background:var(--red); }} .util-none {{ background:#374151; }}
+        .main-status {{ margin-top:18px; padding:15px; border-radius:16px; background:#f8fafc; border:1px solid var(--line); text-align:center; }} .main-label {{ color:var(--muted); font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }} .main-value {{ margin-top:5px; font-size:28px; font-weight:900; letter-spacing:-.5px; }}
+        .job-block {{ margin-top:16px; min-height:54px; }} .job {{ font-size:17px; font-weight:900; }} .site {{ margin-top:3px; color:#334155; font-weight:700; }} .detail {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.35; }} .since {{ color:var(--muted); font-size:14px; margin-top:7px; }}
+        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }} .metrics div {{ background:#f9fafb; border:1px solid var(--line); padding:10px; border-radius:13px; }} .metrics span {{ display:block; color:var(--muted); font-size:12px; }} .metrics strong {{ display:block; margin-top:3px; font-size:16px; }} .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); padding-top:12px; }}
+        .table-wrap {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:760px; }} th {{ text-align:left; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--line); padding:10px; }} td {{ border-bottom:1px solid var(--line); padding:12px 10px; vertical-align:top; }} td span {{ color:var(--muted); font-size:13px; }} .pill {{ display:inline-block; padding:6px 10px; border-radius:999px; color:white; background:#334155; font-weight:900; font-size:12px; }} .pill.good {{ background:var(--green); }} .pill.blue {{ background:var(--blue); }} .pill.amber {{ background:var(--amber); color:#111827; }} .pill.danger {{ background:var(--red); }} .pill.muted {{ background:var(--grey); }}
+        .empty {{ color:var(--muted); background:#f8fafc; border:1px dashed var(--line); border-radius:16px; padding:18px; }} .footer {{ color:var(--muted); font-size:13px; margin-top:22px; }}
+        @media (prefers-color-scheme: dark) {{ :root {{ --bg:#0b1220; --card:#111827; --dark:#e5e7eb; --muted:#94a3b8; --line:#273244; }} .summary-card, .card, .panel {{ background:#111827; box-shadow:0 8px 24px rgba(0,0,0,.28); }} .status, .main-status, .metrics div, .empty {{ background:#172033; }} .site {{ color:#cbd5e1; }} }}
+        @media (max-width:960px) {{ .panel-grid {{ grid-template-columns:1fr; }} }}
+        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
+    </style>
+</head>
+<body>
+    <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><div class='logo'>CDR</div></div><nav>{nav}</nav></header>
+    <main class='wrap'>{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
+</body>
+</html>
+    """)
+
+
 @web_app.get("/dashboard", response_class=HTMLResponse)
-def live_engineer_dashboard(token: str = ""):
+def live_engineer_dashboard(token: str = "", view: str = "engineers"):
     if DASHBOARD_TOKEN and token != DASHBOARD_TOKEN:
         return HTMLResponse("Dashboard access denied.", status_code=403)
 
@@ -2513,17 +2772,8 @@ def live_engineer_dashboard(token: str = ""):
         day_logs = get_list_items(site_id, day_logs_list_id)
         rows = dashboard_engineer_rows(engineers, day_logs, jobs_data)
         summary = dashboard_metric_summary(rows, jobs_data)
+        job_rows = dashboard_job_rows(jobs_data)
         generated = datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M:%S")
-
-        metric_cards = f"""
-            <div class='summary-card'><span>Active</span><strong>{html_safe(summary['active'])}</strong></div>
-            <div class='summary-card good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong></div>
-            <div class='summary-card blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong></div>
-            <div class='summary-card amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong></div>
-            <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong></div>
-            <div class='summary-card'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong></div>
-            <div class='summary-card'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong></div>
-        """
 
         cards = []
         for row in rows:
@@ -2532,133 +2782,19 @@ def live_engineer_dashboard(token: str = ""):
                 <div class='card-top'>
                     <div class='identity'>
                         <div class='avatar'>{html_safe(row['initials'])}</div>
-                        <div>
-                            <h2>{html_safe(row['name'])}</h2>
-                            <div class='status'>{html_safe(row['status_icon'])} {html_safe(row['status'])}</div>
-                        </div>
+                        <div><h2>{html_safe(row['name'])}</h2><div class='status'>{html_safe(row['status_icon'])} {html_safe(row['status'])}</div></div>
                     </div>
                     <div class='util {html_safe(row['util_class'])}'>{html_safe(dashboard_number(row['util'], '%') if row['util'] != '-' else '-')}</div>
                 </div>
-
-                <div class='main-status'>
-                    <div class='main-label'>{html_safe(row['timer_label'])}</div>
-                    <div class='main-value'>{html_safe(row['timer_value'])}</div>
-                </div>
-
-                <div class='job-block'>
-                    <div class='job'>{html_safe(row['job'])}</div>
-                    {f"<div class='site'>{html_safe(row['job_site'])}</div>" if row.get('job_site') else ""}
-                    {f"<div class='detail'>{html_safe(row['detail'])}</div>" if row.get('detail') else ""}
-                </div>
-
+                <div class='main-status'><div class='main-label'>{html_safe(row['timer_label'])}</div><div class='main-value'>{html_safe(row['timer_value'])}</div></div>
+                <div class='job-block'><div class='job'>{html_safe(row['job'])}</div>{f"<div class='site'>{html_safe(row['job_site'])}</div>" if row.get('job_site') else ""}{f"<div class='detail'>{html_safe(row['detail'])}</div>" if row.get('detail') else ""}</div>
                 <div class='since'>{html_safe(row['since'])}</div>
-
-                <div class='metrics'>
-                    <div><span>Start</span><strong>{html_safe(row['start'])}</strong></div>
-                    <div><span>Productive</span><strong>{html_safe(dashboard_number(row['productive'], 'h'))}</strong></div>
-                    <div><span>Inactive</span><strong>{html_safe(dashboard_number(row['inactive'], 'h'))}</strong></div>
-                </div>
+                <div class='metrics'><div><span>Start</span><strong>{html_safe(row['start'])}</strong></div><div><span>Productive</span><strong>{html_safe(dashboard_number(row['productive'], 'h'))}</strong></div><div><span>Inactive</span><strong>{html_safe(dashboard_number(row['inactive'], 'h'))}</strong></div></div>
                 <div class='last'>Last: {html_safe(row['last'])}</div>
             </div>
             """)
 
-        return HTMLResponse(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>CDR Engineer Dashboard</title>
-    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-    <meta http-equiv='refresh' content='30'>
-    <style>
-        :root {{
-            --orange:#f58220;
-            --dark:#0f172a;
-            --panel:#111827;
-            --muted:#64748b;
-            --bg:#eef2f7;
-            --card:#ffffff;
-            --line:#e5e7eb;
-            --green:#16a34a;
-            --blue:#2563eb;
-            --amber:#f59e0b;
-            --red:#dc2626;
-            --purple:#7c3aed;
-            --grey:#6b7280;
-        }}
-        body {{ margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--dark); }}
-        header {{ background:#0b1220; color:white; padding:20px 28px; display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; box-shadow:0 3px 18px rgba(0,0,0,.20); }}
-        header h1 {{ margin:0; font-size:29px; letter-spacing:-.5px; }}
-        header .sub {{ color:#cbd5e1; font-size:14px; margin-top:5px; }}
-        .logo {{ font-weight:900; color:var(--orange); font-size:31px; letter-spacing:2px; }}
-        .wrap {{ padding:22px; }}
-        .summary {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:18px; }}
-        .summary-card {{ background:#fff; border-radius:16px; padding:14px 16px; box-shadow:0 6px 18px rgba(15,23,42,.08); border-top:5px solid #334155; }}
-        .summary-card.good {{ border-top-color:var(--green); }}
-        .summary-card.blue {{ border-top-color:var(--blue); }}
-        .summary-card.amber {{ border-top-color:var(--amber); }}
-        .summary-card span {{ display:block; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }}
-        .summary-card strong {{ display:block; margin-top:6px; font-size:24px; }}
-        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap:18px; align-items:stretch; }}
-        .card {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); border-left:9px solid #9ca3af; min-height:265px; }}
-        .card.on-site {{ border-left-color:var(--green); }}
-        .card.travelling {{ border-left-color:var(--blue); }}
-        .card.active {{ border-left-color:var(--purple); }}
-        .card.idle {{ border-left-color:var(--amber); }}
-        .card.ended {{ border-left-color:var(--grey); opacity:.88; }}
-        .card.not-started {{ border-left-color:var(--red); opacity:.82; }}
-        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
-        .identity {{ display:flex; gap:12px; align-items:center; }}
-        .avatar {{ width:42px; height:42px; border-radius:14px; display:flex; align-items:center; justify-content:center; background:#111827; color:#fff; font-weight:900; }}
-        h2 {{ margin:0; font-size:21px; }}
-        .status {{ display:inline-block; margin-top:7px; padding:6px 10px; background:#f1f5f9; border-radius:999px; font-size:13px; font-weight:800; }}
-        .util {{ min-width:72px; text-align:center; background:#334155; color:white; border-radius:15px; padding:9px 10px; font-weight:900; font-size:16px; }}
-        .util-good {{ background:var(--green); }}
-        .util-mid {{ background:var(--amber); color:#111827; }}
-        .util-low {{ background:var(--red); }}
-        .util-none {{ background:#374151; }}
-        .main-status {{ margin-top:18px; padding:15px; border-radius:16px; background:#f8fafc; border:1px solid var(--line); text-align:center; }}
-        .main-label {{ color:var(--muted); font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }}
-        .main-value {{ margin-top:5px; font-size:28px; font-weight:900; letter-spacing:-.5px; }}
-        .job-block {{ margin-top:16px; min-height:54px; }}
-        .job {{ font-size:17px; font-weight:900; }}
-        .site {{ margin-top:3px; color:#334155; font-weight:700; }}
-        .detail {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.35; }}
-        .since {{ color:var(--muted); font-size:14px; margin-top:7px; }}
-        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }}
-        .metrics div {{ background:#f9fafb; border:1px solid var(--line); padding:10px; border-radius:13px; }}
-        .metrics span {{ display:block; color:var(--muted); font-size:12px; }}
-        .metrics strong {{ display:block; margin-top:3px; font-size:16px; }}
-        .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); padding-top:12px; }}
-        .footer {{ color:var(--muted); font-size:13px; margin-top:22px; }}
-        @media (prefers-color-scheme: dark) {{
-            :root {{ --bg:#0b1220; --card:#111827; --dark:#e5e7eb; --muted:#94a3b8; --line:#273244; }}
-            .summary-card, .card {{ background:#111827; box-shadow:0 8px 24px rgba(0,0,0,.28); }}
-            .status, .main-status, .metrics div {{ background:#172033; }}
-            .site {{ color:#cbd5e1; }}
-        }}
-        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
-    </style>
-</head>
-<body>
-    <header>
-        <div>
-            <h1>Engineer Dashboard</h1>
-            <div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div>
-        </div>
-        <div class='logo'>CDR</div>
-    </header>
-    <main class='wrap'>
-        <section class='summary'>
-            {metric_cards}
-        </section>
-        <section class='grid'>
-            {''.join(cards) if cards else "<p>No engineers found.</p>"}
-        </section>
-        <div class='footer'>Green = on site · Blue = travelling · Amber = active but idle · Red = not started · Grey = ended day · Cards auto-sort by operational priority</div>
-    </main>
-</body>
-</html>
-        """)
+        return render_dashboard_page(view, token, generated, summary, rows, job_rows, ''.join(cards))
 
     except Exception as e:
         print(f"ERROR loading dashboard: {e}")
