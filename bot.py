@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-logo-fixed-v19"
+BUILD_VERSION = "dashboard-ops-idle-v20"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2183,6 +2183,15 @@ def logo():
 # =========================
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
+# Idle alerts are OFF by default for safety.
+# Set IDLE_ALERTS_ENABLED=true in Railway to enable helpdesk idle notifications.
+IDLE_ALERTS_ENABLED = str(os.getenv("IDLE_ALERTS_ENABLED", "false")).strip().lower() in ["1", "true", "yes", "on"]
+IDLE_ALERT_THRESHOLD_MINUTES = int(os.getenv("IDLE_ALERT_THRESHOLD_MINUTES", "90"))
+IDLE_ALERT_REPEAT_MINUTES = int(os.getenv("IDLE_ALERT_REPEAT_MINUTES", "60"))
+IDLE_ALERT_CHECK_MINUTES = int(os.getenv("IDLE_ALERT_CHECK_MINUTES", "15"))
+LAST_IDLE_ALERTS = {}
+
+
 
 def html_safe(value):
     return xml_escape(str(value or ""))
@@ -2218,6 +2227,17 @@ def dashboard_latest_day_log_for_engineer(day_logs, telegram_id, work_date):
 
     matches.sort(key=lambda item: item[0], reverse=True)
     return matches[0][1]
+
+
+
+def dashboard_minutes_text(minutes):
+    try:
+        minutes = max(0, int(minutes))
+    except Exception:
+        return "-"
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
 def dashboard_duration_text(start_dt, end_dt=None, empty="-"):
@@ -2438,6 +2458,13 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
             productive = live_hours.get("productive_hours") if live_hours else "-"
             inactive = live_hours.get("inactive_hours") if live_hours else "-"
 
+        idle_minutes = 0
+        if css == "idle" and current_status_start:
+            try:
+                idle_minutes = max(0, int((now - current_status_start).total_seconds() // 60))
+            except Exception:
+                idle_minutes = 0
+
         rows.append({
             "name": name,
             "initials": dashboard_initials(name),
@@ -2458,6 +2485,7 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
             "inactive": inactive if inactive not in [None, ""] else "-",
             "last": f"{last_event['label']} - {last_event['cdr']}" if last_event else "-",
             "sort_rank": sort_rank,
+            "idle_minutes": idle_minutes,
         })
 
     rows.sort(key=lambda row: (row["sort_rank"], str(row["name"]).lower()))
@@ -8273,6 +8301,75 @@ async def remind_active_engineers_to_end_day(app):
         print(f"ERROR sending end-day reminders: {e}")
 
 
+
+async def check_engineer_idle_alerts(app):
+    """Optional helpdesk idle alerts.
+
+    Safe by default:
+    - Does not write to SharePoint.
+    - Does not message engineers.
+    - Only sends to HELPDESK_CHAT_ID when IDLE_ALERTS_ENABLED=true.
+    """
+    if not IDLE_ALERTS_ENABLED:
+        return
+
+    if not HELPDESK_CHAT_ID:
+        print("Idle alerts enabled but HELPDESK_CHAT_ID is missing.")
+        return
+
+    try:
+        site_id = get_site_id()
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+
+        engineers = get_list_items(site_id, engineers_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        day_logs = get_list_items(site_id, day_logs_list_id)
+        rows = dashboard_engineer_rows(engineers, day_logs, jobs_data)
+        now = datetime.now(UK_TZ)
+
+        active_idle_names = set()
+
+        for row in rows:
+            if row.get("css") != "idle":
+                continue
+
+            idle_minutes = int(row.get("idle_minutes") or 0)
+            if idle_minutes < IDLE_ALERT_THRESHOLD_MINUTES:
+                continue
+
+            engineer_name = row.get("name", "Engineer")
+            active_idle_names.add(engineer_name)
+
+            last_alert = LAST_IDLE_ALERTS.get(engineer_name)
+            if last_alert:
+                minutes_since_last = (now - last_alert).total_seconds() / 60
+                if minutes_since_last < IDLE_ALERT_REPEAT_MINUTES:
+                    continue
+
+            LAST_IDLE_ALERTS[engineer_name] = now
+            await app.bot.send_message(
+                chat_id=HELPDESK_CHAT_ID,
+                text=(
+                    "⚠️ Engineer Idle Alert\n\n"
+                    f"Engineer: {engineer_name}\n"
+                    f"Idle time: {dashboard_duration_text(now.replace(tzinfo=UK_TZ) - __import__('datetime').timedelta(minutes=idle_minutes), now)}\n"
+                    f"Last activity: {row.get('last', '-') or '-'}\n"
+                    f"Status: {row.get('job', 'No current open job')}\n\n"
+                    "This is a dashboard-only alert. No job, worksheet or SharePoint record has been changed."
+                ),
+            )
+
+        # Clear alert state once the engineer is no longer idle, so future idle periods can alert again.
+        for name in list(LAST_IDLE_ALERTS.keys()):
+            if name not in active_idle_names:
+                LAST_IDLE_ALERTS.pop(name, None)
+
+    except Exception as e:
+        print(f"ERROR checking engineer idle alerts: {e}")
+
+
 GLOBAL_SCHEDULER = None
 
 
@@ -8306,6 +8403,13 @@ async def post_init(app):
         trigger="cron",
         hour=16,
         minute=45,
+        args=[app],
+    )
+
+    scheduler.add_job(
+        check_engineer_idle_alerts,
+        trigger="interval",
+        minutes=IDLE_ALERT_CHECK_MINUTES,
         args=[app],
     )
 
