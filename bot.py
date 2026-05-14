@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "live-dashboard-v11"
+BUILD_VERSION = "live-dashboard-v12"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2211,6 +2211,90 @@ def dashboard_latest_day_log_for_engineer(day_logs, telegram_id, work_date):
     return matches[0][1]
 
 
+def dashboard_duration_text(start_dt, end_dt=None, empty="-"):
+    if not start_dt:
+        return empty
+    end_dt = end_dt or datetime.now(UK_TZ)
+    mins = max(0, int((end_dt - start_dt).total_seconds() // 60))
+    if mins < 60:
+        return f"{mins}m"
+    return f"{mins // 60}h {mins % 60:02d}m"
+
+
+def dashboard_number(value, suffix=""):
+    if value in [None, "", "-"]:
+        return "-"
+    try:
+        number = float(value)
+        if number.is_integer():
+            return f"{int(number)}{suffix}"
+        return f"{number:.2f}{suffix}"
+    except Exception:
+        return f"{value}{suffix}"
+
+
+def dashboard_util_class(value):
+    try:
+        number = float(value)
+    except Exception:
+        return "util-none"
+    if number >= 75:
+        return "util-good"
+    if number >= 50:
+        return "util-mid"
+    return "util-low"
+
+
+def dashboard_initials(name):
+    parts = [p for p in str(name or "").split() if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
+
+def dashboard_get_today_events_for_engineer(jobs_data, engineer_name, today):
+    events = []
+    engineer_key = str(engineer_name or "").strip().lower()
+
+    for job in jobs_data or []:
+        fields = job.get("fields", {})
+        cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+        site = get_field_value(fields, "SiteName", "Site Name") or ""
+        log_text = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
+        try:
+            visits = parse_engineer_visit_log(log_text)
+        except Exception:
+            visits = []
+
+        for visit in visits:
+            if str(visit.get("engineer", "")).strip().lower() != engineer_key:
+                continue
+
+            date_text = visit.get("date", "")
+            try:
+                visit_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+            except Exception:
+                continue
+
+            if visit_date != today:
+                continue
+
+            for key, label in [
+                ("travel", "Travelling"),
+                ("on_site", "On Site"),
+                ("off_site", visit.get("status", "Completed") or "Completed"),
+            ]:
+                time_text = visit.get(key)
+                event_dt = parse_engineer_log_datetime(date_text, time_text) if time_text else None
+                if event_dt:
+                    events.append({"dt": event_dt, "label": label, "cdr": cdr, "site": site})
+
+    events.sort(key=lambda item: item["dt"], reverse=True)
+    return events
+
+
 def dashboard_engineer_rows(engineers, day_logs, jobs_data):
     today = datetime.now(UK_TZ).date()
     now = datetime.now(UK_TZ)
@@ -2253,74 +2337,92 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
         open_jobs = get_open_jobs_for_engineer_today(jobs_data, lookup_id) if lookup_id else []
         current_job = None
         if open_jobs:
-            status_priority = {"On Site": 0, "Travelling": 1, "Assigned": 2, AWAITING_DEPLOYMENT_STATUS: 3, LEGACY_AWAITING_DEPLOYMENT_STATUS: 3, "": 4}
+            status_priority = {
+                "On Site": 0,
+                "Travelling": 1,
+                "Assigned": 2,
+                AWAITING_DEPLOYMENT_STATUS: 3,
+                LEGACY_AWAITING_DEPLOYMENT_STATUS: 3,
+                "": 4,
+            }
             open_jobs.sort(key=lambda job: status_priority.get(str(job.get("fields", {}).get("Status", "")), 9))
             current_job = open_jobs[0]
 
-        events = []
-        for job in jobs_data or []:
-            fields = job.get("fields", {})
-            cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
-            site = get_field_value(fields, "SiteName", "Site Name") or ""
-            log_text = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
-            try:
-                visits = parse_engineer_visit_log(log_text)
-            except Exception:
-                visits = []
-            for visit in visits:
-                if str(visit.get("engineer", "")).strip().lower() != name.strip().lower():
-                    continue
-                date_text = visit.get("date", "")
-                try:
-                    visit_date = datetime.strptime(date_text, "%d/%m/%Y").date()
-                except Exception:
-                    continue
-                if visit_date != today:
-                    continue
-                for key, label in [("travel", "Travelling"), ("on_site", "On Site"), ("off_site", visit.get("status", "Completed"))]:
-                    time_text = visit.get(key)
-                    event_dt = parse_engineer_log_datetime(date_text, time_text) if time_text else None
-                    if event_dt:
-                        events.append({"dt": event_dt, "label": label, "cdr": cdr, "site": site})
-        events.sort(key=lambda item: item["dt"], reverse=True)
+        events = dashboard_get_today_events_for_engineer(jobs_data, name, today)
         last_event = events[0] if events else None
+
+        job_cdr = ""
+        job_site = ""
+        detail_line = ""
+        timer_label = "Last activity"
+        timer_value = "-"
+        current_status_start = None
 
         if not day_log:
             card_status = "Not Started"
             css = "not-started"
+            status_icon = "🔴"
             job_text = "No active day"
-            since_text = ""
+            since_text = "No start logged today"
             util = "-"
             productive = "-"
             inactive = "-"
+            sort_rank = 4
         elif str(day_status).lower() == DAY_CLOSED_STATUS.lower():
             card_status = "Ended Day"
             css = "ended"
+            status_icon = "⚫"
             job_text = "Day closed"
-            since_text = end_dt.strftime("%H:%M") if end_dt else ""
+            since_text = f"Ended at {end_dt.strftime('%H:%M')}" if end_dt else "Ended"
             util = get_field_value(day_fields, "UtilisationPercent", "Utilisation Percent")
             productive = get_field_value(day_fields, "ProductiveHours", "Productive Hours")
             inactive = get_field_value(day_fields, "InactiveHours", "Inactive Hours", "UnproductiveHours", "Unproductive Hours")
+            timer_label = "Closed"
+            timer_value = end_dt.strftime("%H:%M") if end_dt else "-"
+            sort_rank = 5
         else:
             if current_job:
                 jf = current_job.get("fields", {})
                 job_status = str(get_field_value(jf, "Status") or "Assigned")
-                cdr = get_field_value(jf, "CDRNumber", "CDR Number", "Title") or ""
-                site = get_field_value(jf, "SiteName", "Site Name") or ""
+                job_cdr = get_field_value(jf, "CDRNumber", "CDR Number", "Title") or ""
+                job_site = get_field_value(jf, "SiteName", "Site Name") or ""
                 card_status = job_status
-                job_text = f"{cdr} - {site}".strip(" -")
-                css = "on-site" if job_status == "On Site" else "travelling" if job_status == "Travelling" else "active"
+                job_text = f"{job_cdr} - {job_site}".strip(" -") or "Current job"
+                detail_line = str(get_field_value(jf, "Task") or "")[:120]
+
+                if job_status == "On Site":
+                    css = "on-site"
+                    status_icon = "🟢"
+                    sort_rank = 0
+                elif job_status == "Travelling":
+                    css = "travelling"
+                    status_icon = "🔵"
+                    sort_rank = 1
+                else:
+                    css = "active"
+                    status_icon = "🟣"
+                    sort_rank = 2
+
+                matching_status_events = [event for event in events if event.get("cdr") == job_cdr and event.get("label") == job_status]
+                if matching_status_events:
+                    current_status_start = matching_status_events[0]["dt"]
+                elif last_event:
+                    current_status_start = last_event["dt"]
+
+                timer_label = job_status
+                timer_value = dashboard_duration_text(current_status_start)
             else:
                 card_status = "Active Day"
                 job_text = "No current open job"
                 css = "idle"
+                status_icon = "🟠"
+                sort_rank = 3
+                current_status_start = last_event["dt"] if last_event else start_dt
+                timer_label = "Idle"
+                timer_value = dashboard_duration_text(current_status_start)
 
             last_dt = last_event["dt"] if last_event else start_dt
-            if last_dt:
-                mins = max(0, int((now - last_dt).total_seconds() // 60))
-                since_text = f"Last activity {mins // 60}h {mins % 60:02d}m ago" if mins >= 60 else f"Last activity {mins}m ago"
-            else:
-                since_text = ""
+            since_text = f"Last activity {dashboard_duration_text(last_dt)} ago" if last_dt else "No activity logged"
 
             live_hours = calculate_day_pay_hours(start_dt, now, jobs_data=jobs_data, engineer_name=name) if start_dt else None
             util = live_hours.get("utilisation_percent") if live_hours else "-"
@@ -2329,18 +2431,70 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
 
         rows.append({
             "name": name,
+            "initials": dashboard_initials(name),
             "status": card_status,
+            "status_icon": status_icon,
             "css": css,
             "job": job_text,
+            "job_cdr": job_cdr,
+            "job_site": job_site,
+            "detail": detail_line,
             "since": since_text,
+            "timer_label": timer_label,
+            "timer_value": timer_value,
             "start": start_dt.strftime("%H:%M") if start_dt else "-",
             "util": util if util not in [None, ""] else "-",
+            "util_class": dashboard_util_class(util),
             "productive": productive if productive not in [None, ""] else "-",
             "inactive": inactive if inactive not in [None, ""] else "-",
             "last": f"{last_event['label']} - {last_event['cdr']}" if last_event else "-",
+            "sort_rank": sort_rank,
         })
 
+    rows.sort(key=lambda row: (row["sort_rank"], str(row["name"]).lower()))
     return rows
+
+
+def dashboard_metric_summary(rows, jobs_data):
+    today = datetime.now(UK_TZ).date()
+    active = sum(1 for r in rows if r["css"] not in ["not-started", "ended"])
+    on_site = sum(1 for r in rows if r["css"] == "on-site")
+    travelling = sum(1 for r in rows if r["css"] == "travelling")
+    idle = sum(1 for r in rows if r["css"] == "idle")
+    not_started = sum(1 for r in rows if r["css"] == "not-started")
+    ended = sum(1 for r in rows if r["css"] == "ended")
+
+    util_values = []
+    for r in rows:
+        try:
+            util_values.append(float(r["util"]))
+        except Exception:
+            pass
+    average_util = round(sum(util_values) / len(util_values), 1) if util_values else "-"
+
+    open_jobs = 0
+    completed_today = 0
+    for job in jobs_data or []:
+        fields = job.get("fields", {})
+        if not is_closed_job(fields):
+            open_jobs += 1
+        completed_date = sharepoint_date_to_uk_date(get_field_value(fields, "DateComplete", "Date Complete", "Modified"))
+        status = str(get_field_value(fields, "Status") or "")
+        outcome = str(get_field_value(fields, "JobOutcome", "Job Outcome") or "")
+        if completed_date == today and (status == COMPLETED_STATUS or outcome == "Completed"):
+            completed_today += 1
+
+    return {
+        "active": active,
+        "on_site": on_site,
+        "travelling": travelling,
+        "idle": idle,
+        "not_started": not_started,
+        "ended": ended,
+        "open_jobs": open_jobs,
+        "completed_today": completed_today,
+        "average_util": average_util,
+    }
 
 
 @web_app.get("/dashboard", response_class=HTMLResponse)
@@ -2358,25 +2512,51 @@ def live_engineer_dashboard(token: str = ""):
         jobs_data = get_list_items(site_id, jobs_list_id)
         day_logs = get_list_items(site_id, day_logs_list_id)
         rows = dashboard_engineer_rows(engineers, day_logs, jobs_data)
+        summary = dashboard_metric_summary(rows, jobs_data)
         generated = datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M:%S")
+
+        metric_cards = f"""
+            <div class='summary-card'><span>Active</span><strong>{html_safe(summary['active'])}</strong></div>
+            <div class='summary-card good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong></div>
+            <div class='summary-card blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong></div>
+            <div class='summary-card amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong></div>
+            <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong></div>
+            <div class='summary-card'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong></div>
+            <div class='summary-card'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong></div>
+        """
 
         cards = []
         for row in rows:
             cards.append(f"""
             <div class='card {html_safe(row['css'])}'>
                 <div class='card-top'>
-                    <div>
-                        <h2>{html_safe(row['name'])}</h2>
-                        <div class='status'>{html_safe(row['status'])}</div>
+                    <div class='identity'>
+                        <div class='avatar'>{html_safe(row['initials'])}</div>
+                        <div>
+                            <h2>{html_safe(row['name'])}</h2>
+                            <div class='status'>{html_safe(row['status_icon'])} {html_safe(row['status'])}</div>
+                        </div>
                     </div>
-                    <div class='util'>{html_safe(row['util'])}%</div>
+                    <div class='util {html_safe(row['util_class'])}'>{html_safe(dashboard_number(row['util'], '%') if row['util'] != '-' else '-')}</div>
                 </div>
-                <div class='job'>{html_safe(row['job'])}</div>
+
+                <div class='main-status'>
+                    <div class='main-label'>{html_safe(row['timer_label'])}</div>
+                    <div class='main-value'>{html_safe(row['timer_value'])}</div>
+                </div>
+
+                <div class='job-block'>
+                    <div class='job'>{html_safe(row['job'])}</div>
+                    {f"<div class='site'>{html_safe(row['job_site'])}</div>" if row.get('job_site') else ""}
+                    {f"<div class='detail'>{html_safe(row['detail'])}</div>" if row.get('detail') else ""}
+                </div>
+
                 <div class='since'>{html_safe(row['since'])}</div>
+
                 <div class='metrics'>
                     <div><span>Start</span><strong>{html_safe(row['start'])}</strong></div>
-                    <div><span>Productive</span><strong>{html_safe(row['productive'])}h</strong></div>
-                    <div><span>Inactive</span><strong>{html_safe(row['inactive'])}h</strong></div>
+                    <div><span>Productive</span><strong>{html_safe(dashboard_number(row['productive'], 'h'))}</strong></div>
+                    <div><span>Inactive</span><strong>{html_safe(dashboard_number(row['inactive'], 'h'))}</strong></div>
                 </div>
                 <div class='last'>Last: {html_safe(row['last'])}</div>
             </div>
@@ -2390,34 +2570,73 @@ def live_engineer_dashboard(token: str = ""):
     <meta name='viewport' content='width=device-width, initial-scale=1.0'>
     <meta http-equiv='refresh' content='30'>
     <style>
-        :root {{ --orange:#f58220; --dark:#1f2937; --muted:#6b7280; --bg:#f3f4f6; }}
+        :root {{
+            --orange:#f58220;
+            --dark:#0f172a;
+            --panel:#111827;
+            --muted:#64748b;
+            --bg:#eef2f7;
+            --card:#ffffff;
+            --line:#e5e7eb;
+            --green:#16a34a;
+            --blue:#2563eb;
+            --amber:#f59e0b;
+            --red:#dc2626;
+            --purple:#7c3aed;
+            --grey:#6b7280;
+        }}
         body {{ margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--dark); }}
-        header {{ background:#111827; color:white; padding:22px 28px; display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; }}
-        header h1 {{ margin:0; font-size:26px; }}
-        header .sub {{ color:#d1d5db; font-size:14px; margin-top:4px; }}
-        .logo {{ font-weight:800; color:var(--orange); font-size:28px; letter-spacing:1px; }}
-        .wrap {{ padding:24px; }}
-        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap:18px; }}
-        .card {{ background:white; border-radius:18px; padding:18px; box-shadow:0 6px 18px rgba(0,0,0,.08); border-left:8px solid #9ca3af; }}
-        .card.on-site {{ border-left-color:#16a34a; }}
-        .card.travelling {{ border-left-color:#2563eb; }}
-        .card.active {{ border-left-color:#7c3aed; }}
-        .card.idle {{ border-left-color:#f59e0b; }}
-        .card.ended {{ border-left-color:#6b7280; opacity:.84; }}
-        .card.not-started {{ border-left-color:#dc2626; opacity:.78; }}
+        header {{ background:#0b1220; color:white; padding:20px 28px; display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; box-shadow:0 3px 18px rgba(0,0,0,.20); }}
+        header h1 {{ margin:0; font-size:29px; letter-spacing:-.5px; }}
+        header .sub {{ color:#cbd5e1; font-size:14px; margin-top:5px; }}
+        .logo {{ font-weight:900; color:var(--orange); font-size:31px; letter-spacing:2px; }}
+        .wrap {{ padding:22px; }}
+        .summary {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:18px; }}
+        .summary-card {{ background:#fff; border-radius:16px; padding:14px 16px; box-shadow:0 6px 18px rgba(15,23,42,.08); border-top:5px solid #334155; }}
+        .summary-card.good {{ border-top-color:var(--green); }}
+        .summary-card.blue {{ border-top-color:var(--blue); }}
+        .summary-card.amber {{ border-top-color:var(--amber); }}
+        .summary-card span {{ display:block; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }}
+        .summary-card strong {{ display:block; margin-top:6px; font-size:24px; }}
+        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap:18px; align-items:stretch; }}
+        .card {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); border-left:9px solid #9ca3af; min-height:265px; }}
+        .card.on-site {{ border-left-color:var(--green); }}
+        .card.travelling {{ border-left-color:var(--blue); }}
+        .card.active {{ border-left-color:var(--purple); }}
+        .card.idle {{ border-left-color:var(--amber); }}
+        .card.ended {{ border-left-color:var(--grey); opacity:.88; }}
+        .card.not-started {{ border-left-color:var(--red); opacity:.82; }}
         .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
+        .identity {{ display:flex; gap:12px; align-items:center; }}
+        .avatar {{ width:42px; height:42px; border-radius:14px; display:flex; align-items:center; justify-content:center; background:#111827; color:#fff; font-weight:900; }}
         h2 {{ margin:0; font-size:21px; }}
-        .status {{ display:inline-block; margin-top:7px; padding:5px 10px; background:#f3f4f6; border-radius:999px; font-size:13px; font-weight:700; }}
-        .util {{ min-width:64px; text-align:center; background:#111827; color:white; border-radius:14px; padding:8px 10px; font-weight:800; }}
-        .job {{ font-size:16px; font-weight:700; margin-top:16px; min-height:38px; }}
-        .since {{ color:var(--muted); font-size:14px; margin-top:4px; }}
-        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:18px; }}
-        .metrics div {{ background:#f9fafb; border:1px solid #e5e7eb; padding:10px; border-radius:12px; }}
+        .status {{ display:inline-block; margin-top:7px; padding:6px 10px; background:#f1f5f9; border-radius:999px; font-size:13px; font-weight:800; }}
+        .util {{ min-width:72px; text-align:center; background:#334155; color:white; border-radius:15px; padding:9px 10px; font-weight:900; font-size:16px; }}
+        .util-good {{ background:var(--green); }}
+        .util-mid {{ background:var(--amber); color:#111827; }}
+        .util-low {{ background:var(--red); }}
+        .util-none {{ background:#374151; }}
+        .main-status {{ margin-top:18px; padding:15px; border-radius:16px; background:#f8fafc; border:1px solid var(--line); text-align:center; }}
+        .main-label {{ color:var(--muted); font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }}
+        .main-value {{ margin-top:5px; font-size:28px; font-weight:900; letter-spacing:-.5px; }}
+        .job-block {{ margin-top:16px; min-height:54px; }}
+        .job {{ font-size:17px; font-weight:900; }}
+        .site {{ margin-top:3px; color:#334155; font-weight:700; }}
+        .detail {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.35; }}
+        .since {{ color:var(--muted); font-size:14px; margin-top:7px; }}
+        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }}
+        .metrics div {{ background:#f9fafb; border:1px solid var(--line); padding:10px; border-radius:13px; }}
         .metrics span {{ display:block; color:var(--muted); font-size:12px; }}
         .metrics strong {{ display:block; margin-top:3px; font-size:16px; }}
-        .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid #e5e7eb; padding-top:12px; }}
+        .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); padding-top:12px; }}
         .footer {{ color:var(--muted); font-size:13px; margin-top:22px; }}
-        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{ --bg:#0b1220; --card:#111827; --dark:#e5e7eb; --muted:#94a3b8; --line:#273244; }}
+            .summary-card, .card {{ background:#111827; box-shadow:0 8px 24px rgba(0,0,0,.28); }}
+            .status, .main-status, .metrics div {{ background:#172033; }}
+            .site {{ color:#cbd5e1; }}
+        }}
+        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
     </style>
 </head>
 <body>
@@ -2429,10 +2648,13 @@ def live_engineer_dashboard(token: str = ""):
         <div class='logo'>CDR</div>
     </header>
     <main class='wrap'>
-        <div class='grid'>
+        <section class='summary'>
+            {metric_cards}
+        </section>
+        <section class='grid'>
             {''.join(cards) if cards else "<p>No engineers found.</p>"}
-        </div>
-        <div class='footer'>Green = on site · Blue = travelling · Amber = active but idle · Red = not started · Grey = ended day</div>
+        </section>
+        <div class='footer'>Green = on site · Blue = travelling · Amber = active but idle · Red = not started · Grey = ended day · Cards auto-sort by operational priority</div>
     </main>
 </body>
 </html>
