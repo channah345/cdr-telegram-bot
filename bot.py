@@ -1827,6 +1827,7 @@ def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url):
 
     image_base64 = signature_data_url.split(",", 1)[1]
     image_bytes = base64.b64decode(image_base64)
+    image_bytes = prepare_signature_image_for_export(image_bytes)
     file_name = f"{cdr_number}_client_signature_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.png"
 
     return upload_file_to_sharepoint(
@@ -2962,23 +2963,78 @@ def signature_page(cdr_number: str, token: str):
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.6/dist/signature_pad.umd.min.js"></script>
         <style>
-            html, body {{ overscroll-behavior: none; }}
-            body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; margin: 0; }}
-            .container {{ max-width: 650px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.12); }}
-            h1 {{ color: #f58220; margin-bottom: 5px; }}
-            .job-box {{ background: #f7f7f7; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+            :root {{ color-scheme: light; }}
+            html, body {{
+                overscroll-behavior: none;
+                background: #f4f6f8 !important;
+                color: #151515 !important;
+            }}
+            body {{
+                font-family: Arial, sans-serif;
+                padding: 20px;
+                margin: 0;
+                -webkit-text-size-adjust: 100%;
+            }}
+            .container {{
+                max-width: 650px;
+                margin: auto;
+                background: #ffffff !important;
+                color: #151515 !important;
+                padding: 25px;
+                border-radius: 12px;
+                box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+            }}
+            h1, h2, p, label, strong {{ color: #151515 !important; }}
+            h2 {{ margin: 4px 0 14px 0; }}
+            .job-box {{
+                background: #f7f7f7 !important;
+                color: #151515 !important;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 20px 0;
+                border: 1px solid #e1e1e1;
+            }}
             label {{ font-weight: bold; display: block; margin-top: 15px; }}
-            input[type="text"] {{ width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; }}
-            canvas {{ width: 100%; height: 260px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; touch-action: none; -ms-touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; display: block; }}
+            input[type="text"] {{
+                width: 100%;
+                padding: 12px;
+                font-size: 16px;
+                box-sizing: border-box;
+                background: #ffffff !important;
+                color: #111111 !important;
+                border: 1px solid #777;
+                border-radius: 2px;
+                -webkit-text-fill-color: #111111 !important;
+            }}
+            input[type="checkbox"] {{ accent-color: #f58220; }}
+            canvas {{
+                width: 100%;
+                height: 260px;
+                border: 2px solid #333;
+                border-radius: 8px;
+                background: #ffffff !important;
+                margin-top: 10px;
+                touch-action: none;
+                -ms-touch-action: none;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-touch-callout: none;
+                display: block;
+                cursor: crosshair;
+            }}
             button {{ width: 100%; padding: 14px; margin-top: 15px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }}
             .submit {{ background: #f58220; color: white; font-weight: bold; }}
             .clear {{ background: #555; color: white; }}
-            .small {{ font-size: 13px; color: #555; margin-top: 15px; }}
-        
-</style>
-    
-<meta name="theme-color" content="#070b12">
-<meta name="apple-mobile-web-app-capable" content="yes">
+            .small {{ font-size: 13px; color: #555 !important; margin-top: 15px; }}
+            @media (prefers-color-scheme: dark) {{
+                html, body {{ background: #f4f6f8 !important; color: #151515 !important; }}
+                .container, .job-box, input, canvas {{ background-color: #ffffff !important; color: #151515 !important; }}
+            }}
+        </style>
+        <meta name="color-scheme" content="light only">
+        <meta name="supported-color-schemes" content="light">
+        <meta name="theme-color" content="#ffffff">
+        <meta name="apple-mobile-web-app-capable" content="yes">
 </head>
     <body>
         <div class="container">
@@ -3016,16 +3072,28 @@ def signature_page(cdr_number: str, token: str):
                 minWidth: 1,
                 maxWidth: 2.5,
                 throttle: 0,
-                velocityFilterWeight: 0.7
+                velocityFilterWeight: 0.7,
+                penColor: "#111111",
+                backgroundColor: "#ffffff"
             }});
 
-            // Stop mobile browsers treating signature movement as page scroll/swipe.
-            // The passive:false option is important on iPhone/Android.
-            ["touchstart", "touchmove", "touchend", "pointerdown", "pointermove", "pointerup"].forEach(function(eventName) {{
+            // Keep the signature pad usable on both light and dark phones/desktops.
+            // Pointer capture also fixes desktop mouse drawing continuing after mouse-up.
+            canvas.addEventListener("pointerdown", function(event) {{
+                try {{ canvas.setPointerCapture(event.pointerId); }} catch (e) {{}}
+                event.preventDefault();
+            }}, {{ passive: false }});
+
+            ["pointermove", "touchstart", "touchmove"].forEach(function(eventName) {{
                 canvas.addEventListener(eventName, function(event) {{
                     event.preventDefault();
-                    event.stopPropagation();
                 }}, {{ passive: false }});
+            }});
+
+            ["pointerup", "pointercancel", "pointerleave"].forEach(function(eventName) {{
+                canvas.addEventListener(eventName, function(event) {{
+                    try {{ canvas.releasePointerCapture(event.pointerId); }} catch (e) {{}}
+                }}, {{ passive: true }});
             }});
 
             let savedSignature = null;
@@ -3039,7 +3107,10 @@ def signature_page(cdr_number: str, token: str):
 
                 canvas.width = rect.width * ratio;
                 canvas.height = rect.height * ratio;
-                canvas.getContext("2d").scale(ratio, ratio);
+                const ctx = canvas.getContext("2d");
+                ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+                ctx.fillStyle = "#ffffff";
+                ctx.fillRect(0, 0, rect.width, rect.height);
                 signaturePad.clear();
 
                 if (savedSignature) {{
@@ -7403,6 +7474,38 @@ def get_signature_image_bytes(site_id, cdr_number):
         return None
 
 
+
+
+def prepare_signature_image_for_export(image_bytes):
+    """Return a PNG signature image with a white background.
+
+    This avoids Word/Office dark mode making transparent signature canvases
+    difficult to see, and also gives PDF conversion a consistent white pad.
+    """
+    if not image_bytes:
+        return image_bytes
+
+    try:
+        from PIL import Image as PILImage
+        image = PILImage.open(BytesIO(image_bytes))
+
+        # Composite transparent signature lines onto solid white.
+        if image.mode in ["RGBA", "LA"] or (image.mode == "P" and "transparency" in image.info):
+            image = image.convert("RGBA")
+            background = PILImage.new("RGBA", image.size, (255, 255, 255, 255))
+            background.alpha_composite(image)
+            image = background.convert("RGB")
+        else:
+            image = image.convert("RGB")
+
+        # Keep the image as a simple PNG for Word/PDF conversion.
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
+    except Exception as e:
+        print(f"WARNING: Could not normalise signature image for export: {e}")
+        return image_bytes
+
 def get_logo_for_pdf(max_width=48 * mm, max_height=20 * mm):
     for path in ["cdr-logo.png", "CDR-logo.png", "logo.png"]:
         if os.path.exists(path):
@@ -7893,6 +7996,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             signature_body.append([{"raw_xml": docx_paragraph(f"Client Name: {name}", size=18, spacing_after=35)}])
             signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
             if signature_bytes:
+                signature_bytes = prepare_signature_image_for_export(signature_bytes)
                 sig_ext = "png"
                 image_parts.append(("word/media/client-signature.%s" % sig_ext, signature_bytes))
                 image_rels.append(("rSignature", "media/client-signature.%s" % sig_ext))
@@ -7970,6 +8074,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
             xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main'
             xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>
+<w:background w:color='FFFFFF'/>
 <w:body>
 {''.join(body)}
 <w:sectPr>
