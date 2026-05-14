@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-logo-tabs-v14"
+BUILD_VERSION = "dashboard-logo-tabs-v16"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2749,13 +2749,13 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
     </style>
 
 <style>
-    .cdr-brand {
+    .cdr-brand {{
         display: flex;
         align-items: center;
         gap: 14px;
         margin-bottom: 18px;
-    }
-    .cdr-brand img {
+    }}
+    .cdr-brand img {{
         height: 54px;
         width: auto;
         object-fit: contain;
@@ -2763,95 +2763,95 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
         border-radius: 12px;
         padding: 6px 10px;
         box-shadow: 0 8px 24px rgba(0,0,0,0.18);
-    }
-    .cdr-brand-title {
+    }}
+    .cdr-brand-title {{
         display: flex;
         flex-direction: column;
         line-height: 1.15;
-    }
-    .cdr-brand-title strong {
+    }}
+    .cdr-brand-title strong {{
         font-size: 22px;
-    }
-    .cdr-brand-title span {
+    }}
+    .cdr-brand-title span {{
         opacity: .72;
         font-size: 13px;
-    }
-    .dashboard-view {
+    }}
+    .dashboard-view {{
         display: none;
         animation: fadeIn .16s ease-in-out;
-    }
-    .dashboard-view.active {
+    }}
+    .dashboard-view.active {{
         display: block;
-    }
-    .nav a.active, .tabs a.active, .dashboard-nav a.active {
+    }}
+    .nav a.active, .tabs a.active, .dashboard-nav a.active {{
         background: rgba(245,130,32,.22) !important;
         border-color: rgba(245,130,32,.55) !important;
         color: #fff !important;
-    }
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(4px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
+    }}
+    @keyframes fadeIn {{
+        from {{ opacity: 0; transform: translateY(4px); }}
+        to {{ opacity: 1; transform: translateY(0); }}
+    }}
 </style>
 <script>
-document.addEventListener("DOMContentLoaded", function () {
+document.addEventListener("DOMContentLoaded", function () {{
     const token = new URLSearchParams(window.location.search).get("token") || "";
     const viewParam = new URLSearchParams(window.location.search).get("view") || "engineers";
 
-    function normaliseView(view) {
+    function normaliseView(view) {{
         if (!view || view === "dashboard") return "engineers";
         return view;
-    }
+    }}
 
-    function showView(view, pushState) {
+    function showView(view, pushState) {{
         view = normaliseView(view);
         const panels = document.querySelectorAll("[data-dashboard-view]");
         const links = document.querySelectorAll("[data-dashboard-link]");
 
         let found = false;
-        panels.forEach(function (panel) {
+        panels.forEach(function (panel) {{
             const isActive = panel.getAttribute("data-dashboard-view") === view;
             panel.classList.toggle("active", isActive);
             if (isActive) found = true;
-        });
+        }});
 
-        if (!found) {
+        if (!found) {{
             view = "engineers";
-            panels.forEach(function (panel) {
+            panels.forEach(function (panel) {{
                 panel.classList.toggle("active", panel.getAttribute("data-dashboard-view") === view);
-            });
-        }
+            }});
+        }}
 
-        links.forEach(function (link) {
+        links.forEach(function (link) {{
             link.classList.toggle("active", normaliseView(link.getAttribute("data-dashboard-link")) === view);
-        });
+        }});
 
-        if (pushState) {
+        if (pushState) {{
             const params = new URLSearchParams();
             if (token) params.set("token", token);
             if (view !== "engineers") params.set("view", view);
             const newUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
-            window.history.pushState({ view: view }, "", newUrl);
-        }
-    }
+            window.history.pushState({{ view: view }}, "", newUrl);
+        }}
+    }}
 
-    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {
+    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {{
         const url = new URL(link.href, window.location.origin);
         const view = normaliseView(link.getAttribute("data-dashboard-link") || url.searchParams.get("view") || "engineers");
         link.setAttribute("data-dashboard-link", view);
-        link.addEventListener("click", function (event) {
+        link.addEventListener("click", function (event) {{
             event.preventDefault();
             showView(view, true);
-        });
-    });
+        }});
+    }});
 
-    window.addEventListener("popstate", function () {
+    window.addEventListener("popstate", function () {{
         const view = new URLSearchParams(window.location.search).get("view") || "engineers";
         showView(view, false);
-    });
+    }});
 
     showView(viewParam, false);
-});
+}});
 </script>
 
 </head>
@@ -2947,13 +2947,13 @@ def signature_page(cdr_number: str, token: str):
         </style>
     
 <style>
-    .cdr-brand {
+    .cdr-brand {{
         display: flex;
         align-items: center;
         gap: 14px;
         margin-bottom: 18px;
-    }
-    .cdr-brand img {
+    }}
+    .cdr-brand img {{
         height: 54px;
         width: auto;
         object-fit: contain;
@@ -2961,95 +2961,95 @@ def signature_page(cdr_number: str, token: str):
         border-radius: 12px;
         padding: 6px 10px;
         box-shadow: 0 8px 24px rgba(0,0,0,0.18);
-    }
-    .cdr-brand-title {
+    }}
+    .cdr-brand-title {{
         display: flex;
         flex-direction: column;
         line-height: 1.15;
-    }
-    .cdr-brand-title strong {
+    }}
+    .cdr-brand-title strong {{
         font-size: 22px;
-    }
-    .cdr-brand-title span {
+    }}
+    .cdr-brand-title span {{
         opacity: .72;
         font-size: 13px;
-    }
-    .dashboard-view {
+    }}
+    .dashboard-view {{
         display: none;
         animation: fadeIn .16s ease-in-out;
-    }
-    .dashboard-view.active {
+    }}
+    .dashboard-view.active {{
         display: block;
-    }
-    .nav a.active, .tabs a.active, .dashboard-nav a.active {
+    }}
+    .nav a.active, .tabs a.active, .dashboard-nav a.active {{
         background: rgba(245,130,32,.22) !important;
         border-color: rgba(245,130,32,.55) !important;
         color: #fff !important;
-    }
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(4px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
+    }}
+    @keyframes fadeIn {{
+        from {{ opacity: 0; transform: translateY(4px); }}
+        to {{ opacity: 1; transform: translateY(0); }}
+    }}
 </style>
 <script>
-document.addEventListener("DOMContentLoaded", function () {
+document.addEventListener("DOMContentLoaded", function () {{
     const token = new URLSearchParams(window.location.search).get("token") || "";
     const viewParam = new URLSearchParams(window.location.search).get("view") || "engineers";
 
-    function normaliseView(view) {
+    function normaliseView(view) {{
         if (!view || view === "dashboard") return "engineers";
         return view;
-    }
+    }}
 
-    function showView(view, pushState) {
+    function showView(view, pushState) {{
         view = normaliseView(view);
         const panels = document.querySelectorAll("[data-dashboard-view]");
         const links = document.querySelectorAll("[data-dashboard-link]");
 
         let found = false;
-        panels.forEach(function (panel) {
+        panels.forEach(function (panel) {{
             const isActive = panel.getAttribute("data-dashboard-view") === view;
             panel.classList.toggle("active", isActive);
             if (isActive) found = true;
-        });
+        }});
 
-        if (!found) {
+        if (!found) {{
             view = "engineers";
-            panels.forEach(function (panel) {
+            panels.forEach(function (panel) {{
                 panel.classList.toggle("active", panel.getAttribute("data-dashboard-view") === view);
-            });
-        }
+            }});
+        }}
 
-        links.forEach(function (link) {
+        links.forEach(function (link) {{
             link.classList.toggle("active", normaliseView(link.getAttribute("data-dashboard-link")) === view);
-        });
+        }});
 
-        if (pushState) {
+        if (pushState) {{
             const params = new URLSearchParams();
             if (token) params.set("token", token);
             if (view !== "engineers") params.set("view", view);
             const newUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
-            window.history.pushState({ view: view }, "", newUrl);
-        }
-    }
+            window.history.pushState({{ view: view }}, "", newUrl);
+        }}
+    }}
 
-    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {
+    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {{
         const url = new URL(link.href, window.location.origin);
         const view = normaliseView(link.getAttribute("data-dashboard-link") || url.searchParams.get("view") || "engineers");
         link.setAttribute("data-dashboard-link", view);
-        link.addEventListener("click", function (event) {
+        link.addEventListener("click", function (event) {{
             event.preventDefault();
             showView(view, true);
-        });
-    });
+        }});
+    }});
 
-    window.addEventListener("popstate", function () {
+    window.addEventListener("popstate", function () {{
         const view = new URLSearchParams(window.location.search).get("view") || "engineers";
         showView(view, false);
-    });
+    }});
 
     showView(viewParam, false);
-});
+}});
 </script>
 
 </head>
@@ -3233,13 +3233,13 @@ def submit_signature(
     </style>
 
 <style>
-    .cdr-brand {
+    .cdr-brand {{
         display: flex;
         align-items: center;
         gap: 14px;
         margin-bottom: 18px;
-    }
-    .cdr-brand img {
+    }}
+    .cdr-brand img {{
         height: 54px;
         width: auto;
         object-fit: contain;
@@ -3247,95 +3247,95 @@ def submit_signature(
         border-radius: 12px;
         padding: 6px 10px;
         box-shadow: 0 8px 24px rgba(0,0,0,0.18);
-    }
-    .cdr-brand-title {
+    }}
+    .cdr-brand-title {{
         display: flex;
         flex-direction: column;
         line-height: 1.15;
-    }
-    .cdr-brand-title strong {
+    }}
+    .cdr-brand-title strong {{
         font-size: 22px;
-    }
-    .cdr-brand-title span {
+    }}
+    .cdr-brand-title span {{
         opacity: .72;
         font-size: 13px;
-    }
-    .dashboard-view {
+    }}
+    .dashboard-view {{
         display: none;
         animation: fadeIn .16s ease-in-out;
-    }
-    .dashboard-view.active {
+    }}
+    .dashboard-view.active {{
         display: block;
-    }
-    .nav a.active, .tabs a.active, .dashboard-nav a.active {
+    }}
+    .nav a.active, .tabs a.active, .dashboard-nav a.active {{
         background: rgba(245,130,32,.22) !important;
         border-color: rgba(245,130,32,.55) !important;
         color: #fff !important;
-    }
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(4px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
+    }}
+    @keyframes fadeIn {{
+        from {{ opacity: 0; transform: translateY(4px); }}
+        to {{ opacity: 1; transform: translateY(0); }}
+    }}
 </style>
 <script>
-document.addEventListener("DOMContentLoaded", function () {
+document.addEventListener("DOMContentLoaded", function () {{
     const token = new URLSearchParams(window.location.search).get("token") || "";
     const viewParam = new URLSearchParams(window.location.search).get("view") || "engineers";
 
-    function normaliseView(view) {
+    function normaliseView(view) {{
         if (!view || view === "dashboard") return "engineers";
         return view;
-    }
+    }}
 
-    function showView(view, pushState) {
+    function showView(view, pushState) {{
         view = normaliseView(view);
         const panels = document.querySelectorAll("[data-dashboard-view]");
         const links = document.querySelectorAll("[data-dashboard-link]");
 
         let found = false;
-        panels.forEach(function (panel) {
+        panels.forEach(function (panel) {{
             const isActive = panel.getAttribute("data-dashboard-view") === view;
             panel.classList.toggle("active", isActive);
             if (isActive) found = true;
-        });
+        }});
 
-        if (!found) {
+        if (!found) {{
             view = "engineers";
-            panels.forEach(function (panel) {
+            panels.forEach(function (panel) {{
                 panel.classList.toggle("active", panel.getAttribute("data-dashboard-view") === view);
-            });
-        }
+            }});
+        }}
 
-        links.forEach(function (link) {
+        links.forEach(function (link) {{
             link.classList.toggle("active", normaliseView(link.getAttribute("data-dashboard-link")) === view);
-        });
+        }});
 
-        if (pushState) {
+        if (pushState) {{
             const params = new URLSearchParams();
             if (token) params.set("token", token);
             if (view !== "engineers") params.set("view", view);
             const newUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
-            window.history.pushState({ view: view }, "", newUrl);
-        }
-    }
+            window.history.pushState({{ view: view }}, "", newUrl);
+        }}
+    }}
 
-    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {
+    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {{
         const url = new URL(link.href, window.location.origin);
         const view = normaliseView(link.getAttribute("data-dashboard-link") || url.searchParams.get("view") || "engineers");
         link.setAttribute("data-dashboard-link", view);
-        link.addEventListener("click", function (event) {
+        link.addEventListener("click", function (event) {{
             event.preventDefault();
             showView(view, true);
-        });
-    });
+        }});
+    }});
 
-    window.addEventListener("popstate", function () {
+    window.addEventListener("popstate", function () {{
         const view = new URLSearchParams(window.location.search).get("view") || "engineers";
         showView(view, false);
-    });
+    }});
 
     showView(viewParam, false);
-});
+}});
 </script>
 
 </head>
