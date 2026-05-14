@@ -5903,7 +5903,16 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         count = len(worksheet.get("photo_links", []))
-        await update.message.reply_text(f"Photo received ({count} total). Send more photos, or type DONE when finished.")
+
+        # Only acknowledge the first successful photo upload.
+        # This avoids spamming the engineer and reduces Telegram API calls when
+        # 10, 20+ photos are being uploaded from poor signal areas.
+        if not worksheet.get("photo_upload_started_notice_sent"):
+            worksheet["photo_upload_started_notice_sent"] = True
+            await update.message.reply_text(
+                "📷 Photo upload started. Send all required photos, then type DONE when finished."
+            )
+
         return PHOTOS
 
     await update.message.reply_text("Please send job photos, or type DONE when finished.")
@@ -6605,7 +6614,7 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=N
 
 def clean_docx_text(value):
     text = str(value or "").strip()
-    return text if text and text.lower() != "none" else "N/A"
+    return text if text and text.lower() not in ["none", "nan"] else "N/A"
 
 
 def safe_docx_filename(value):
@@ -6619,72 +6628,101 @@ def docx_escape(value):
     return xml_escape(text)
 
 
-def docx_run(text, bold=False, size=20):
+DOCX_PAGE_WIDTH = 11906
+DOCX_CONTENT_WIDTH = 10320
+DOCX_ORANGE = "F58220"
+DOCX_DARK = "333333"
+DOCX_LIGHT = "F7F7F7"
+DOCX_GREY = "D9D9D9"
+
+
+def docx_run(text, bold=False, size=18, color=None):
     rpr = f"<w:sz w:val='{size}'/>"
     if bold:
         rpr += "<w:b/>"
+    if color:
+        rpr += f"<w:color w:val='{color}'/>"
     return f"<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space='preserve'>{docx_escape(text)}</w:t></w:r>"
 
 
-def docx_paragraph(value="", bold=False, size=20, align=None, spacing_after=120):
+def docx_paragraph(value="", bold=False, size=18, align=None, spacing_after=80, color=None, clean=False):
     ppr = f"<w:spacing w:after='{spacing_after}'/>"
     if align:
         ppr += f"<w:jc w:val='{align}'/>"
 
-    lines = str(clean_docx_text(value)).splitlines() or [""]
+    text = clean_docx_text(value) if clean else str(value or "")
+    lines = text.splitlines() or [""]
     runs = []
     for i, line in enumerate(lines):
         if i:
             runs.append("<w:r><w:br/></w:r>")
-        runs.append(docx_run(line, bold=bold, size=size))
+        runs.append(docx_run(line, bold=bold, size=size, color=color))
 
     return f"<w:p><w:pPr>{ppr}</w:pPr>{''.join(runs)}</w:p>"
 
 
-def docx_cell(value="", bold=False, width=4500, shade=None):
+def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18, align=None):
     tcpr = f"<w:tcPr><w:tcW w:w='{width}' w:type='dxa'/>"
+    tcpr += "<w:tcMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tcMar>"
+    tcpr += "<w:vAlign w:val='top'/>"
     if shade:
         tcpr += f"<w:shd w:val='clear' w:color='auto' w:fill='{shade}'/>"
     tcpr += "</w:tcPr>"
-    return f"<w:tc>{tcpr}{docx_paragraph(value, bold=bold, size=18, spacing_after=60)}</w:tc>"
+    return f"<w:tc>{tcpr}{docx_paragraph(value, bold=bold, size=size, spacing_after=0, color=color, align=align, clean=False)}</w:tc>"
 
 
-def docx_table(rows, header_first=False, widths=None):
+def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None):
     if not rows:
         return ""
 
     column_count = max(len(row) for row in rows)
     if not widths:
-        widths = [int(9000 / column_count)] * column_count
+        widths = [int(table_width / column_count)] * column_count
 
     grid = "".join(f"<w:gridCol w:w='{widths[min(i, len(widths)-1)]}'/>" for i in range(column_count))
     tbl = [
         "<w:tbl>",
         "<w:tblPr>",
-        "<w:tblW w:w='9000' w:type='dxa'/>",
+        f"<w:tblW w:w='{table_width}' w:type='dxa'/>",
         "<w:tblLayout w:type='fixed'/>",
         "<w:tblBorders>",
-        "<w:top w:val='single' w:sz='4' w:space='0' w:color='999999'/>",
-        "<w:left w:val='single' w:sz='4' w:space='0' w:color='999999'/>",
-        "<w:bottom w:val='single' w:sz='4' w:space='0' w:color='999999'/>",
-        "<w:right w:val='single' w:sz='4' w:space='0' w:color='999999'/>",
-        "<w:insideH w:val='single' w:sz='4' w:space='0' w:color='999999'/>",
-        "<w:insideV w:val='single' w:sz='4' w:space='0' w:color='999999'/>",
+        f"<w:top w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:left w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:bottom w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:right w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:insideH w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
+        f"<w:insideV w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
         "</w:tblBorders>",
+        "<w:tblCellMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tblCellMar>",
         "</w:tblPr>",
         f"<w:tblGrid>{grid}</w:tblGrid>",
     ]
 
+    label_columns = set(label_columns or [])
     for row_index, row in enumerate(rows):
         is_header = header_first and row_index == 0
         tbl.append("<w:tr>")
         for col_index in range(column_count):
-            value = row[col_index] if col_index < len(row) else ""
+            raw_value = row[col_index] if col_index < len(row) else ""
+            value = clean_docx_text(raw_value)
+            is_label = col_index in label_columns and not is_header
+            shade = None
+            color = None
+            bold = False
+            if is_header:
+                shade = DOCX_ORANGE if header_orange else DOCX_LIGHT
+                color = "FFFFFF" if header_orange else None
+                bold = True
+            elif is_label:
+                shade = DOCX_LIGHT
+                bold = True
             tbl.append(docx_cell(
                 value,
-                bold=is_header,
+                bold=bold,
                 width=widths[min(col_index, len(widths)-1)],
-                shade="F58220" if is_header else None,
+                shade=shade,
+                color=color,
+                size=17,
             ))
         tbl.append("</w:tr>")
 
@@ -6692,15 +6730,19 @@ def docx_table(rows, header_first=False, widths=None):
     return "".join(tbl)
 
 
+def docx_spacer(height=90):
+    return docx_paragraph("", spacing_after=height)
+
+
 def docx_section(title, value):
     return (
-        docx_paragraph(title, bold=True, size=22)
-        + docx_table([[clean_docx_text(value)]], widths=[9000])
-        + docx_paragraph("", spacing_after=80)
+        docx_table([[title], [clean_docx_text(value)]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH])
+        + docx_spacer(100)
     )
 
 
 def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
+    # Build an editable DOCX matching the previous professional PDF worksheet layout.
     cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "") or fields.get("Title", "")
     date_logged = format_sharepoint_date(fields.get("Date", ""))
     date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
@@ -6726,15 +6768,15 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
         }]
 
-    visit_rows = [["Date", "Travel", "On Site", "Engineer", "Status", "Off Site"]]
+    visit_rows = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
     for visit in visits:
         visit_rows.append([
-            clean_docx_text(visit.get("date")),
-            clean_docx_text(visit.get("travel")),
-            clean_docx_text(visit.get("on_site")),
-            clean_docx_text(visit.get("engineer")),
-            clean_docx_text(visit.get("status")),
-            clean_docx_text(visit.get("off_site")),
+            visit.get("date", ""),
+            visit.get("travel", ""),
+            visit.get("on_site", ""),
+            visit.get("engineer", ""),
+            visit.get("status", ""),
+            visit.get("off_site", ""),
         ])
 
     comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
@@ -6752,23 +6794,24 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         signature_text = "Client signature not required."
 
     body = []
-    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=34, align="center", spacing_after=180))
+    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="center", spacing_after=60))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd\n"
         "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\n"
         "Telephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\n"
         "VAT Number: 397715249 | Company No.: 13744971",
-        size=18,
+        size=17,
         align="center",
-        spacing_after=220,
+        spacing_after=160,
     ))
 
     body.append(docx_table(
         [["Customer Details", "Site Details"], [customer_details, site_details]],
         header_first=True,
-        widths=[4500, 4500],
+        header_orange=True,
+        widths=[5160, 5160],
     ))
-    body.append(docx_paragraph("", spacing_after=120))
+    body.append(docx_spacer(110))
 
     body.append(docx_table(
         [
@@ -6776,14 +6819,14 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             ["Date Logged", date_logged, "Job Category", job_category],
             ["Date Complete", date_complete, "Status", outcome],
         ],
-        widths=[2200, 2300, 2200, 2300],
+        widths=[1950, 3210, 2450, 2710],
+        label_columns={0, 2},
     ))
-    body.append(docx_paragraph("", spacing_after=120))
+    body.append(docx_spacer(110))
 
     body.append(docx_section("Description", task))
-    body.append(docx_paragraph("Visits", bold=True, size=22))
-    body.append(docx_table(visit_rows, header_first=True, widths=[1300, 1300, 1300, 2200, 1600, 1300]))
-    body.append(docx_paragraph("", spacing_after=120))
+    body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
+    body.append(docx_spacer(110))
     body.append(docx_section("Engineer Comment", comments))
     body.append(docx_section("Client Signature", signature_text))
     body.append(docx_paragraph(
@@ -6798,8 +6841,8 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <w:body>
 {''.join(body)}
 <w:sectPr>
-<w:pgSz w:w='11906' w:h='16838'/>
-<w:pgMar w:top='720' w:right='720' w:bottom='720' w:left='720' w:header='720' w:footer='720' w:gutter='0'/>
+<w:pgSz w:w='{DOCX_PAGE_WIDTH}' w:h='16838'/>
+<w:pgMar w:top='680' w:right='793' w:bottom='680' w:left='793' w:header='720' w:footer='720' w:gutter='0'/>
 </w:sectPr>
 </w:body>
 </w:document>'''
@@ -6852,24 +6895,25 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 
 
 def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
-    """Generate and upload the professional PDF worksheet."""
+    # Generate and upload editable Word worksheet using the professional PDF-style layout.
+    # Function name is kept for compatibility with existing worksheet flow and SharePoint fields.
     try:
-        pdf_bytes = build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id)
+        docx_bytes = build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id)
         cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
         worksheet_folder_name = safe_folder_name(cdr_number)
-        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.pdf"
+        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
 
         worksheet_link = upload_file_to_sharepoint(
             site_id,
             WORKSHEET_BASE_FOLDER,
             worksheet_folder_name,
             file_name,
-            pdf_bytes,
+            docx_bytes,
         )
         colour_sharepoint_folder_green(site_id, WORKSHEET_BASE_FOLDER, worksheet_folder_name)
         return worksheet_link
     except Exception as e:
-        print(f"ERROR generating worksheet PDF: {e}")
+        print(f"ERROR generating worksheet Word document: {e}")
         return ""
 
 
