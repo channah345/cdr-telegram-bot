@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "docx-pdf-layout-all-photos-max10-v7"
+BUILD_VERSION = "live-dashboard-v11"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2165,6 +2165,282 @@ def logo():
     """
 
     return Response(content=fallback_svg.strip(), media_type="image/svg+xml")
+
+
+
+
+# =========================
+# Live Engineer Dashboard
+# =========================
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
+
+
+def html_safe(value):
+    return xml_escape(str(value or ""))
+
+
+def dashboard_parse_work_date(fields):
+    return parse_sharepoint_date_to_date(
+        get_field_value(fields, "WorkDate", "Work Date", "Created")
+    )
+
+
+def dashboard_latest_day_log_for_engineer(day_logs, telegram_id, work_date):
+    telegram_id = str(telegram_id or "").strip()
+    matches = []
+
+    for log in day_logs or []:
+        fields = log.get("fields", {})
+        log_telegram_id = str(get_field_value(fields, "EngineerTelegramID", "Engineer Telegram ID") or "").strip()
+        if log_telegram_id != telegram_id:
+            continue
+
+        log_date = dashboard_parse_work_date(fields)
+        if log_date != work_date:
+            continue
+
+        start_dt = parse_sharepoint_datetime(get_field_value(fields, "StartTime", "Start Time"))
+        created_dt = parse_sharepoint_datetime(get_field_value(fields, "Created"))
+        sort_dt = start_dt or created_dt or datetime.min.replace(tzinfo=UK_TZ)
+        matches.append((sort_dt, log))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return matches[0][1]
+
+
+def dashboard_engineer_rows(engineers, day_logs, jobs_data):
+    today = datetime.now(UK_TZ).date()
+    now = datetime.now(UK_TZ)
+    rows = []
+
+    active_engineers = []
+    for engineer in engineers or []:
+        fields = engineer.get("fields", {})
+        active_value = get_field_value(fields, "Active")
+        if active_value not in [None, ""] and not bool_field(active_value):
+            continue
+
+        role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
+        if role not in ["engineer", "admin"]:
+            continue
+
+        name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
+        telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
+        lookup_id = str(fields.get("id", "") or engineer.get("id", "")).strip()
+
+        if name and telegram_id:
+            active_engineers.append({
+                "name": name,
+                "telegram_id": telegram_id,
+                "lookup_id": lookup_id,
+            })
+
+    active_engineers.sort(key=lambda e: e["name"].lower())
+
+    for engineer in active_engineers:
+        name = engineer["name"]
+        lookup_id = engineer["lookup_id"]
+        telegram_id = engineer["telegram_id"]
+        day_log = dashboard_latest_day_log_for_engineer(day_logs, telegram_id, today)
+        day_fields = day_log.get("fields", {}) if day_log else {}
+        day_status = str(get_field_value(day_fields, "Status") or "Not Started")
+        start_dt = parse_sharepoint_datetime(get_field_value(day_fields, "StartTime", "Start Time"))
+        end_dt = parse_sharepoint_datetime(get_field_value(day_fields, "EndTime", "End Time"))
+
+        open_jobs = get_open_jobs_for_engineer_today(jobs_data, lookup_id) if lookup_id else []
+        current_job = None
+        if open_jobs:
+            status_priority = {"On Site": 0, "Travelling": 1, "Assigned": 2, AWAITING_DEPLOYMENT_STATUS: 3, LEGACY_AWAITING_DEPLOYMENT_STATUS: 3, "": 4}
+            open_jobs.sort(key=lambda job: status_priority.get(str(job.get("fields", {}).get("Status", "")), 9))
+            current_job = open_jobs[0]
+
+        events = []
+        for job in jobs_data or []:
+            fields = job.get("fields", {})
+            cdr = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+            site = get_field_value(fields, "SiteName", "Site Name") or ""
+            log_text = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
+            try:
+                visits = parse_engineer_visit_log(log_text)
+            except Exception:
+                visits = []
+            for visit in visits:
+                if str(visit.get("engineer", "")).strip().lower() != name.strip().lower():
+                    continue
+                date_text = visit.get("date", "")
+                try:
+                    visit_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+                except Exception:
+                    continue
+                if visit_date != today:
+                    continue
+                for key, label in [("travel", "Travelling"), ("on_site", "On Site"), ("off_site", visit.get("status", "Completed"))]:
+                    time_text = visit.get(key)
+                    event_dt = parse_engineer_log_datetime(date_text, time_text) if time_text else None
+                    if event_dt:
+                        events.append({"dt": event_dt, "label": label, "cdr": cdr, "site": site})
+        events.sort(key=lambda item: item["dt"], reverse=True)
+        last_event = events[0] if events else None
+
+        if not day_log:
+            card_status = "Not Started"
+            css = "not-started"
+            job_text = "No active day"
+            since_text = ""
+            util = "-"
+            productive = "-"
+            inactive = "-"
+        elif str(day_status).lower() == DAY_CLOSED_STATUS.lower():
+            card_status = "Ended Day"
+            css = "ended"
+            job_text = "Day closed"
+            since_text = end_dt.strftime("%H:%M") if end_dt else ""
+            util = get_field_value(day_fields, "UtilisationPercent", "Utilisation Percent")
+            productive = get_field_value(day_fields, "ProductiveHours", "Productive Hours")
+            inactive = get_field_value(day_fields, "InactiveHours", "Inactive Hours", "UnproductiveHours", "Unproductive Hours")
+        else:
+            if current_job:
+                jf = current_job.get("fields", {})
+                job_status = str(get_field_value(jf, "Status") or "Assigned")
+                cdr = get_field_value(jf, "CDRNumber", "CDR Number", "Title") or ""
+                site = get_field_value(jf, "SiteName", "Site Name") or ""
+                card_status = job_status
+                job_text = f"{cdr} - {site}".strip(" -")
+                css = "on-site" if job_status == "On Site" else "travelling" if job_status == "Travelling" else "active"
+            else:
+                card_status = "Active Day"
+                job_text = "No current open job"
+                css = "idle"
+
+            last_dt = last_event["dt"] if last_event else start_dt
+            if last_dt:
+                mins = max(0, int((now - last_dt).total_seconds() // 60))
+                since_text = f"Last activity {mins // 60}h {mins % 60:02d}m ago" if mins >= 60 else f"Last activity {mins}m ago"
+            else:
+                since_text = ""
+
+            live_hours = calculate_day_pay_hours(start_dt, now, jobs_data=jobs_data, engineer_name=name) if start_dt else None
+            util = live_hours.get("utilisation_percent") if live_hours else "-"
+            productive = live_hours.get("productive_hours") if live_hours else "-"
+            inactive = live_hours.get("inactive_hours") if live_hours else "-"
+
+        rows.append({
+            "name": name,
+            "status": card_status,
+            "css": css,
+            "job": job_text,
+            "since": since_text,
+            "start": start_dt.strftime("%H:%M") if start_dt else "-",
+            "util": util if util not in [None, ""] else "-",
+            "productive": productive if productive not in [None, ""] else "-",
+            "inactive": inactive if inactive not in [None, ""] else "-",
+            "last": f"{last_event['label']} - {last_event['cdr']}" if last_event else "-",
+        })
+
+    return rows
+
+
+@web_app.get("/dashboard", response_class=HTMLResponse)
+def live_engineer_dashboard(token: str = ""):
+    if DASHBOARD_TOKEN and token != DASHBOARD_TOKEN:
+        return HTMLResponse("Dashboard access denied.", status_code=403)
+
+    try:
+        site_id = get_site_id()
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+
+        engineers = get_list_items(site_id, engineers_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        day_logs = get_list_items(site_id, day_logs_list_id)
+        rows = dashboard_engineer_rows(engineers, day_logs, jobs_data)
+        generated = datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M:%S")
+
+        cards = []
+        for row in rows:
+            cards.append(f"""
+            <div class='card {html_safe(row['css'])}'>
+                <div class='card-top'>
+                    <div>
+                        <h2>{html_safe(row['name'])}</h2>
+                        <div class='status'>{html_safe(row['status'])}</div>
+                    </div>
+                    <div class='util'>{html_safe(row['util'])}%</div>
+                </div>
+                <div class='job'>{html_safe(row['job'])}</div>
+                <div class='since'>{html_safe(row['since'])}</div>
+                <div class='metrics'>
+                    <div><span>Start</span><strong>{html_safe(row['start'])}</strong></div>
+                    <div><span>Productive</span><strong>{html_safe(row['productive'])}h</strong></div>
+                    <div><span>Inactive</span><strong>{html_safe(row['inactive'])}h</strong></div>
+                </div>
+                <div class='last'>Last: {html_safe(row['last'])}</div>
+            </div>
+            """)
+
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CDR Engineer Dashboard</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <meta http-equiv='refresh' content='30'>
+    <style>
+        :root {{ --orange:#f58220; --dark:#1f2937; --muted:#6b7280; --bg:#f3f4f6; }}
+        body {{ margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--dark); }}
+        header {{ background:#111827; color:white; padding:22px 28px; display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; }}
+        header h1 {{ margin:0; font-size:26px; }}
+        header .sub {{ color:#d1d5db; font-size:14px; margin-top:4px; }}
+        .logo {{ font-weight:800; color:var(--orange); font-size:28px; letter-spacing:1px; }}
+        .wrap {{ padding:24px; }}
+        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap:18px; }}
+        .card {{ background:white; border-radius:18px; padding:18px; box-shadow:0 6px 18px rgba(0,0,0,.08); border-left:8px solid #9ca3af; }}
+        .card.on-site {{ border-left-color:#16a34a; }}
+        .card.travelling {{ border-left-color:#2563eb; }}
+        .card.active {{ border-left-color:#7c3aed; }}
+        .card.idle {{ border-left-color:#f59e0b; }}
+        .card.ended {{ border-left-color:#6b7280; opacity:.84; }}
+        .card.not-started {{ border-left-color:#dc2626; opacity:.78; }}
+        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
+        h2 {{ margin:0; font-size:21px; }}
+        .status {{ display:inline-block; margin-top:7px; padding:5px 10px; background:#f3f4f6; border-radius:999px; font-size:13px; font-weight:700; }}
+        .util {{ min-width:64px; text-align:center; background:#111827; color:white; border-radius:14px; padding:8px 10px; font-weight:800; }}
+        .job {{ font-size:16px; font-weight:700; margin-top:16px; min-height:38px; }}
+        .since {{ color:var(--muted); font-size:14px; margin-top:4px; }}
+        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:18px; }}
+        .metrics div {{ background:#f9fafb; border:1px solid #e5e7eb; padding:10px; border-radius:12px; }}
+        .metrics span {{ display:block; color:var(--muted); font-size:12px; }}
+        .metrics strong {{ display:block; margin-top:3px; font-size:16px; }}
+        .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid #e5e7eb; padding-top:12px; }}
+        .footer {{ color:var(--muted); font-size:13px; margin-top:22px; }}
+        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} }}
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>Engineer Dashboard</h1>
+            <div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div>
+        </div>
+        <div class='logo'>CDR</div>
+    </header>
+    <main class='wrap'>
+        <div class='grid'>
+            {''.join(cards) if cards else "<p>No engineers found.</p>"}
+        </div>
+        <div class='footer'>Green = on site · Blue = travelling · Amber = active but idle · Red = not started · Grey = ended day</div>
+    </main>
+</body>
+</html>
+        """)
+
+    except Exception as e:
+        print(f"ERROR loading dashboard: {e}")
+        return HTMLResponse(f"Dashboard error: {html_safe(e)}", status_code=500)
 
 
 @web_app.get("/sign/{cdr_number}", response_class=HTMLResponse)
