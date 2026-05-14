@@ -5,7 +5,7 @@ import secrets
 import threading
 import zipfile
 from io import BytesIO
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from xml.sax.saxutils import escape as xml_escape
 import warnings
 import requests
@@ -54,7 +54,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "worksheet-word-docx-v1"
+BUILD_VERSION = "worksheet-docx-engineer-summary-green-folder-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -1508,6 +1508,82 @@ def ensure_folder(drive_id, folder_path):
             raise Exception(f"Could not create folder {current_path}: {create_response.text}")
 
 
+
+def get_sharepoint_rest_headers():
+    """Headers for SharePoint REST API calls.
+
+    Graph calls use a Graph token. Folder colouring is a SharePoint REST
+    endpoint, so this requests a SharePoint audience token instead.
+    """
+    site_hostname = SHAREPOINT_SITE.split("/")[2]
+    token_result = msal_app.acquire_token_for_client(
+        scopes=[f"https://{site_hostname}/.default"]
+    )
+
+    if "access_token" not in token_result:
+        raise Exception(f"Could not get SharePoint REST token: {token_result}")
+
+    return {
+        "Authorization": f"Bearer {token_result['access_token']}",
+        "Accept": "application/json;odata=nometadata",
+        "Content-Type": "application/json;odata=nometadata",
+    }
+
+
+def get_drive_web_url(site_id, drive_name):
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
+    response = requests.get(url, headers=get_headers())
+
+    if response.status_code != 200:
+        raise Exception(f"Could not get SharePoint drives: {response.text}")
+
+    for drive in response.json().get("value", []):
+        if drive.get("name") == drive_name:
+            return drive.get("webUrl", "")
+
+    raise Exception(f"Document library not found: {drive_name}")
+
+
+def colour_sharepoint_folder_green(site_id, base_folder, folder_name):
+    """Best-effort SharePoint folder colour update.
+
+    If the tenant/app permissions do not allow SharePoint REST folder colouring,
+    the worksheet upload still succeeds and this only logs a warning.
+    """
+    try:
+        site_url = SHAREPOINT_SITE.rstrip("/")
+        drive_web_url = get_drive_web_url(site_id, PHOTO_LIBRARY)
+
+        parsed_drive = urlparse(drive_web_url)
+        library_server_relative = parsed_drive.path.rstrip("/")
+        folder_server_relative = f"{library_server_relative}/{base_folder}/{folder_name}"
+
+        # SharePoint folder colour codes are 0-15. 11 is light green.
+        endpoint = (
+            f"{site_url}/_api/foldercoloring/stampcolor"
+            f"(DecodedUrl='{folder_server_relative}')"
+        )
+
+        body = {
+            "coloringInformation": {
+                "ColorHex": "11"
+            }
+        }
+
+        response = requests.post(
+            endpoint,
+            headers=get_sharepoint_rest_headers(),
+            json=body,
+        )
+
+        if response.status_code not in [200, 201, 204]:
+            print(f"WARNING: Could not colour worksheet folder green: {response.status_code} {response.text}")
+
+    except Exception as e:
+        print(f"WARNING: Could not colour worksheet folder green: {e}")
+
+
+
 def upload_file_to_sharepoint(site_id, base_folder, cdr_number, file_name, file_bytes):
     drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
     folder_path = f"{base_folder}/{cdr_number}"
@@ -1673,6 +1749,7 @@ def build_trade_group_text_summary(worksheet, fields, updated_log, outcome):
         f"Date To Attend: {date_line}",
         f"Job Location: {site_name}",
         f"Job Number: {cdr_number}",
+        f"Engineer: {engineer_name}",
         f"Description: {task}",
     ]
 
@@ -6661,13 +6738,15 @@ def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet,
         cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
         file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
 
+        worksheet_folder_name = safe_folder_name(cdr_number)
         worksheet_link = upload_file_to_sharepoint(
             site_id,
             WORKSHEET_BASE_FOLDER,
-            safe_folder_name(cdr_number),
+            worksheet_folder_name,
             file_name,
             docx_bytes,
         )
+        colour_sharepoint_folder_green(site_id, WORKSHEET_BASE_FOLDER, worksheet_folder_name)
         return worksheet_link
     except Exception as e:
         print(f"ERROR generating worksheet Word document: {e}")
