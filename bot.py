@@ -7756,10 +7756,11 @@ def docx_escape(value):
 DOCX_PAGE_WIDTH = 11906
 DOCX_CONTENT_WIDTH = 10320
 DOCX_ORANGE = "F58220"
-DOCX_DARK = "333333"
-DOCX_LIGHT = "F7F7F7"
+DOCX_DARK = "595959"
+DOCX_MID = "D9D9D9"
+DOCX_LIGHT = "F2F2F2"
 DOCX_GREY = "999999"
-DOCX_GRID = "D9D9D9"
+DOCX_GRID = "BFBFBF"
 
 
 def mm_to_emu(mm_value):
@@ -7855,7 +7856,7 @@ def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18,
     return f"<w:tc>{tcpr}{content}</w:tc>"
 
 
-def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None, no_borders=False):
+def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None, no_borders=False, header_dark=False):
     if not rows:
         return ""
 
@@ -7873,12 +7874,12 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
     else:
         borders = f"""
         <w:tblBorders>
-          <w:top w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
-          <w:left w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
-          <w:bottom w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
-          <w:right w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
-          <w:insideH w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GRID}'/>
-          <w:insideV w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:top w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:left w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:bottom w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:right w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:insideH w:val='single' w:sz='6' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:insideV w:val='single' w:sz='6' w:space='0' w:color='{DOCX_GRID}'/>
         </w:tblBorders>"""
 
     tbl = [
@@ -7887,7 +7888,7 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
         f"<w:tblW w:w='{table_width}' w:type='dxa'/>",
         "<w:tblLayout w:type='fixed'/>",
         borders,
-        "<w:tblCellMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tblCellMar>",
+        "<w:tblCellMar><w:top w:w='95' w:type='dxa'/><w:left w:w='130' w:type='dxa'/><w:bottom w:w='95' w:type='dxa'/><w:right w:w='130' w:type='dxa'/></w:tblCellMar>",
         "</w:tblPr>",
         f"<w:tblGrid>{grid}</w:tblGrid>",
     ]
@@ -7905,8 +7906,14 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
             color = None
             bold = False
             if is_header:
-                shade = DOCX_ORANGE if header_orange else DOCX_LIGHT
-                color = "FFFFFF" if header_orange else None
+                if header_orange:
+                    shade = DOCX_ORANGE
+                    color = "FFFFFF"
+                elif header_dark:
+                    shade = DOCX_DARK
+                    color = "FFFFFF"
+                else:
+                    shade = DOCX_MID
                 bold = True
             elif is_label:
                 shade = DOCX_LIGHT
@@ -7925,16 +7932,16 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
     tbl.append("</w:tbl>")
     return "".join(tbl)
 
-
 def docx_spacer(height=90):
     return docx_paragraph("", spacing_after=height)
 
 
 def docx_section(title, value):
-    # Simple PDF-style section: bold heading with plain body text underneath.
+    # Professional jobsheet section: dark grey header bar with bordered body.
     return (
-        docx_paragraph(title, bold=True, size=20, spacing_after=30)
-        + docx_paragraph(clean_docx_text(value), size=18, spacing_after=120)
+        docx_table([[title.upper()]], header_first=True, header_dark=True, widths=[DOCX_CONTENT_WIDTH])
+        + docx_table([[clean_docx_text(value)]], widths=[DOCX_CONTENT_WIDTH])
+        + docx_spacer(80)
     )
 
 
@@ -7993,7 +8000,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     if worksheet.get("ClientSignatureRequired"):
         if worksheet.get("ClientSignatureReceived"):
             name = worksheet.get("ClientSignatureName", "")
-            signature_body.append([{"raw_xml": docx_paragraph(f"Client Name: {name}", size=18, spacing_after=35)}])
+            signature_body.append([{"raw_xml": docx_paragraph(f"Client Name: {name}", bold=True, size=18, spacing_after=35)}])
             signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
             if signature_bytes:
                 signature_bytes = prepare_signature_image_for_export(signature_bytes)
@@ -8024,13 +8031,12 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     ))
 
     body.append(docx_table(
-        [["Customer Details", "Site Details"], [customer_details, site_details]],
+        [["CUSTOMER DETAILS", "SITE DETAILS"], [customer_details, site_details]],
         header_first=True,
-        header_orange=False,
+        header_dark=False,
         widths=[5160, 5160],
-        no_borders=True,
     ))
-    body.append(docx_spacer(80))
+    body.append(docx_spacer(90))
 
     body.append(docx_table(
         [
@@ -8040,25 +8046,24 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         ],
         widths=[1650, 3510, 2350, 2810],
         label_columns={0, 2},
-        no_borders=True,
     ))
     body.append(docx_spacer(90))
 
     body.append(docx_section("Description", task))
 
-    body.append(docx_paragraph("Visits", bold=True, size=20, spacing_after=35))
+    body.append(docx_table([["VISITS"]], header_first=True, header_dark=True, widths=[DOCX_CONTENT_WIDTH]))
     body.append(docx_table(
         visit_rows,
         header_first=True,
-        header_orange=False,
+        header_dark=False,
         widths=[1450, 1250, 1250, 2550, 2200, 1620],
     ))
     body.append(docx_spacer(100))
 
     body.append(docx_section("Engineer Comment", comments))
 
-    body.append(docx_paragraph("Client Signature", bold=True, size=20, spacing_after=35))
-    body.append(docx_table(signature_body, widths=[DOCX_CONTENT_WIDTH], no_borders=True))
+    body.append(docx_table([["CLIENT SIGNATURE"]], header_first=True, header_dark=True, widths=[DOCX_CONTENT_WIDTH]))
+    body.append(docx_table(signature_body, widths=[DOCX_CONTENT_WIDTH]))
     body.append(docx_spacer(80))
 
     body.append(docx_paragraph(
