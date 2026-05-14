@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-pages-v13"
+BUILD_VERSION = "dashboard-logo-tabs-v14"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2747,6 +2747,113 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
         @media (max-width:960px) {{ .panel-grid {{ grid-template-columns:1fr; }} }}
         @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
     </style>
+
+<style>
+    .cdr-brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 18px;
+    }
+    .cdr-brand img {
+        height: 54px;
+        width: auto;
+        object-fit: contain;
+        background: #ffffff;
+        border-radius: 12px;
+        padding: 6px 10px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    }
+    .cdr-brand-title {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.15;
+    }
+    .cdr-brand-title strong {
+        font-size: 22px;
+    }
+    .cdr-brand-title span {
+        opacity: .72;
+        font-size: 13px;
+    }
+    .dashboard-view {
+        display: none;
+        animation: fadeIn .16s ease-in-out;
+    }
+    .dashboard-view.active {
+        display: block;
+    }
+    .nav a.active, .tabs a.active, .dashboard-nav a.active {
+        background: rgba(245,130,32,.22) !important;
+        border-color: rgba(245,130,32,.55) !important;
+        color: #fff !important;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+</style>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const token = new URLSearchParams(window.location.search).get("token") || "";
+    const viewParam = new URLSearchParams(window.location.search).get("view") || "engineers";
+
+    function normaliseView(view) {
+        if (!view || view === "dashboard") return "engineers";
+        return view;
+    }
+
+    function showView(view, pushState) {
+        view = normaliseView(view);
+        const panels = document.querySelectorAll("[data-dashboard-view]");
+        const links = document.querySelectorAll("[data-dashboard-link]");
+
+        let found = false;
+        panels.forEach(function (panel) {
+            const isActive = panel.getAttribute("data-dashboard-view") === view;
+            panel.classList.toggle("active", isActive);
+            if (isActive) found = true;
+        });
+
+        if (!found) {
+            view = "engineers";
+            panels.forEach(function (panel) {
+                panel.classList.toggle("active", panel.getAttribute("data-dashboard-view") === view);
+            });
+        }
+
+        links.forEach(function (link) {
+            link.classList.toggle("active", normaliseView(link.getAttribute("data-dashboard-link")) === view);
+        });
+
+        if (pushState) {
+            const params = new URLSearchParams();
+            if (token) params.set("token", token);
+            if (view !== "engineers") params.set("view", view);
+            const newUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
+            window.history.pushState({ view: view }, "", newUrl);
+        }
+    }
+
+    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {
+        const url = new URL(link.href, window.location.origin);
+        const view = normaliseView(link.getAttribute("data-dashboard-link") || url.searchParams.get("view") || "engineers");
+        link.setAttribute("data-dashboard-link", view);
+        link.addEventListener("click", function (event) {
+            event.preventDefault();
+            showView(view, true);
+        });
+    });
+
+    window.addEventListener("popstate", function () {
+        const view = new URLSearchParams(window.location.search).get("view") || "engineers";
+        showView(view, false);
+    });
+
+    showView(viewParam, false);
+});
+</script>
+
 </head>
 <body>
     <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><div class='logo'>CDR</div></div><nav>{nav}</nav></header>
@@ -2838,10 +2945,117 @@ def signature_page(cdr_number: str, token: str):
             .clear {{ background: #555; color: white; }}
             .small {{ font-size: 13px; color: #555; margin-top: 15px; }}
         </style>
-    </head>
+    
+<style>
+    .cdr-brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 18px;
+    }
+    .cdr-brand img {
+        height: 54px;
+        width: auto;
+        object-fit: contain;
+        background: #ffffff;
+        border-radius: 12px;
+        padding: 6px 10px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    }
+    .cdr-brand-title {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.15;
+    }
+    .cdr-brand-title strong {
+        font-size: 22px;
+    }
+    .cdr-brand-title span {
+        opacity: .72;
+        font-size: 13px;
+    }
+    .dashboard-view {
+        display: none;
+        animation: fadeIn .16s ease-in-out;
+    }
+    .dashboard-view.active {
+        display: block;
+    }
+    .nav a.active, .tabs a.active, .dashboard-nav a.active {
+        background: rgba(245,130,32,.22) !important;
+        border-color: rgba(245,130,32,.55) !important;
+        color: #fff !important;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+</style>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const token = new URLSearchParams(window.location.search).get("token") || "";
+    const viewParam = new URLSearchParams(window.location.search).get("view") || "engineers";
+
+    function normaliseView(view) {
+        if (!view || view === "dashboard") return "engineers";
+        return view;
+    }
+
+    function showView(view, pushState) {
+        view = normaliseView(view);
+        const panels = document.querySelectorAll("[data-dashboard-view]");
+        const links = document.querySelectorAll("[data-dashboard-link]");
+
+        let found = false;
+        panels.forEach(function (panel) {
+            const isActive = panel.getAttribute("data-dashboard-view") === view;
+            panel.classList.toggle("active", isActive);
+            if (isActive) found = true;
+        });
+
+        if (!found) {
+            view = "engineers";
+            panels.forEach(function (panel) {
+                panel.classList.toggle("active", panel.getAttribute("data-dashboard-view") === view);
+            });
+        }
+
+        links.forEach(function (link) {
+            link.classList.toggle("active", normaliseView(link.getAttribute("data-dashboard-link")) === view);
+        });
+
+        if (pushState) {
+            const params = new URLSearchParams();
+            if (token) params.set("token", token);
+            if (view !== "engineers") params.set("view", view);
+            const newUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
+            window.history.pushState({ view: view }, "", newUrl);
+        }
+    }
+
+    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {
+        const url = new URL(link.href, window.location.origin);
+        const view = normaliseView(link.getAttribute("data-dashboard-link") || url.searchParams.get("view") || "engineers");
+        link.setAttribute("data-dashboard-link", view);
+        link.addEventListener("click", function (event) {
+            event.preventDefault();
+            showView(view, true);
+        });
+    });
+
+    window.addEventListener("popstate", function () {
+        const view = new URLSearchParams(window.location.search).get("view") || "engineers";
+        showView(view, false);
+    });
+
+    showView(viewParam, false);
+});
+</script>
+
+</head>
     <body>
         <div class="container">
-            <img src="/logo.png" alt="CDR M&E Services Ltd" style="display:block; max-width:320px; width:80%; margin:0 auto 20px auto;">
+            <img src="/cdr-logo.png" alt="CDR M&E Services Ltd" style="display:block; max-width:320px; width:80%; margin:0 auto 20px auto;">
             <h2 style="text-align:center;">Client Signature</h2>
             <div class="job-box">
                 <p><strong>CDR Number:</strong> {cdr_number}</p>
@@ -3017,12 +3231,119 @@ def submit_signature(
             margin: 0;
         }
     </style>
+
+<style>
+    .cdr-brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 18px;
+    }
+    .cdr-brand img {
+        height: 54px;
+        width: auto;
+        object-fit: contain;
+        background: #ffffff;
+        border-radius: 12px;
+        padding: 6px 10px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    }
+    .cdr-brand-title {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.15;
+    }
+    .cdr-brand-title strong {
+        font-size: 22px;
+    }
+    .cdr-brand-title span {
+        opacity: .72;
+        font-size: 13px;
+    }
+    .dashboard-view {
+        display: none;
+        animation: fadeIn .16s ease-in-out;
+    }
+    .dashboard-view.active {
+        display: block;
+    }
+    .nav a.active, .tabs a.active, .dashboard-nav a.active {
+        background: rgba(245,130,32,.22) !important;
+        border-color: rgba(245,130,32,.55) !important;
+        color: #fff !important;
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+</style>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const token = new URLSearchParams(window.location.search).get("token") || "";
+    const viewParam = new URLSearchParams(window.location.search).get("view") || "engineers";
+
+    function normaliseView(view) {
+        if (!view || view === "dashboard") return "engineers";
+        return view;
+    }
+
+    function showView(view, pushState) {
+        view = normaliseView(view);
+        const panels = document.querySelectorAll("[data-dashboard-view]");
+        const links = document.querySelectorAll("[data-dashboard-link]");
+
+        let found = false;
+        panels.forEach(function (panel) {
+            const isActive = panel.getAttribute("data-dashboard-view") === view;
+            panel.classList.toggle("active", isActive);
+            if (isActive) found = true;
+        });
+
+        if (!found) {
+            view = "engineers";
+            panels.forEach(function (panel) {
+                panel.classList.toggle("active", panel.getAttribute("data-dashboard-view") === view);
+            });
+        }
+
+        links.forEach(function (link) {
+            link.classList.toggle("active", normaliseView(link.getAttribute("data-dashboard-link")) === view);
+        });
+
+        if (pushState) {
+            const params = new URLSearchParams();
+            if (token) params.set("token", token);
+            if (view !== "engineers") params.set("view", view);
+            const newUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
+            window.history.pushState({ view: view }, "", newUrl);
+        }
+    }
+
+    document.querySelectorAll("a[href*='view='], a[data-dashboard-link]").forEach(function (link) {
+        const url = new URL(link.href, window.location.origin);
+        const view = normaliseView(link.getAttribute("data-dashboard-link") || url.searchParams.get("view") || "engineers");
+        link.setAttribute("data-dashboard-link", view);
+        link.addEventListener("click", function (event) {
+            event.preventDefault();
+            showView(view, true);
+        });
+    });
+
+    window.addEventListener("popstate", function () {
+        const view = new URLSearchParams(window.location.search).get("view") || "engineers";
+        showView(view, false);
+    });
+
+    showView(viewParam, false);
+});
+</script>
+
 </head>
 <body>
 
 <div class="container">
 
-    <img src="/logo.png" class="logo">
+    <img src="/cdr-logo.png" class="logo">
 
     <div class="tick">✓</div>
 
