@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-stable-logo-v18"
+BUILD_VERSION = "dashboard-logo-fixed-v19"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2150,11 +2150,20 @@ def home():
 
 
 @web_app.get("/logo.png")
+@web_app.get("/cdr-logo.png")
 def logo():
-    logo_path = "cdr-logo.png"
+    possible_logo_paths = [
+        "cdr-logo.png",
+        "./cdr-logo.png",
+        "/app/cdr-logo.png",
+        "CDR-logo.png",
+        "cdr_logo.png",
+        "logo.png",
+    ]
 
-    if os.path.exists(logo_path):
-        return FileResponse(logo_path)
+    for logo_path in possible_logo_paths:
+        if os.path.exists(logo_path):
+            return FileResponse(logo_path)
 
     fallback_svg = """
     <svg xmlns="http://www.w3.org/2000/svg" width="640" height="180" viewBox="0 0 640 180">
@@ -2752,7 +2761,7 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
 </style>
 </head>
 <body>
-    <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><div class='logo'>CDR</div></div><nav>{nav}</nav></header>
+    <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><img src='/logo.png' alt='CDR M&E Services Ltd' style='height:46px;width:auto;max-width:220px;object-fit:contain;display:block;'></div><nav>{nav}</nav></header>
     <main class='wrap'>{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
 </body>
 </html>
