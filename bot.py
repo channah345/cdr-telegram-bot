@@ -7828,14 +7828,15 @@ def docx_spacer(height=90):
 
 
 def docx_section(title, value):
+    # Simple PDF-style section: bold heading with plain body text underneath.
     return (
-        docx_table([[title], [clean_docx_text(value)]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH])
-        + docx_spacer(100)
+        docx_paragraph(title, bold=True, size=20, spacing_after=30)
+        + docx_paragraph(clean_docx_text(value), size=18, spacing_after=120)
     )
 
 
 def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
-    """Build an editable Word worksheet that mirrors the original PDF layout as closely as Word allows."""
+    # Build editable Word worksheet in the same simple style as the original PDF worksheet.
     cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "") or fields.get("Title", "")
     date_logged = format_sharepoint_date(fields.get("Date", ""))
     date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
@@ -7859,6 +7860,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             "engineer": worksheet.get("engineer_name", ""),
             "status": outcome,
             "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+            "notes": build_visit_comment_extra(worksheet),
         }]
 
     visit_rows = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
@@ -7878,56 +7880,53 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     image_rels = []
     logo_bytes, logo_ext = get_docx_logo_bytes()
     if logo_bytes:
-        image_parts.append(("word/media/logo.%s" % logo_ext, logo_bytes))
-        image_rels.append(("rLogo", "media/logo.%s" % logo_ext))
-        logo_xml = docx_image_paragraph("rLogo", "CDR logo", width_mm=42, height_mm=15, align="left")
+        image_parts.append(("word/media/cdr-logo.%s" % logo_ext, logo_bytes))
+        image_rels.append(("rLogo", "media/cdr-logo.%s" % logo_ext))
+        logo_xml = docx_image_paragraph("rLogo", "CDR logo", width_mm=54, height_mm=20, align="center", spacing_after=0)
     else:
-        logo_xml = docx_paragraph("CDR", bold=True, size=28, color=DOCX_ORANGE, spacing_after=0)
+        logo_xml = docx_paragraph("CDR M&E Services Ltd", bold=True, size=24, align="center", spacing_after=0, color=DOCX_ORANGE)
 
-    signature_rows = []
+    signature_body = []
     if worksheet.get("ClientSignatureRequired"):
         if worksheet.get("ClientSignatureReceived"):
-            signature_rows.append([{
-                "raw_xml": docx_paragraph(
-                    f"Client Name: {worksheet.get('ClientSignatureName', '')}\nSigned Digitally: Yes",
-                    size=17,
-                    spacing_after=0,
-                )
-            }])
+            name = worksheet.get("ClientSignatureName", "")
+            signature_body.append([{"raw_xml": docx_paragraph(f"Client Name: {name}", size=18, spacing_after=35)}])
             signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
             if signature_bytes:
                 sig_ext = "png"
-                image_parts.append(("word/media/signature.%s" % sig_ext, signature_bytes))
-                image_rels.append(("rSignature", "media/signature.%s" % sig_ext))
-                signature_rows.append([{"raw_xml": docx_image_paragraph("rSignature", "Client signature", width_mm=80, height_mm=28, align="left")}])
+                image_parts.append(("word/media/client-signature.%s" % sig_ext, signature_bytes))
+                image_rels.append(("rSignature", "media/client-signature.%s" % sig_ext))
+                signature_body.append([{"raw_xml": docx_image_paragraph("rSignature", "Client signature", width_mm=70, height_mm=25, align="left", spacing_after=20)}])
+                signature_body.append([{"raw_xml": docx_paragraph("Signed Digitally: Yes", size=18, spacing_after=0)}])
             else:
-                signature_rows.append(["Signature image saved in SharePoint but could not be embedded."])
+                signature_body.append(["Signed Digitally: Yes"])
+                signature_body.append(["Signature image could not be embedded from SharePoint."])
         else:
-            signature_rows.append(["Client signature required but not received."])
+            signature_body.append(["Client signature required but not received."])
     else:
-        signature_rows.append(["Client signature not required."])
+        signature_body.append(["Client signature not required."])
 
     body = []
-    body.append(docx_table(
-        [[{"raw_xml": logo_xml}, {"raw_xml": docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="right", spacing_after=0)}]],
-        widths=[4200, 6120],
-        no_borders=True,
+    body.append(logo_xml)
+    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=30, align="center", spacing_after=60))
+    body.append(docx_paragraph(
+        "CDR M&E Services Ltd\n"
+        "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\n"
+        "Telephone: 01642 057939    Email: helpdesk@cdrme.co.uk\n"
+        "VAT Number: 397715249    Company No.: 13744971",
+        size=16,
+        align="center",
+        spacing_after=130,
     ))
-    body.append(docx_spacer(70))
-
-    body.append(docx_table(
-        [["CDR M&E Services Ltd\n6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\nTelephone: 01642 057939    Email: helpdesk@cdrme.co.uk\nVAT Number: 397715249    Company No.: 13744971"]],
-        widths=[DOCX_CONTENT_WIDTH],
-    ).replace("<w:tcPr>", f"<w:tcPr><w:shd w:val='clear' w:color='auto' w:fill='{DOCX_LIGHT}'/>", 1))
-    body.append(docx_spacer(110))
 
     body.append(docx_table(
         [["Customer Details", "Site Details"], [customer_details, site_details]],
         header_first=True,
         header_orange=False,
         widths=[5160, 5160],
+        no_borders=True,
     ))
-    body.append(docx_spacer(110))
+    body.append(docx_spacer(80))
 
     body.append(docx_table(
         [
@@ -7935,18 +7934,29 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             ["Date Logged:", date_logged, "Job Category:", job_category],
             ["Date Complete:", date_complete, "Status:", outcome],
         ],
-        widths=[1950, 3210, 2450, 2710],
+        widths=[1650, 3510, 2350, 2810],
         label_columns={0, 2},
+        no_borders=True,
     ))
-    body.append(docx_spacer(110))
+    body.append(docx_spacer(90))
 
     body.append(docx_section("Description", task))
-    body.append(docx_paragraph("Visits", bold=True, size=18, spacing_after=40))
-    body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
-    body.append(docx_spacer(110))
+
+    body.append(docx_paragraph("Visits", bold=True, size=20, spacing_after=35))
+    body.append(docx_table(
+        visit_rows,
+        header_first=True,
+        header_orange=False,
+        widths=[1450, 1250, 1250, 2550, 2200, 1620],
+    ))
+    body.append(docx_spacer(100))
+
     body.append(docx_section("Engineer Comment", comments))
-    body.append(docx_table([["Client Signature"]] + signature_rows, header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH]))
+
+    body.append(docx_paragraph("Client Signature", bold=True, size=20, spacing_after=35))
+    body.append(docx_table(signature_body, widths=[DOCX_CONTENT_WIDTH], no_borders=True))
     body.append(docx_spacer(80))
+
     body.append(docx_paragraph(
         "CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk",
         size=16,
@@ -7954,7 +7964,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         spacing_after=0,
     ))
 
-    document_xml = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    document_xml = f"""<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'
             xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'
             xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
@@ -7967,9 +7977,9 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <w:pgMar w:top='680' w:right='793' w:bottom='680' w:left='793' w:header='720' w:footer='720' w:gutter='0'/>
 </w:sectPr>
 </w:body>
-</w:document>'''
+</w:document>"""
 
-    content_types = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    content_types = """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
 <Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
 <Default Extension='xml' ContentType='application/xml'/>
@@ -7980,14 +7990,14 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
 <Override PartName='/docProps/core.xml' ContentType='application/vnd.openxmlformats-package.core-properties+xml'/>
 <Override PartName='/docProps/app.xml' ContentType='application/vnd.openxmlformats-officedocument.extended-properties+xml'/>
-</Types>'''
+</Types>"""
 
-    root_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    root_rels = """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
 <Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='word/document.xml'/>
 <Relationship Id='rId2' Type='http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties' Target='docProps/core.xml'/>
 <Relationship Id='rId3' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties' Target='docProps/app.xml'/>
-</Relationships>'''
+</Relationships>"""
 
     rel_lines = ["<?xml version='1.0' encoding='UTF-8' standalone='yes'?><Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"]
     for rel_id, target in image_rels:
@@ -7996,19 +8006,19 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     doc_rels = "".join(rel_lines)
 
     now_iso = datetime.now(UK_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    core = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    core = f"""<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <cp:coreProperties xmlns:cp='http://schemas.openxmlformats.org/package/2006/metadata/core-properties' xmlns:dc='http://purl.org/dc/elements/1.1/' xmlns:dcterms='http://purl.org/dc/terms/' xmlns:dcmitype='http://purl.org/dc/dcmitype/' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'>
 <dc:title>{docx_escape(cdr_number)} Worksheet</dc:title>
 <dc:creator>CDR Engineer Bot</dc:creator>
 <cp:lastModifiedBy>CDR Engineer Bot</cp:lastModifiedBy>
 <dcterms:created xsi:type='dcterms:W3CDTF'>{now_iso}</dcterms:created>
 <dcterms:modified xsi:type='dcterms:W3CDTF'>{now_iso}</dcterms:modified>
-</cp:coreProperties>'''
+</cp:coreProperties>"""
 
-    app_props = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    app_props = """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Properties xmlns='http://schemas.openxmlformats.org/officeDocument/2006/extended-properties' xmlns:vt='http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'>
 <Application>CDR Engineer Bot</Application>
-</Properties>'''
+</Properties>"""
 
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as docx:
@@ -8022,7 +8032,6 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             docx.writestr(part_name, data)
 
     return buffer.getvalue()
-
 
 
 def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
