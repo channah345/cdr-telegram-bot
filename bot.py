@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-sleek-v21"
+BUILD_VERSION = "dashboard-ops-centre-v22"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2690,52 +2690,108 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
     nav = dashboard_nav(view, token)
     ops = dashboard_ops_summary(rows, job_rows)
 
+    def render_control_feed():
+        feed_rows = []
+        priority_jobs = [job for job in job_rows if job.get("overdue") or job.get("awaiting") or job.get("open")][:9]
+        for job in priority_jobs:
+            marker = "danger" if job.get("overdue") else "amber" if job.get("awaiting") else "blue"
+            label = "Overdue" if job.get("overdue") else "Awaiting dispatch" if job.get("awaiting") else "Live job"
+            feed_rows.append(f"""
+                <div class='feed-item'>
+                    <span class='feed-dot {marker}'></span>
+                    <div>
+                        <strong>{html_safe(job['cdr'])} · {html_safe(job['site'])}</strong>
+                        <small>{html_safe(label)} · {html_safe(job['assigned'])} · {html_safe(job['date'])}</small>
+                    </div>
+                </div>
+            """)
+        if not feed_rows:
+            return "<div class='empty premium-empty'>No live exceptions showing.</div>"
+        return "".join(feed_rows)
+
     top_metrics = f"""
-        <div class='summary-card'><span>Active Engineers</span><strong>{html_safe(ops['active_engineers'])}</strong></div>
-        <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(ops['open_jobs'])}</strong></div>
-        <div class='summary-card amber'><span>Awaiting Dispatch</span><strong>{html_safe(ops['awaiting_dispatch'])}</strong></div>
-        <div class='summary-card danger'><span>Overdue</span><strong>{html_safe(ops['overdue'])}</strong></div>
-        <div class='summary-card good'><span>Completed Today</span><strong>{html_safe(ops['completed_today'])}</strong></div>
-        <div class='summary-card blue'><span>Revisit</span><strong>{html_safe(ops['revisit'])}</strong></div>
-        <div class='summary-card'><span>No Access</span><strong>{html_safe(ops['no_access'])}</strong></div>
+        <div class='summary-card hero-stat'><span>Active Engineers</span><strong>{html_safe(ops['active_engineers'])}</strong><em>Currently clocked in</em></div>
+        <div class='summary-card hero-stat'><span>Open Jobs</span><strong>{html_safe(ops['open_jobs'])}</strong><em>Live workload</em></div>
+        <div class='summary-card hero-stat amber'><span>Awaiting Dispatch</span><strong>{html_safe(ops['awaiting_dispatch'])}</strong><em>Needs allocation</em></div>
+        <div class='summary-card hero-stat danger'><span>Overdue</span><strong>{html_safe(ops['overdue'])}</strong><em>Requires attention</em></div>
+        <div class='summary-card hero-stat good'><span>Completed Today</span><strong>{html_safe(ops['completed_today'])}</strong><em>Closed out</em></div>
+        <div class='summary-card hero-stat blue'><span>Revisit</span><strong>{html_safe(ops['revisit'])}</strong><em>Follow-up queue</em></div>
+        <div class='summary-card hero-stat slate'><span>No Access</span><strong>{html_safe(ops['no_access'])}</strong><em>Exceptions</em></div>
+    """
+
+    control_room = f"""
+        <section class='control-room'>
+            <div class='control-left'>
+                <div class='eyebrow'>CDR Live Operations</div>
+                <h1>{html_safe(title if 'title' in locals() else 'Engineer Dashboard')}</h1>
+                <p>Engineer status, priority jobs and live exceptions in one control-room view.</p>
+            </div>
+            <div class='control-right'>
+                <div class='control-chip'><span>Refresh</span><strong>30s</strong></div>
+                <div class='control-chip'><span>Updated</span><strong>{html_safe(generated[-8:] if generated else '')}</strong></div>
+            </div>
+        </section>
     """
 
     if view == "ops":
-        content = f"""
-            <section class='summary'>{top_metrics}</section>
-            <section class='panel-grid'>
-                <div class='panel'><h2>Priority Queue</h2>{render_job_table(job_rows, 'open')}</div>
-                <div class='panel'><h2>Engineer Snapshot</h2><div class='mini-grid'>{engineer_cards_html}</div></div>
-            </section>
-        """
         title = "Ops Board"
-    elif view == "jobs":
-        content = f"<section class='summary'>{top_metrics}</section><section class='panel'><h2>Open Jobs</h2>{render_job_table(job_rows, 'open')}</section>"
-        title = "Open Jobs"
-    elif view == "sla":
-        content = f"<section class='summary'>{top_metrics}</section><section class='panel'><h2>SLA / Overdue Jobs</h2>{render_job_table(job_rows, 'sla')}</section>"
-        title = "SLA / Overdue"
-    elif view == "reports":
         content = f"""
-            <section class='summary'>{top_metrics}</section>
-            <section class='panel-grid'>
-                <div class='panel'><h2>Today / Exceptions</h2>{render_job_table(job_rows, 'reports')}</div>
-                <div class='panel'><h2>Notes</h2><div class='empty'>This page is read-only for now. Next stage can add weekly reports, engineer performance and client summaries.</div></div>
+            <section class='summary premium-summary'>{top_metrics}</section>
+            <section class='ops-layout'>
+                <div class='panel priority-panel'><div class='panel-title'><h2>Priority Queue</h2><span>Open / overdue / awaiting</span></div>{render_job_table(job_rows, 'open')}</div>
+                <aside class='side-stack'>
+                    <div class='panel'><div class='panel-title'><h2>Live Activity</h2><span>Auto-refreshed</span></div><div class='feed'>{render_control_feed()}</div></div>
+                    <div class='panel'><div class='panel-title'><h2>Engineer Snapshot</h2><span>Today</span></div><div class='mini-grid'>{engineer_cards_html}</div></div>
+                </aside>
             </section>
         """
+    elif view == "jobs":
+        title = "Open Jobs"
+        content = f"<section class='summary premium-summary'>{top_metrics}</section><section class='panel priority-panel'><div class='panel-title'><h2>Open Jobs</h2><span>Dispatch list</span></div>{render_job_table(job_rows, 'open')}</section>"
+    elif view == "sla":
+        title = "SLA / Overdue"
+        content = f"<section class='summary premium-summary'>{top_metrics}</section><section class='panel priority-panel'><div class='panel-title'><h2>SLA / Overdue Jobs</h2><span>Red items first</span></div>{render_job_table(job_rows, 'sla')}</section>"
+    elif view == "reports":
         title = "Reports"
-    else:
-        metric_cards = f"""
-            <div class='summary-card'><span>Active</span><strong>{html_safe(summary['active'])}</strong></div>
-            <div class='summary-card good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong></div>
-            <div class='summary-card blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong></div>
-            <div class='summary-card amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong></div>
-            <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong></div>
-            <div class='summary-card'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong></div>
-            <div class='summary-card'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong></div>
+        content = f"""
+            <section class='summary premium-summary'>{top_metrics}</section>
+            <section class='ops-layout'>
+                <div class='panel priority-panel'><div class='panel-title'><h2>Today / Exceptions</h2><span>Completed, revisit and no access</span></div>{render_job_table(job_rows, 'reports')}</div>
+                <aside class='side-stack'><div class='panel'><div class='panel-title'><h2>Next Stage</h2><span>Read-only</span></div><div class='empty premium-empty'>Weekly reports, engineer performance and client summaries can be added next without changing the engineer workflow.</div></div></aside>
+            </section>
         """
-        content = f"<section class='summary'>{metric_cards}</section><section class='grid'>{engineer_cards_html if engineer_cards_html else '<p>No engineers found.</p>'}</section>"
+    else:
         title = "Engineer Dashboard"
+        metric_cards = f"""
+            <div class='summary-card hero-stat'><span>Active</span><strong>{html_safe(summary['active'])}</strong><em>Working today</em></div>
+            <div class='summary-card hero-stat good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong><em>At location</em></div>
+            <div class='summary-card hero-stat blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong><em>En route</em></div>
+            <div class='summary-card hero-stat amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong><em>Needs review</em></div>
+            <div class='summary-card hero-stat'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong><em>Assigned today</em></div>
+            <div class='summary-card hero-stat good'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong><em>Closed</em></div>
+            <div class='summary-card hero-stat slate'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong><em>Productive time</em></div>
+        """
+        content = f"""
+            <section class='summary premium-summary'>{metric_cards}</section>
+            <section class='dashboard-split'>
+                <div class='engineer-board'><div class='section-heading'><h2>Engineer Control Board</h2><span>Live status cards</span></div><div class='grid'>{engineer_cards_html if engineer_cards_html else '<p>No engineers found.</p>'}</div></div>
+                <aside class='panel live-panel'><div class='panel-title'><h2>Live Activity</h2><span>Exceptions & queue</span></div><div class='feed'>{render_control_feed()}</div></aside>
+            </section>
+        """
+
+    control_room = f"""
+        <section class='control-room'>
+            <div class='control-left'>
+                <div class='eyebrow'>CDR Live Operations</div>
+                <h1>{html_safe(title)}</h1>
+                <p>Engineer status, priority jobs and live exceptions in one control-room view.</p>
+            </div>
+            <div class='control-right'>
+                <div class='control-chip'><span>Refresh</span><strong>30s</strong></div>
+                <div class='control-chip'><span>Updated</span><strong>{html_safe(generated[-8:] if generated else '')}</strong></div>
+            </div>
+        </section>
+    """
 
     return HTMLResponse(f"""
 <!DOCTYPE html>
@@ -2746,51 +2802,92 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
     <meta http-equiv='refresh' content='30'>
     <style>
         :root {{
-            --orange:#f58220; --dark:#0f172a; --muted:#64748b; --bg:#eef2f7; --card:#ffffff; --line:#e5e7eb;
-            --green:#16a34a; --blue:#2563eb; --amber:#f59e0b; --red:#dc2626; --purple:#7c3aed; --grey:#6b7280;
+            --orange:#f58220; --orange-2:#ffb15f; --ink:#e5eefb; --muted:#94a3b8; --muted-2:#64748b;
+            --bg:#070b12; --panel:#0f172a; --panel-2:#111c31; --glass:rgba(255,255,255,.07); --line:rgba(148,163,184,.20);
+            --green:#22c55e; --blue:#38bdf8; --amber:#f59e0b; --red:#ef4444; --purple:#a78bfa; --grey:#64748b;
+            --radius:24px; --shadow:0 24px 70px rgba(0,0,0,.32);
         }}
-        body {{ margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--dark); }}
-        header {{ background:#0b1220; color:white; padding:18px 28px; box-shadow:0 3px 18px rgba(0,0,0,.20); }}
-        .header-row {{ display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; }}
-        header h1 {{ margin:0; font-size:29px; letter-spacing:-.5px; }}
-        header .sub {{ color:#cbd5e1; font-size:14px; margin-top:5px; }}
-        .logo {{ font-weight:900; color:var(--orange); font-size:31px; letter-spacing:2px; }}
-        nav {{ margin-top:16px; display:flex; gap:8px; flex-wrap:wrap; }}
-        nav a {{ color:#e5e7eb; text-decoration:none; padding:9px 13px; border-radius:999px; background:#1f2937; font-weight:800; font-size:13px; }}
-        nav a.active {{ background:var(--orange); color:#111827; }}
-        .wrap {{ padding:22px; }}
-        .summary {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:18px; }}
-        .summary-card {{ background:#fff; border-radius:16px; padding:14px 16px; box-shadow:0 6px 18px rgba(15,23,42,.08); border-top:5px solid #334155; }}
-        .summary-card.good {{ border-top-color:var(--green); }} .summary-card.blue {{ border-top-color:var(--blue); }} .summary-card.amber {{ border-top-color:var(--amber); }} .summary-card.danger {{ border-top-color:var(--red); }}
-        .summary-card span {{ display:block; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }}
-        .summary-card strong {{ display:block; margin-top:6px; font-size:24px; }}
-        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap:18px; align-items:stretch; }}
-        .mini-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:14px; }}
-        .panel-grid {{ display:grid; grid-template-columns: 1.35fr .9fr; gap:18px; align-items:start; }}
-        .panel {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); }}
-        .panel h2 {{ margin:0 0 14px 0; }}
-        .card {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); border-left:9px solid #9ca3af; min-height:265px; }}
-        .card.on-site {{ border-left-color:var(--green); }} .card.travelling {{ border-left-color:var(--blue); }} .card.active {{ border-left-color:var(--purple); }} .card.idle {{ border-left-color:var(--amber); }} .card.ended {{ border-left-color:var(--grey); opacity:.88; }} .card.not-started {{ border-left-color:var(--red); opacity:.82; }}
-        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }} .identity {{ display:flex; gap:12px; align-items:center; }}
-        .avatar {{ width:42px; height:42px; border-radius:14px; display:flex; align-items:center; justify-content:center; background:#111827; color:#fff; font-weight:900; }}
-        h2 {{ margin:0; font-size:21px; }} .status {{ display:inline-block; margin-top:7px; padding:6px 10px; background:#f1f5f9; border-radius:999px; font-size:13px; font-weight:800; }}
-        .util {{ min-width:72px; text-align:center; background:#334155; color:white; border-radius:15px; padding:9px 10px; font-weight:900; font-size:16px; }} .util-good {{ background:var(--green); }} .util-mid {{ background:var(--amber); color:#111827; }} .util-low {{ background:var(--red); }} .util-none {{ background:#374151; }}
-        .main-status {{ margin-top:18px; padding:15px; border-radius:16px; background:#f8fafc; border:1px solid var(--line); text-align:center; }} .main-label {{ color:var(--muted); font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }} .main-value {{ margin-top:5px; font-size:28px; font-weight:900; letter-spacing:-.5px; }}
-        .job-block {{ margin-top:16px; min-height:54px; }} .job {{ font-size:17px; font-weight:900; }} .site {{ margin-top:3px; color:#334155; font-weight:700; }} .detail {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.35; }} .since {{ color:var(--muted); font-size:14px; margin-top:7px; }}
-        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }} .metrics div {{ background:#f9fafb; border:1px solid var(--line); padding:10px; border-radius:13px; }} .metrics span {{ display:block; color:var(--muted); font-size:12px; }} .metrics strong {{ display:block; margin-top:3px; font-size:16px; }} .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); padding-top:12px; }}
-        .table-wrap {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:760px; }} th {{ text-align:left; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--line); padding:10px; }} td {{ border-bottom:1px solid var(--line); padding:12px 10px; vertical-align:top; }} td span {{ color:var(--muted); font-size:13px; }} .pill {{ display:inline-block; padding:6px 10px; border-radius:999px; color:white; background:#334155; font-weight:900; font-size:12px; }} .pill.good {{ background:var(--green); }} .pill.blue {{ background:var(--blue); }} .pill.amber {{ background:var(--amber); color:#111827; }} .pill.danger {{ background:var(--red); }} .pill.muted {{ background:var(--grey); }}
-        .empty {{ color:var(--muted); background:#f8fafc; border:1px dashed var(--line); border-radius:16px; padding:18px; }} .footer {{ color:var(--muted); font-size:13px; margin-top:22px; }}
-        @media (prefers-color-scheme: dark) {{ :root {{ --bg:#0b1220; --card:#111827; --dark:#e5e7eb; --muted:#94a3b8; --line:#273244; }} .summary-card, .card, .panel {{ background:#111827; box-shadow:0 8px 24px rgba(0,0,0,.28); }} .status, .main-status, .metrics div, .empty {{ background:#172033; }} .site {{ color:#cbd5e1; }} }}
-        @media (max-width:960px) {{ .panel-grid {{ grid-template-columns:1fr; }} }}
-        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
-    
-
-
-</style>
+        * {{ box-sizing:border-box; }}
+        body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; background:
+            radial-gradient(circle at top left, rgba(245,130,32,.22), transparent 34rem),
+            radial-gradient(circle at 82% 10%, rgba(56,189,248,.14), transparent 28rem),
+            linear-gradient(180deg, #05070c 0%, #0b1220 48%, #070b12 100%); color:var(--ink); min-height:100vh; }}
+        body:before {{ content:''; position:fixed; inset:0; pointer-events:none; background-image:linear-gradient(rgba(255,255,255,.026) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.026) 1px, transparent 1px); background-size:38px 38px; mask-image:linear-gradient(to bottom, black, transparent 75%); }}
+        header {{ position:sticky; top:0; z-index:10; backdrop-filter:blur(18px); background:rgba(7,11,18,.82); border-bottom:1px solid var(--line); }}
+        .topbar {{ width:min(1500px, calc(100% - 36px)); margin:0 auto; padding:16px 0; display:flex; align-items:center; justify-content:space-between; gap:22px; }}
+        .brand-lockup {{ display:flex; align-items:center; gap:14px; min-width:220px; }}
+        .logo-frame {{ background:rgba(255,255,255,.96); padding:8px 12px; border-radius:18px; box-shadow:0 18px 45px rgba(0,0,0,.35); }}
+        .logo-frame img {{ height:48px; width:auto; max-width:230px; object-fit:contain; display:block; }}
+        .brand-text strong {{ display:block; font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:#fff; }}
+        .brand-text span {{ display:block; margin-top:3px; color:var(--muted); font-size:12px; }}
+        nav {{ display:flex; justify-content:center; gap:8px; flex-wrap:wrap; padding:7px; border:1px solid var(--line); background:rgba(255,255,255,.05); border-radius:999px; }}
+        nav a {{ color:var(--muted); text-decoration:none; padding:10px 14px; border-radius:999px; font-weight:800; font-size:13px; transition:all .18s ease; }}
+        nav a:hover {{ color:#fff; background:rgba(255,255,255,.08); }}
+        nav a.active {{ color:#111827; background:linear-gradient(135deg, var(--orange), var(--orange-2)); box-shadow:0 12px 30px rgba(245,130,32,.28); }}
+        .build-pill {{ color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:10px 12px; font-weight:800; font-size:12px; background:rgba(255,255,255,.045); }}
+        .wrap {{ width:min(1500px, calc(100% - 36px)); margin:0 auto; padding:24px 0 34px; }}
+        .control-room {{ display:flex; align-items:flex-end; justify-content:space-between; gap:22px; margin:12px 0 20px; padding:28px; border:1px solid var(--line); border-radius:32px; background:linear-gradient(135deg, rgba(255,255,255,.09), rgba(255,255,255,.035)); box-shadow:var(--shadow); overflow:hidden; position:relative; }}
+        .control-room:after {{ content:''; position:absolute; right:-90px; top:-90px; width:260px; height:260px; border-radius:50%; background:rgba(245,130,32,.20); filter:blur(12px); }}
+        .eyebrow {{ color:var(--orange-2); font-weight:950; text-transform:uppercase; letter-spacing:.18em; font-size:12px; }}
+        .control-room h1 {{ position:relative; margin:8px 0 8px; font-size:clamp(34px, 5vw, 62px); line-height:.95; letter-spacing:-.06em; }}
+        .control-room p {{ margin:0; color:var(--muted); font-size:16px; max-width:720px; }}
+        .control-right {{ display:flex; gap:10px; position:relative; z-index:1; }}
+        .control-chip {{ min-width:112px; padding:13px 15px; border-radius:18px; background:rgba(0,0,0,.24); border:1px solid var(--line); }}
+        .control-chip span {{ display:block; color:var(--muted); font-size:11px; text-transform:uppercase; font-weight:900; letter-spacing:.1em; }}
+        .control-chip strong {{ display:block; margin-top:4px; font-size:18px; }}
+        .premium-summary {{ display:grid; grid-template-columns:repeat(7, minmax(130px, 1fr)); gap:14px; margin:0 0 20px; }}
+        .summary-card {{ position:relative; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,.092), rgba(255,255,255,.04)); border:1px solid var(--line); border-radius:22px; padding:17px 18px; box-shadow:0 18px 48px rgba(0,0,0,.20); }}
+        .summary-card:before {{ content:''; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--orange); }}
+        .summary-card.good:before {{ background:var(--green); }} .summary-card.blue:before {{ background:var(--blue); }} .summary-card.amber:before {{ background:var(--amber); }} .summary-card.danger:before {{ background:var(--red); }} .summary-card.slate:before {{ background:var(--grey); }}
+        .summary-card span {{ display:block; color:var(--muted); font-size:11px; font-weight:950; text-transform:uppercase; letter-spacing:.12em; }}
+        .summary-card strong {{ display:block; margin-top:7px; font-size:32px; line-height:1; letter-spacing:-.04em; }}
+        .summary-card em {{ display:block; margin-top:8px; color:var(--muted-2); font-style:normal; font-size:12px; font-weight:700; }}
+        .dashboard-split {{ display:grid; grid-template-columns:minmax(0, 1fr) 380px; gap:18px; align-items:start; }}
+        .ops-layout {{ display:grid; grid-template-columns:minmax(0, 1.28fr) 480px; gap:18px; align-items:start; }}
+        .side-stack {{ display:grid; gap:18px; }}
+        .section-heading, .panel-title {{ display:flex; align-items:flex-end; justify-content:space-between; gap:14px; margin:0 0 14px; }}
+        .section-heading h2, .panel-title h2 {{ margin:0; font-size:22px; letter-spacing:-.035em; }}
+        .section-heading span, .panel-title span {{ color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:.12em; }}
+        .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:18px; align-items:stretch; }}
+        .mini-grid {{ display:grid; grid-template-columns:1fr; gap:12px; }}
+        .panel, .card {{ background:linear-gradient(180deg, rgba(17,28,49,.94), rgba(15,23,42,.96)); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); }}
+        .panel {{ padding:18px; }}
+        .card {{ position:relative; min-height:285px; padding:20px; overflow:hidden; }}
+        .card:before {{ content:''; position:absolute; inset:0 auto 0 0; width:6px; background:var(--grey); }}
+        .card:after {{ content:''; position:absolute; right:-50px; top:-70px; width:160px; height:160px; border-radius:50%; background:rgba(255,255,255,.05); }}
+        .card.on-site:before {{ background:var(--green); box-shadow:0 0 24px rgba(34,197,94,.48); }} .card.travelling:before {{ background:var(--blue); box-shadow:0 0 24px rgba(56,189,248,.42); }} .card.active:before {{ background:var(--purple); }} .card.idle:before {{ background:var(--amber); }} .card.ended:before {{ background:var(--grey); }} .card.not-started:before {{ background:var(--red); }}
+        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; position:relative; z-index:1; }}
+        .identity {{ display:flex; gap:13px; align-items:center; min-width:0; }}
+        .avatar {{ width:52px; height:52px; flex:0 0 52px; border-radius:19px; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg, #1e293b, #020617); color:#fff; font-weight:950; box-shadow:inset 0 1px 0 rgba(255,255,255,.10), 0 12px 28px rgba(0,0,0,.28); }}
+        h2 {{ margin:0; font-size:22px; letter-spacing:-.035em; }}
+        .status {{ display:inline-flex; align-items:center; gap:5px; margin-top:8px; padding:7px 10px; border-radius:999px; background:rgba(255,255,255,.07); border:1px solid var(--line); color:#dbeafe; font-size:12px; font-weight:900; }}
+        .util {{ min-width:78px; text-align:center; border-radius:18px; padding:10px 11px; font-weight:950; font-size:17px; color:white; background:#334155; box-shadow:inset 0 1px 0 rgba(255,255,255,.12); }} .util-good {{ background:linear-gradient(135deg, #15803d, var(--green)); }} .util-mid {{ background:linear-gradient(135deg, #b45309, var(--amber)); color:#111827; }} .util-low {{ background:linear-gradient(135deg, #b91c1c, var(--red)); }} .util-none {{ background:#334155; }}
+        .main-status {{ margin-top:18px; padding:17px; border-radius:20px; background:rgba(0,0,0,.20); border:1px solid var(--line); }}
+        .main-label {{ color:var(--muted); font-size:11px; font-weight:950; text-transform:uppercase; letter-spacing:.13em; }} .main-value {{ margin-top:5px; font-size:34px; font-weight:950; letter-spacing:-.05em; }}
+        .job-block {{ margin-top:16px; padding:14px; border-radius:18px; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.08); min-height:76px; }}
+        .job {{ font-size:18px; font-weight:950; letter-spacing:-.02em; }} .site {{ margin-top:5px; color:#cbd5e1; font-weight:800; }} .detail {{ margin-top:8px; color:var(--muted); font-size:13px; line-height:1.42; }} .since {{ color:var(--muted); font-size:13px; margin-top:10px; font-weight:700; }}
+        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }} .metrics div {{ background:rgba(0,0,0,.18); border:1px solid var(--line); padding:11px; border-radius:16px; }} .metrics span {{ display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:.09em; }} .metrics strong {{ display:block; margin-top:5px; font-size:17px; }} .last {{ margin-top:14px; color:var(--muted); font-size:12px; border-top:1px solid var(--line); padding-top:13px; }}
+        .feed {{ display:grid; gap:10px; }}
+        .feed-item {{ display:grid; grid-template-columns:13px 1fr; gap:10px; align-items:start; padding:12px; border-radius:16px; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.08); }}
+        .feed-dot {{ width:10px; height:10px; margin-top:4px; border-radius:50%; background:var(--blue); box-shadow:0 0 18px currentColor; }} .feed-dot.danger {{ background:var(--red); }} .feed-dot.amber {{ background:var(--amber); }} .feed-dot.blue {{ background:var(--blue); }}
+        .feed-item strong {{ display:block; font-size:13px; }} .feed-item small {{ display:block; margin-top:4px; color:var(--muted); line-height:1.35; }}
+        .table-wrap {{ overflow:auto; border-radius:18px; border:1px solid var(--line); }} table {{ width:100%; border-collapse:separate; border-spacing:0; min-width:820px; }} th {{ text-align:left; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; background:rgba(255,255,255,.055); padding:13px; }} td {{ border-top:1px solid var(--line); padding:14px 13px; vertical-align:top; background:rgba(0,0,0,.10); }} td span {{ color:var(--muted); font-size:13px; }} .pill {{ display:inline-block; padding:7px 10px; border-radius:999px; color:white; background:#334155; font-weight:950; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }} .pill.good {{ background:var(--green); color:#052e16; }} .pill.blue {{ background:var(--blue); color:#082f49; }} .pill.amber {{ background:var(--amber); color:#111827; }} .pill.danger {{ background:var(--red); }} .pill.muted {{ background:var(--grey); }}
+        .empty {{ color:var(--muted); background:rgba(255,255,255,.045); border:1px dashed var(--line); border-radius:18px; padding:18px; }}
+        .footer {{ color:var(--muted-2); font-size:12px; margin-top:22px; text-align:center; }}
+        @media (max-width:1180px) {{ .premium-summary {{ grid-template-columns:repeat(3,1fr); }} .dashboard-split, .ops-layout {{ grid-template-columns:1fr; }} .live-panel {{ order:-1; }} }}
+        @media (max-width:760px) {{ .topbar {{ flex-direction:column; align-items:flex-start; }} nav {{ width:100%; justify-content:flex-start; overflow-x:auto; flex-wrap:nowrap; border-radius:20px; }} nav a {{ white-space:nowrap; }} .build-pill {{ display:none; }} .control-room {{ flex-direction:column; align-items:flex-start; padding:22px; }} .control-right {{ width:100%; }} .control-chip {{ flex:1; }} .premium-summary {{ grid-template-columns:repeat(2,1fr); }} .grid {{ grid-template-columns:1fr; }} .wrap, .topbar {{ width:min(100% - 24px, 1500px); }} }}
+        @media (max-width:480px) {{ .premium-summary {{ grid-template-columns:1fr; }} .metrics {{ grid-template-columns:1fr; }} .card {{ min-height:auto; }} }}
+    </style>
 </head>
 <body>
-    <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><img src='/logo.png' alt='CDR M&E Services Ltd' style='height:46px;width:auto;max-width:220px;object-fit:contain;display:block;'></div><nav>{nav}</nav></header>
-    <main class='wrap'>{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
+    <header>
+        <div class='topbar'>
+            <div class='brand-lockup'><div class='logo-frame'><img src='/logo.png' alt='CDR M&E Services Ltd'></div><div class='brand-text'><strong>CDR M&amp;E</strong><span>Operations Centre</span></div></div>
+            <nav>{nav}</nav>
+            <div class='build-pill'>{html_safe(BUILD_VERSION)}</div>
+        </div>
+    </header>
+    <main class='wrap'>{control_room}{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
 </body>
 </html>
     """)
