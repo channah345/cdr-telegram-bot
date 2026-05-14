@@ -4,6 +4,7 @@ import base64
 import secrets
 import threading
 import zipfile
+import asyncio
 from io import BytesIO
 from urllib.parse import quote_plus, urlparse
 from xml.sax.saxutils import escape as xml_escape
@@ -54,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "docx-no-dependency-all-photos-v1"
+BUILD_VERSION = "pdf-worksheet-photo-confirm-v3-small-photo-batches"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -1825,49 +1826,88 @@ async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
 
 
 async def send_trade_group_photos(context, chat_id, worksheet):
-    """Send all engineer photos as grouped Telegram albums.
+    """Send all engineer photos to the trade group safely.
 
-    Telegram allows a maximum of 10 photos per media group. If there are more
-    than 10, this sends multiple albums until every uploaded photo has gone.
+    Telegram media groups can time out when large photos are sent in big albums.
+    This version uses smaller albums, longer per-call timeouts, and falls back
+    to single-photo messages so one failed batch does not lose all photos.
     """
     photo_items = worksheet.get("photo_files_for_group", []) or []
 
     if not photo_items:
+        print("Trade group photo send skipped: worksheet contains no photo bytes.")
         return
 
+    batch_size = 4
     sent_total = 0
+    failed_total = 0
 
-    try:
-        for batch_start in range(0, len(photo_items), 10):
-            batch = photo_items[batch_start:batch_start + 10]
-            media = []
+    async def send_single_photo(file_bytes, file_name):
+        single_buffer = BytesIO(file_bytes)
+        single_buffer.name = file_name
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=single_buffer,
+            connect_timeout=30,
+            read_timeout=60,
+            write_timeout=60,
+            pool_timeout=30,
+        )
 
-            for index, item in enumerate(batch):
-                if not isinstance(item, dict):
-                    continue
+    for batch_start in range(0, len(photo_items), batch_size):
+        batch = photo_items[batch_start:batch_start + batch_size]
+        valid_items = []
+        media = []
 
-                file_bytes = item.get("bytes")
-                file_name = item.get("file_name") or f"job_photo_{batch_start + index + 1}.jpg"
+        for index, item in enumerate(batch):
+            if not isinstance(item, dict):
+                failed_total += 1
+                continue
 
-                if not file_bytes:
-                    continue
+            file_bytes = item.get("bytes")
+            file_name = item.get("file_name") or f"job_photo_{batch_start + index + 1}.jpg"
 
-                buffer = BytesIO(file_bytes)
-                buffer.name = file_name
-                media.append(InputMediaPhoto(media=buffer))
+            if not file_bytes:
+                failed_total += 1
+                continue
 
-            if media:
+            valid_items.append((file_bytes, file_name))
+            album_buffer = BytesIO(file_bytes)
+            album_buffer.name = file_name
+            media.append(InputMediaPhoto(media=album_buffer))
+
+        if not valid_items:
+            continue
+
+        try:
+            if len(media) == 1:
+                await send_single_photo(valid_items[0][0], valid_items[0][1])
+            else:
                 await context.bot.send_media_group(
                     chat_id=chat_id,
                     media=media,
+                    connect_timeout=30,
+                    read_timeout=90,
+                    write_timeout=120,
+                    pool_timeout=30,
                 )
-                sent_total += len(media)
+            sent_total += len(valid_items)
+            await asyncio.sleep(1.2)
+        except Exception as album_error:
+            print(f"WARNING: Trade group album batch starting at photo {batch_start + 1} failed, sending individually: {album_error}")
+            for file_bytes, file_name in valid_items:
+                try:
+                    await send_single_photo(file_bytes, file_name)
+                    sent_total += 1
+                    await asyncio.sleep(0.7)
+                except Exception as single_error:
+                    failed_total += 1
+                    print(f"WARNING: Could not send trade group photo {file_name}: {single_error}")
 
-        if sent_total < len(photo_items):
-            print(f"WARNING: Trade group photos sent {sent_total}/{len(photo_items)}. Some stored items were empty or invalid.")
-
-    except Exception as e:
-        print(f"WARNING: Could not send trade group photo albums. Sent {sent_total}/{len(photo_items)} before error: {e}")
+    if sent_total < len(photo_items):
+        print(f"WARNING: Trade group photos sent {sent_total}/{len(photo_items)}. Failed/invalid: {failed_total}.")
+    else:
+        print(f"Trade group photos sent successfully: {sent_total}/{len(photo_items)}.")
 
 
 async def notify_helpdesk(context, text):
@@ -5810,6 +5850,13 @@ async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAUL
     return PHOTOS
 
 
+def get_photos_done_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Continue - photo count is correct", callback_data="photos_done|continue")],
+        [InlineKeyboardButton("➕ Add more photos / wait for uploads", callback_data="photos_done|add_more")],
+    ])
+
+
 async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -5821,11 +5868,15 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worksheet = context.user_data["worksheet"]
 
     if update.message.text and update.message.text.strip().upper() == "DONE":
+        photo_count = len(worksheet.get("photo_links", []))
         await update.message.reply_text(
-            "Is a client signature required?",
-            reply_markup=get_yes_no_keyboard("signature_required"),
+            f"I have received {photo_count} job photo(s).\n\n"
+            "Check this number before continuing. If the engineer sent 22 photos but this says 18, "
+            "do NOT continue yet. Wait for the missing photos to appear, or tap Add more photos / wait for uploads and resend the missing photos.\n\n"
+            "Tap Continue only when the photo count is definitely correct.",
+            reply_markup=get_photos_done_keyboard(),
         )
-        return SIGNATURE_REQUIRED
+        return PHOTOS
 
     if update.message.photo:
         site_id = worksheet["site_id"]
@@ -5850,9 +5901,44 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_name": file_name,
             "bytes": bytes(file_bytes),
         })
+
+        count = len(worksheet.get("photo_links", []))
+        await update.message.reply_text(f"Photo received ({count} total). Send more photos, or type DONE when finished.")
         return PHOTOS
 
-    await update.message.reply_text("Please send the required van photos, or type DONE once all 3 have been uploaded.")
+    await update.message.reply_text("Please send job photos, or type DONE when finished.")
+    return PHOTOS
+
+
+async def worksheet_photos_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    action = query.data.split("|", 1)[1]
+    photo_count = len(worksheet.get("photo_links", []))
+
+    if action == "add_more":
+        await query.message.reply_text(
+            f"No problem. I currently have {photo_count} photo(s). Send the missing photos now, then type DONE again."
+        )
+        return PHOTOS
+
+    if action == "continue":
+        await query.message.reply_text(
+            "Is a client signature required?",
+            reply_markup=get_yes_no_keyboard("signature_required"),
+        )
+        return SIGNATURE_REQUIRED
+
+    await query.message.reply_text("Please tap Continue or Add more photos.", reply_markup=get_photos_done_keyboard())
     return PHOTOS
 
 
@@ -6766,27 +6852,24 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 
 
 def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
-    """Generate and upload an editable Word worksheet.
-
-    Function name kept for compatibility with existing worksheet flow.
-    """
+    """Generate and upload the professional PDF worksheet."""
     try:
-        docx_bytes = build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id)
+        pdf_bytes = build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id)
         cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
         worksheet_folder_name = safe_folder_name(cdr_number)
-        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
+        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.pdf"
 
         worksheet_link = upload_file_to_sharepoint(
             site_id,
             WORKSHEET_BASE_FOLDER,
             worksheet_folder_name,
             file_name,
-            docx_bytes,
+            pdf_bytes,
         )
         colour_sharepoint_folder_green(site_id, WORKSHEET_BASE_FOLDER, worksheet_folder_name)
         return worksheet_link
     except Exception as e:
-        print(f"ERROR generating worksheet Word document: {e}")
+        print(f"ERROR generating worksheet PDF: {e}")
         return ""
 
 
@@ -6932,7 +7015,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if outcome == "Completed":
-            final_pdf_text = "\n\nFinal worksheet Word document generated." if worksheet_pdf_link else "\n\nFinal Word document will generate when the last assigned engineer submits."
+            final_pdf_text = "\n\nFinal PDF worksheet generated." if worksheet_pdf_link else "\n\nFinal PDF worksheet will generate when the last assigned engineer submits."
         else:
             final_pdf_text = ""
         await update.message.reply_text(
@@ -7078,7 +7161,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
     )
 
     if outcome == "Completed":
-        final_pdf_text = "\n\nFinal worksheet Word document generated." if worksheet_pdf_link else "\n\nFinal Word document will generate when the last assigned engineer submits."
+        final_pdf_text = "\n\nFinal PDF worksheet generated." if worksheet_pdf_link else "\n\nFinal PDF worksheet will generate when the last assigned engineer submits."
     else:
         final_pdf_text = ""
     await query.message.reply_text(
@@ -7297,6 +7380,10 @@ async def post_init(app):
 telegram_app = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
+    .connect_timeout(30)
+    .read_timeout(60)
+    .write_timeout(120)
+    .pool_timeout(30)
     .post_init(post_init)
     .build()
 )
@@ -7353,6 +7440,7 @@ worksheet_handler = ConversationHandler(
         ],
         FOLLOW_ON_NOTES: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_follow_on_notes)],
         PHOTOS: [
+            CallbackQueryHandler(worksheet_photos_done_button, pattern=r"^photos_done\|"),
             MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, worksheet_photos),
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_photos),
         ],
