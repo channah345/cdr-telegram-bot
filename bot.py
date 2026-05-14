@@ -3,8 +3,10 @@ import re
 import base64
 import secrets
 import threading
+import zipfile
 from io import BytesIO
 from urllib.parse import quote_plus
+from xml.sax.saxutils import escape as xml_escape
 import warnings
 import requests
 import msal
@@ -14,7 +16,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto, ReplyKeyboardRemove
 try:
     from telegram.warnings import PTBUserWarning
 except Exception:
@@ -52,7 +54,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "engineer-reminders-fixed-v1"
+BUILD_VERSION = "worksheet-word-docx-v1"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -2069,6 +2071,24 @@ async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💬 Chat Type:\n{chat.type}\n\n"
         f"👤 User:\n{user.full_name}"
     )
+
+
+
+async def group_chat_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove any old bot keyboard from group chats and stop group workflows."""
+    if not update.effective_chat or update.effective_chat.type == "private":
+        return ConversationHandler.END
+
+    if update.message:
+        try:
+            await update.message.reply_text(
+                "CDR bot controls only work in private chat.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception as e:
+            print(f"WARNING: Could not remove group keyboard: {e}")
+
+    return ConversationHandler.END
 
 
 def run_signature_web_server():
@@ -4531,7 +4551,7 @@ async def handle_menu_during_conversation(update: Update, context: ContextTypes.
     """
     Prevent reply-keyboard menu buttons being saved as answers inside active flows.
     This is especially important during worksheets, where helpdesk/admin buttons
-    must never end up in Work Completed, Materials, Notes or PDF comments.
+    must never end up in Work Completed, Materials, Notes or worksheet comments.
     """
     text = update.message.text.strip() if update.message and update.message.text else ""
 
@@ -5977,14 +5997,14 @@ def safe_pdf_filename(value):
 
 
 def clean_engineer_log_extra(value):
-    """Keep EngineerVisitLog extra text to one safe line so it can be parsed back into the PDF."""
+    """Keep EngineerVisitLog extra text to one safe line so it can be parsed back into the worksheet."""
     text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
     text = re.sub(r"\s+", " ", text)
     return text
 
 
 def build_visit_comment_extra(worksheet):
-    """Create a compact visit comment for EngineerVisitLog and the final worksheet PDF."""
+    """Create a compact visit comment for EngineerVisitLog and the final worksheet document."""
     parts = []
 
     outcome = worksheet.get("JobOutcome", "Completed")
@@ -6411,22 +6431,246 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=N
     return pdf_bytes
 
 
+
+def clean_docx_text(value):
+    text = str(value or "").strip()
+    return text if text and text.lower() != "none" else "N/A"
+
+
+def safe_docx_filename(value):
+    cleaned = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in ["-", "_", " "]).strip()
+    return cleaned.replace(" ", "_") or "worksheet"
+
+
+def docx_paragraph(value="", bold=False, size=20, align=None):
+    props = ""
+    if align:
+        props += f"<w:jc w:val=\"{align}\"/>"
+
+    run_props = f"<w:sz w:val=\"{size}\"/>"
+    if bold:
+        run_props += "<w:b/>"
+
+    text = clean_docx_text(value)
+    parts = str(text).splitlines() or [""]
+
+    runs = []
+    for index, part in enumerate(parts):
+        if index:
+            runs.append("<w:r><w:br/></w:r>")
+        runs.append(
+            f"<w:r><w:rPr>{run_props}</w:rPr>"
+            f"<w:t xml:space=\"preserve\">{xml_escape(part)}</w:t></w:r>"
+        )
+
+    return f"<w:p><w:pPr>{props}</w:pPr>{''.join(runs)}</w:p>"
+
+
+def docx_cell(value="", bold=False, shade=None):
+    tc_pr = "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/>"
+    if shade:
+        tc_pr += f"<w:shd w:fill=\"{shade}\"/>"
+    tc_pr += "</w:tcPr>"
+    return f"<w:tc>{tc_pr}{docx_paragraph(value, bold=bold, size=18)}</w:tc>"
+
+
+def docx_row(values, header=False):
+    shade = "F58220" if header else None
+    return "<w:tr>" + "".join(docx_cell(v, bold=header, shade=shade) for v in values) + "</w:tr>"
+
+
+def docx_table(rows, header_first=False):
+    tbl_pr = (
+        "<w:tblPr>"
+        "<w:tblStyle w:val=\"TableGrid\"/>"
+        "<w:tblW w:w=\"0\" w:type=\"auto\"/>"
+        "<w:tblBorders>"
+        "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"
+        "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"
+        "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"
+        "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"
+        "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"
+        "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"999999\"/>"
+        "</w:tblBorders>"
+        "</w:tblPr>"
+    )
+
+    xml_rows = []
+    for index, row in enumerate(rows):
+        xml_rows.append(docx_row(row, header=(header_first and index == 0)))
+
+    return "<w:tbl>" + tbl_pr + "".join(xml_rows) + "</w:tbl>"
+
+
+def docx_section(title, body):
+    return (
+        docx_paragraph(title, bold=True, size=22)
+        + docx_table([[body]], header_first=False)
+        + docx_paragraph("")
+    )
+
+
+def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
+    cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "")
+    date_logged = format_sharepoint_date(fields.get("Date", ""))
+    date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
+
+    customer_details = get_field_value(fields, "CustomerName", "Customer Name") or get_field_value(fields, "ClientName", "Client Name") or ""
+    site_details = fields.get("SiteName", "") or ""
+
+    order_number = get_field_value(fields, "CustomerOrderNumber", "Customer Order Number", "OrderNumber", "Order Number") or ""
+    job_category = get_field_value(fields, "JobCategory", "Job Category") or ""
+
+    visits = parse_engineer_visit_log(updated_log)
+    if not visits:
+        visits = [{
+            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
+            "travel": "",
+            "on_site": "",
+            "engineer": worksheet.get("engineer_name", ""),
+            "status": outcome,
+            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+        }]
+
+    visit_rows = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
+    for visit in visits:
+        visit_rows.append([
+            clean_docx_text(visit.get("date")),
+            clean_docx_text(visit.get("travel")),
+            clean_docx_text(visit.get("on_site")),
+            clean_docx_text(visit.get("engineer")),
+            clean_docx_text(visit.get("status")),
+            clean_docx_text(visit.get("off_site")),
+        ])
+
+    comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
+
+    if worksheet.get("ClientSignatureRequired"):
+        if worksheet.get("ClientSignatureReceived"):
+            signature_text = (
+                f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
+                "Signed Digitally: Yes\n"
+                "Signature image is saved against the job in SharePoint."
+            )
+        else:
+            signature_text = "Client signature required but not received."
+    else:
+        signature_text = "Client signature not required."
+
+    body = []
+    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="center"))
+    body.append(docx_paragraph(
+        "CDR M&E Services Ltd\n"
+        "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\n"
+        "Telephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\n"
+        "VAT Number: 397715249 | Company No.: 13744971",
+        size=18,
+        align="center",
+    ))
+    body.append(docx_paragraph(""))
+
+    body.append(docx_table([
+        ["Customer Details", "Site Details"],
+        [customer_details, site_details],
+    ], header_first=True))
+    body.append(docx_paragraph(""))
+
+    body.append(docx_table([
+        ["Job Number", cdr_number, "Customer Order Number", order_number],
+        ["Date Logged", date_logged, "Job Category", job_category],
+        ["Date Complete", date_complete, "Status", outcome],
+    ]))
+    body.append(docx_paragraph(""))
+
+    body.append(docx_section("Description", fields.get("Task", "") or fields.get("Description", "") or fields.get("Notes", "")))
+
+    body.append(docx_paragraph("Visits", bold=True, size=22))
+    body.append(docx_table(visit_rows, header_first=True))
+    body.append(docx_paragraph(""))
+
+    body.append(docx_section("Engineer Comment", comments))
+    body.append(docx_section("Client Signature", signature_text))
+
+    body.append(docx_paragraph("CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk", size=16, align="center"))
+
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {''.join(body)}
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="720" w:footer="720" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>'''
+
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>'''
+
+    root_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>'''
+
+    doc_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'''
+
+    now_iso = datetime.now(UK_TZ).isoformat()
+    core = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>{xml_escape(cdr_number)} Worksheet</dc:title>
+  <dc:creator>CDR Engineer Bot</dc:creator>
+  <cp:lastModifiedBy>CDR Engineer Bot</cp:lastModifiedBy>
+  <dcterms:created xsi:type="dcterms:W3CDTF">{now_iso}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">{now_iso}</dcterms:modified>
+</cp:coreProperties>'''
+
+    app_props = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>CDR Engineer Bot</Application>
+</Properties>'''
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as docx:
+        docx.writestr("[Content_Types].xml", content_types)
+        docx.writestr("_rels/.rels", root_rels)
+        docx.writestr("word/_rels/document.xml.rels", doc_rels)
+        docx.writestr("word/document.xml", document_xml)
+        docx.writestr("docProps/core.xml", core)
+        docx.writestr("docProps/app.xml", app_props)
+
+    return buffer.getvalue()
+
+
+
 def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
+    """Generate and upload an editable Word worksheet.
+
+    Kept under the old function name so existing workflow call sites stay stable.
+    """
     try:
-        pdf_bytes = build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id)
+        docx_bytes = build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id)
         cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
-        file_name = f"{safe_pdf_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.pdf"
+        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
 
         worksheet_link = upload_file_to_sharepoint(
             site_id,
             WORKSHEET_BASE_FOLDER,
             safe_folder_name(cdr_number),
             file_name,
-            pdf_bytes,
+            docx_bytes,
         )
         return worksheet_link
     except Exception as e:
-        print(f"ERROR generating worksheet PDF: {e}")
+        print(f"ERROR generating worksheet Word document: {e}")
         return ""
 
 
@@ -6572,7 +6816,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if outcome == "Completed":
-            final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer submits."
+            final_pdf_text = "\n\nFinal worksheet Word document generated." if worksheet_pdf_link else "\n\nFinal Word document will generate when the last assigned engineer submits."
         else:
             final_pdf_text = ""
         await update.message.reply_text(
@@ -6718,7 +6962,7 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
     )
 
     if outcome == "Completed":
-        final_pdf_text = "\n\nFinal worksheet PDF generated." if worksheet_pdf_link else "\n\nFinal PDF will generate when the last assigned engineer submits."
+        final_pdf_text = "\n\nFinal worksheet Word document generated." if worksheet_pdf_link else "\n\nFinal Word document will generate when the last assigned engineer submits."
     else:
         final_pdf_text = ""
     await query.message.reply_text(
@@ -6822,59 +7066,27 @@ async def send_new_jobs(app):
         print(f"ERROR sending new jobs: {e}")
 
 
-def get_engineer_role_from_fields(fields):
-    """Return the menu role for a user row from the Engineers list."""
-    role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
-
-    if role == "admin":
-        return "Admin"
-
-    if role == "helpdesk":
-        return "Helpdesk"
-
-    return "Engineer"
-
-
-def engineer_row_is_active(fields):
-    active_value = get_field_value(fields, "Active")
-    return active_value in [None, ""] or bool_field(active_value)
-
-
-def build_telegram_role_map(engineers):
-    role_map = {}
-
-    for engineer in engineers:
-        fields = engineer.get("fields", {})
-        telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
-
-        if telegram_id:
-            role_map[telegram_id] = get_engineer_role_from_fields(fields)
-
-    return role_map
-
-
 async def remind_engineers_to_start_day(app):
-    """Daily 07:40 private reminder to active engineers/admins to start their day."""
+    """Daily 07:40 reminder to active engineers/admin engineers to start their day."""
     try:
         site_id = get_site_id()
         engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
         engineers = get_list_items(site_id, engineers_list_id)
 
-        sent_to = set()
-
         for engineer in engineers:
             fields = engineer.get("fields", {})
             engineer_name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
             telegram_id = str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip()
-            role = get_engineer_role_from_fields(fields)
+            role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
+            active_value = get_field_value(fields, "Active")
 
-            if not engineer_row_is_active(fields):
+            if active_value not in [None, ""] and not bool_field(active_value):
                 continue
 
-            if role.lower() not in ["engineer", "admin"]:
+            if role not in ["engineer", "admin"]:
                 continue
 
-            if not telegram_id or telegram_id in sent_to:
+            if not telegram_id:
                 continue
 
             try:
@@ -6884,9 +7096,7 @@ async def remind_engineers_to_start_day(app):
                         "⏰ Start Day Reminder\n\n"
                         f"Morning {engineer_name or 'Engineer'}, please tap 🟢 Start Day when you begin work today."
                     ),
-                    reply_markup=get_main_menu(role),
                 )
-                sent_to.add(telegram_id)
             except Exception as e:
                 print(f"WARNING: Could not send start-day reminder to {telegram_id}: {e}")
 
@@ -6895,49 +7105,33 @@ async def remind_engineers_to_start_day(app):
 
 
 async def remind_active_engineers_to_end_day(app):
-    """Daily 16:45 private reminder only for engineers with an active day log today."""
+    """Daily reminder so engineers do not forget to close their day."""
     try:
         site_id = get_site_id()
         day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
         day_logs = get_list_items(site_id, day_logs_list_id)
-        engineers = get_list_items(site_id, engineers_list_id)
-        role_map = build_telegram_role_map(engineers)
         today = get_today_iso()
-        sent_to = set()
 
         for log in day_logs:
             fields = log.get("fields", {})
-            status = str(fields.get("Status", "")).strip()
-            telegram_id = str(fields.get("EngineerTelegramID") or fields.get("Engineer Telegram ID") or "").strip()
+            status = str(fields.get("Status", ""))
+            telegram_id = str(fields.get("EngineerTelegramID") or fields.get("Engineer Telegram ID") or "")
             raw_work_date = fields.get("WorkDate") or fields.get("Work Date") or ""
             parsed_work_date = sharepoint_date_to_uk_date(raw_work_date)
             log_date = parsed_work_date.isoformat() if parsed_work_date else str(raw_work_date)[:10]
 
-            if status != DAY_ACTIVE_STATUS:
-                continue
-
-            if not telegram_id or telegram_id in sent_to:
-                continue
-
-            if log_date != today:
-                continue
-
-            role = role_map.get(telegram_id, "Engineer")
-
-            try:
-                await app.bot.send_message(
-                    chat_id=telegram_id,
-                    text=(
-                        "⏰ End Day Reminder\n\n"
-                        "If you have finished work, please tap 🏁 End Day. "
-                        "This keeps timesheets, mileage and pay hours correct."
-                    ),
-                    reply_markup=get_main_menu(role),
-                )
-                sent_to.add(telegram_id)
-            except Exception as e:
-                print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
+            if status == DAY_ACTIVE_STATUS and telegram_id and log_date == today:
+                try:
+                    await app.bot.send_message(
+                        chat_id=telegram_id,
+                        text=(
+                            "End of day reminder: if you have finished work, please tap 🏁 End Day. "
+                            "This keeps timesheets, mileage and pay hours correct."
+                        ),
+                        reply_markup=get_main_menu(await get_role_for_update(update)),
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
 
     except Exception as e:
         print(f"ERROR sending end-day reminders: {e}")
@@ -7462,6 +7656,15 @@ abortjob_handler = ConversationHandler(
     fallbacks=[CommandHandler("cancel", abort_job_cancel)],
 )
 
+
+
+telegram_app.add_handler(
+    MessageHandler(
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|👷 Engineer Menu|📌 Quote Reminder|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        group_chat_cleanup,
+    ),
+    group=0,
+)
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("my_id", my_id))
