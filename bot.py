@@ -7655,11 +7655,40 @@ DOCX_CONTENT_WIDTH = 10320
 DOCX_ORANGE = "F58220"
 DOCX_DARK = "333333"
 DOCX_LIGHT = "F7F7F7"
-DOCX_GREY = "D9D9D9"
+DOCX_GREY = "999999"
+DOCX_GRID = "D9D9D9"
+
+
+def mm_to_emu(mm_value):
+    return int(float(mm_value) * 36000)
+
+
+def get_docx_image_ext(file_name="image.png"):
+    lower = str(file_name or "").lower()
+    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+        return "jpeg"
+    if lower.endswith(".gif"):
+        return "gif"
+    return "png"
+
+
+def get_docx_logo_bytes():
+    """Return the CDR logo image bytes for Word worksheets if the logo exists in the app folder."""
+    for path in [
+        "cdr-logo.png", "CDR-logo.png", "logo.png", "Logo.png",
+        "/app/cdr-logo.png", "/app/CDR-logo.png", "/app/logo.png", "/app/Logo.png",
+    ]:
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as handle:
+                    return handle.read(), get_docx_image_ext(path)
+        except Exception as e:
+            print(f"Could not load worksheet logo {path}: {e}")
+    return None, None
 
 
 def docx_run(text, bold=False, size=18, color=None):
-    rpr = f"<w:sz w:val='{size}'/>"
+    rpr = f"<w:sz w:val='{size}'/><w:szCs w:val='{size}'/>"
     if bold:
         rpr += "<w:b/>"
     if color:
@@ -7683,17 +7712,47 @@ def docx_paragraph(value="", bold=False, size=18, align=None, spacing_after=80, 
     return f"<w:p><w:pPr>{ppr}</w:pPr>{''.join(runs)}</w:p>"
 
 
-def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18, align=None):
+def docx_image_paragraph(rid, name="Image", width_mm=45, height_mm=18, align="left", spacing_after=0):
+    cx = mm_to_emu(width_mm)
+    cy = mm_to_emu(height_mm)
+    docpr_id = abs(hash(str(rid))) % 100000 + 1
+    return f"""
+<w:p>
+  <w:pPr><w:spacing w:after='{spacing_after}'/><w:jc w:val='{align}'/></w:pPr>
+  <w:r>
+    <w:drawing>
+      <wp:inline distT='0' distB='0' distL='0' distR='0'>
+        <wp:extent cx='{cx}' cy='{cy}'/>
+        <wp:effectExtent l='0' t='0' r='0' b='0'/>
+        <wp:docPr id='{docpr_id}' name='{docx_escape(name)}'/>
+        <wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect='1'/></wp:cNvGraphicFramePr>
+        <a:graphic>
+          <a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>
+            <pic:pic>
+              <pic:nvPicPr><pic:cNvPr id='0' name='{docx_escape(name)}'/><pic:cNvPicPr/></pic:nvPicPr>
+              <pic:blipFill><a:blip r:embed='{rid}'/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+              <pic:spPr><a:xfrm><a:off x='0' y='0'/><a:ext cx='{cx}' cy='{cy}'/></a:xfrm><a:prstGeom prst='rect'><a:avLst/></a:prstGeom></pic:spPr>
+            </pic:pic>
+          </a:graphicData>
+        </a:graphic>
+      </wp:inline>
+    </w:drawing>
+  </w:r>
+</w:p>"""
+
+
+def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18, align=None, raw_xml=None, bottom_pad=90, top_pad=90):
     tcpr = f"<w:tcPr><w:tcW w:w='{width}' w:type='dxa'/>"
-    tcpr += "<w:tcMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tcMar>"
+    tcpr += f"<w:tcMar><w:top w:w='{top_pad}' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='{bottom_pad}' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tcMar>"
     tcpr += "<w:vAlign w:val='top'/>"
     if shade:
         tcpr += f"<w:shd w:val='clear' w:color='auto' w:fill='{shade}'/>"
     tcpr += "</w:tcPr>"
-    return f"<w:tc>{tcpr}{docx_paragraph(value, bold=bold, size=size, spacing_after=0, color=color, align=align, clean=False)}</w:tc>"
+    content = raw_xml if raw_xml is not None else docx_paragraph(value, bold=bold, size=size, spacing_after=0, color=color, align=align, clean=False)
+    return f"<w:tc>{tcpr}{content}</w:tc>"
 
 
-def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None):
+def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None, no_borders=False):
     if not rows:
         return ""
 
@@ -7702,19 +7761,29 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
         widths = [int(table_width / column_count)] * column_count
 
     grid = "".join(f"<w:gridCol w:w='{widths[min(i, len(widths)-1)]}'/>" for i in range(column_count))
+    if no_borders:
+        borders = """
+        <w:tblBorders>
+          <w:top w:val='nil'/><w:left w:val='nil'/><w:bottom w:val='nil'/><w:right w:val='nil'/>
+          <w:insideH w:val='nil'/><w:insideV w:val='nil'/>
+        </w:tblBorders>"""
+    else:
+        borders = f"""
+        <w:tblBorders>
+          <w:top w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
+          <w:left w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
+          <w:bottom w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
+          <w:right w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>
+          <w:insideH w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GRID}'/>
+          <w:insideV w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GRID}'/>
+        </w:tblBorders>"""
+
     tbl = [
         "<w:tbl>",
         "<w:tblPr>",
         f"<w:tblW w:w='{table_width}' w:type='dxa'/>",
         "<w:tblLayout w:type='fixed'/>",
-        "<w:tblBorders>",
-        f"<w:top w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
-        f"<w:left w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
-        f"<w:bottom w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
-        f"<w:right w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
-        f"<w:insideH w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
-        f"<w:insideV w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
-        "</w:tblBorders>",
+        borders,
         "<w:tblCellMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tblCellMar>",
         "</w:tblPr>",
         f"<w:tblGrid>{grid}</w:tblGrid>",
@@ -7726,7 +7795,8 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
         tbl.append("<w:tr>")
         for col_index in range(column_count):
             raw_value = row[col_index] if col_index < len(row) else ""
-            value = clean_docx_text(raw_value)
+            is_raw = isinstance(raw_value, dict) and "raw_xml" in raw_value
+            value = raw_value.get("text", "") if isinstance(raw_value, dict) else clean_docx_text(raw_value)
             is_label = col_index in label_columns and not is_header
             shade = None
             color = None
@@ -7745,6 +7815,7 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
                 shade=shade,
                 color=color,
                 size=17,
+                raw_xml=raw_value.get("raw_xml") if is_raw else None,
             ))
         tbl.append("</w:tr>")
 
@@ -7764,7 +7835,7 @@ def docx_section(title, value):
 
 
 def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
-    # Build an editable DOCX matching the previous professional PDF worksheet layout.
+    """Build an editable Word worksheet that mirrors the original PDF layout as closely as Word allows."""
     cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "") or fields.get("Title", "")
     date_logged = format_sharepoint_date(fields.get("Date", ""))
     date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
@@ -7803,42 +7874,66 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 
     comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
 
+    image_parts = []
+    image_rels = []
+    logo_bytes, logo_ext = get_docx_logo_bytes()
+    if logo_bytes:
+        image_parts.append(("word/media/logo.%s" % logo_ext, logo_bytes))
+        image_rels.append(("rLogo", "media/logo.%s" % logo_ext))
+        logo_xml = docx_image_paragraph("rLogo", "CDR logo", width_mm=42, height_mm=15, align="left")
+    else:
+        logo_xml = docx_paragraph("CDR", bold=True, size=28, color=DOCX_ORANGE, spacing_after=0)
+
+    signature_rows = []
     if worksheet.get("ClientSignatureRequired"):
         if worksheet.get("ClientSignatureReceived"):
-            signature_text = (
-                f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
-                "Signed Digitally: Yes\n"
-                "Signature image is saved against the job record in SharePoint."
-            )
+            signature_rows.append([{
+                "raw_xml": docx_paragraph(
+                    f"Client Name: {worksheet.get('ClientSignatureName', '')}\nSigned Digitally: Yes",
+                    size=17,
+                    spacing_after=0,
+                )
+            }])
+            signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
+            if signature_bytes:
+                sig_ext = "png"
+                image_parts.append(("word/media/signature.%s" % sig_ext, signature_bytes))
+                image_rels.append(("rSignature", "media/signature.%s" % sig_ext))
+                signature_rows.append([{"raw_xml": docx_image_paragraph("rSignature", "Client signature", width_mm=80, height_mm=28, align="left")}])
+            else:
+                signature_rows.append(["Signature image saved in SharePoint but could not be embedded."])
         else:
-            signature_text = "Client signature required but not received."
+            signature_rows.append(["Client signature required but not received."])
     else:
-        signature_text = "Client signature not required."
+        signature_rows.append(["Client signature not required."])
 
     body = []
     body.append(docx_table(
-        [["CDR M&E Services Ltd", "JOB WORKSHEET"],
-         ["6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\nTelephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\nVAT Number: 397715249 | Company No.: 13744971", f"Job Number: {cdr_number}\nDate Complete: {date_complete}"]],
-        header_first=True,
-        header_orange=False,
-        widths=[6200, 4120],
-        label_columns={0, 1},
+        [[{"raw_xml": logo_xml}, {"raw_xml": docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="right", spacing_after=0)}]],
+        widths=[4200, 6120],
+        no_borders=True,
     ))
+    body.append(docx_spacer(70))
+
+    body.append(docx_table(
+        [["CDR M&E Services Ltd\n6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\nTelephone: 01642 057939    Email: helpdesk@cdrme.co.uk\nVAT Number: 397715249    Company No.: 13744971"]],
+        widths=[DOCX_CONTENT_WIDTH],
+    ).replace("<w:tcPr>", f"<w:tcPr><w:shd w:val='clear' w:color='auto' w:fill='{DOCX_LIGHT}'/>", 1))
     body.append(docx_spacer(110))
 
     body.append(docx_table(
         [["Customer Details", "Site Details"], [customer_details, site_details]],
         header_first=True,
-        header_orange=True,
+        header_orange=False,
         widths=[5160, 5160],
     ))
     body.append(docx_spacer(110))
 
     body.append(docx_table(
         [
-            ["Job Number", cdr_number, "Customer Order Number", order_number],
-            ["Date Logged", date_logged, "Job Category", job_category],
-            ["Date Complete", date_complete, "Status", outcome],
+            ["Job Number:", cdr_number, "Customer Order Number:", order_number],
+            ["Date Logged:", date_logged, "Job Category:", job_category],
+            ["Date Complete:", date_complete, "Status:", outcome],
         ],
         widths=[1950, 3210, 2450, 2710],
         label_columns={0, 2},
@@ -7846,11 +7941,12 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     body.append(docx_spacer(110))
 
     body.append(docx_section("Description", task))
-    body.append(docx_table([["Visits"]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH]))
-    body.append(docx_table(visit_rows, header_first=True, header_orange=False, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
+    body.append(docx_paragraph("Visits", bold=True, size=18, spacing_after=40))
+    body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
     body.append(docx_spacer(110))
     body.append(docx_section("Engineer Comment", comments))
-    body.append(docx_section("Client Signature", signature_text))
+    body.append(docx_table([["Client Signature"]] + signature_rows, header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH]))
+    body.append(docx_spacer(80))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk",
         size=16,
@@ -7859,7 +7955,11 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     ))
 
     document_xml = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
+<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+            xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+            xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main'
+            xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>
 <w:body>
 {''.join(body)}
 <w:sectPr>
@@ -7873,6 +7973,10 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
 <Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
 <Default Extension='xml' ContentType='application/xml'/>
+<Default Extension='png' ContentType='image/png'/>
+<Default Extension='jpeg' ContentType='image/jpeg'/>
+<Default Extension='jpg' ContentType='image/jpeg'/>
+<Default Extension='gif' ContentType='image/gif'/>
 <Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
 <Override PartName='/docProps/core.xml' ContentType='application/vnd.openxmlformats-package.core-properties+xml'/>
 <Override PartName='/docProps/app.xml' ContentType='application/vnd.openxmlformats-officedocument.extended-properties+xml'/>
@@ -7885,8 +7989,11 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Relationship Id='rId3' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties' Target='docProps/app.xml'/>
 </Relationships>'''
 
-    doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>'''
+    rel_lines = ["<?xml version='1.0' encoding='UTF-8' standalone='yes'?><Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"]
+    for rel_id, target in image_rels:
+        rel_lines.append(f"<Relationship Id='{rel_id}' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='{target}'/>")
+    rel_lines.append("</Relationships>")
+    doc_rels = "".join(rel_lines)
 
     now_iso = datetime.now(UK_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
     core = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
@@ -7911,6 +8018,8 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         docx.writestr("word/document.xml", document_xml)
         docx.writestr("docProps/core.xml", core)
         docx.writestr("docProps/app.xml", app_props)
+        for part_name, data in image_parts:
+            docx.writestr(part_name, data)
 
     return buffer.getvalue()
 
