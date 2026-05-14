@@ -80,7 +80,7 @@ MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
 MENU_UPLOAD_RECEIPTS = "🧾 Receipts / Returns"
 MENU_REQUEST_JOB = "📣 Request Job"
-MENU_QUOTE_REMINDER = "📌 Quote Reminder"
+MENU_QUOTE_REMINDER = "📋 Task / Activity"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
@@ -1076,7 +1076,188 @@ def parse_sharepoint_datetime(value):
         return None
 
 
-def calculate_day_pay_hours(start_dt, end_dt):
+def hours_between(start_dt, end_dt):
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return 0.0
+    return (end_dt - start_dt).total_seconds() / 3600
+
+
+def round_hours(value):
+    try:
+        return round(float(value or 0), 2)
+    except Exception:
+        return 0.0
+
+
+def parse_engineer_log_datetime(date_text, time_text):
+    try:
+        parsed = datetime.strptime(f"{date_text} {time_text}", "%d/%m/%Y %H:%M")
+        return parsed.replace(tzinfo=UK_TZ)
+    except Exception:
+        return None
+
+
+def get_engineer_productive_intervals_for_day(jobs_data, engineer_name, work_date, start_dt=None, end_dt=None):
+    """
+    Build productive intervals from existing job action logs.
+
+    This intentionally uses the job buttons engineers already press:
+    Travelling -> On Site -> Completed/No Access/Revisit Required.
+    No extra engineer workflow is required.
+    """
+    engineer_key = str(engineer_name or "").strip().lower()
+    intervals = []
+
+    if not engineer_key or not work_date:
+        return intervals
+
+    for job in jobs_data or []:
+        fields = job.get("fields", {})
+        log_text = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
+
+        try:
+            visits = parse_engineer_visit_log(log_text)
+        except Exception as e:
+            print(f"WARNING: Could not parse productive intervals: {e}")
+            visits = []
+
+        for visit in visits:
+            if str(visit.get("engineer", "")).strip().lower() != engineer_key:
+                continue
+
+            date_text = visit.get("date", "")
+            try:
+                visit_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+            except Exception:
+                continue
+
+            if visit_date != work_date:
+                continue
+
+            start_text = visit.get("travel") or visit.get("on_site")
+            end_text = visit.get("off_site") or visit.get("on_site")
+            interval_start = parse_engineer_log_datetime(date_text, start_text)
+            interval_end = parse_engineer_log_datetime(date_text, end_text)
+
+            if not interval_start or not interval_end or interval_end <= interval_start:
+                continue
+
+            if start_dt and interval_end < start_dt:
+                continue
+            if end_dt and interval_start > end_dt:
+                continue
+
+            if start_dt and interval_start < start_dt:
+                interval_start = start_dt
+            if end_dt and interval_end > end_dt:
+                interval_end = end_dt
+
+            intervals.append((interval_start, interval_end))
+
+    return merge_time_intervals(intervals)
+
+
+def merge_time_intervals(intervals):
+    cleaned = sorted(
+        [(start, end) for start, end in intervals if start and end and end > start],
+        key=lambda item: item[0],
+    )
+
+    if not cleaned:
+        return []
+
+    merged = [cleaned[0]]
+    for start, end in cleaned[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def calculate_activity_hours(start_dt, end_dt, jobs_data=None, engineer_name=""):
+    """Calculate productive/inactive time from job logs for the engineer's day."""
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return {
+            "productive_hours": 0.0,
+            "inactive_hours": 0.0,
+            "utilisation_percent": 0.0,
+            "productive_intervals": [],
+        }
+
+    work_date = start_dt.astimezone(UK_TZ).date()
+    intervals = get_engineer_productive_intervals_for_day(
+        jobs_data or [],
+        engineer_name,
+        work_date,
+        start_dt,
+        end_dt,
+    )
+
+    productive_hours = sum(hours_between(start, end) for start, end in intervals)
+    total_hours = hours_between(start_dt, end_dt)
+    inactive_hours = max(0.0, total_hours - productive_hours)
+    utilisation_percent = (productive_hours / total_hours * 100) if total_hours > 0 else 0.0
+
+    return {
+        "productive_hours": round_hours(productive_hours),
+        "inactive_hours": round_hours(inactive_hours),
+        "utilisation_percent": round_hours(utilisation_percent),
+        "productive_intervals": intervals,
+    }
+
+
+def calculate_commute_deductions(start_dt, end_dt, productive_intervals):
+    """
+    Apply CDR's simple automatic commute rule without extra engineer inputs.
+
+    - Morning: if the day starts before 08:00 and the first job travel/action is before 08:00,
+      deduct up to 30 minutes from payable OOH.
+    - Evening: if the day ends after 16:30, deduct up to 30 minutes from the gap after the
+      last productive job action.
+    """
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return {
+            "morning_commute_deduction_hours": 0.0,
+            "evening_commute_deduction_hours": 0.0,
+            "commute_deduction_hours": 0.0,
+        }
+
+    normal_start = start_dt.replace(hour=8, minute=0, second=0, microsecond=0)
+    normal_end = start_dt.replace(hour=16, minute=30, second=0, microsecond=0)
+
+    morning_deduction = 0.0
+    evening_deduction = 0.0
+
+    if productive_intervals:
+        first_productive_start = productive_intervals[0][0]
+        last_productive_end = productive_intervals[-1][1]
+
+        if start_dt < normal_start and first_productive_start < normal_start:
+            pre_8_duration = hours_between(start_dt, min(end_dt, normal_start))
+            morning_deduction = min(0.5, pre_8_duration)
+
+        if end_dt > normal_end and last_productive_end < end_dt:
+            commute_gap_start = max(last_productive_end, normal_end)
+            post_work_gap = hours_between(commute_gap_start, end_dt)
+            evening_deduction = min(0.5, post_work_gap)
+    else:
+        # No job actions were logged. Do not auto-deduct commute time because the day may have
+        # been office/training/admin work. Office can review inactive time separately.
+        morning_deduction = 0.0
+        evening_deduction = 0.0
+
+    total = morning_deduction + evening_deduction
+    return {
+        "morning_commute_deduction_hours": round_hours(morning_deduction),
+        "evening_commute_deduction_hours": round_hours(evening_deduction),
+        "commute_deduction_hours": round_hours(total),
+    }
+
+
+def calculate_day_pay_hours(start_dt, end_dt, jobs_data=None, engineer_name=""):
     if not start_dt or not end_dt:
         return None
 
@@ -1100,11 +1281,27 @@ def calculate_day_pay_hours(start_dt, end_dt):
     normal_hours = max(0.0, normal_gross - break_deducted)
     ooh_hours = max(0.0, total_hours - normal_gross)
 
+    activity = calculate_activity_hours(start_dt, end_dt, jobs_data, engineer_name)
+    commute = calculate_commute_deductions(
+        start_dt,
+        end_dt,
+        activity.get("productive_intervals", []),
+    )
+
+    payable_ooh_hours = max(0.0, ooh_hours - commute["commute_deduction_hours"])
+
     return {
-        "total_hours": round(total_hours, 2),
-        "normal_hours": round(normal_hours, 2),
-        "ooh_hours": round(ooh_hours, 2),
-        "break_deducted": round(break_deducted, 2),
+        "total_hours": round_hours(total_hours),
+        "normal_hours": round_hours(normal_hours),
+        "ooh_hours": round_hours(ooh_hours),
+        "break_deducted": round_hours(break_deducted),
+        "morning_commute_deduction_hours": commute["morning_commute_deduction_hours"],
+        "evening_commute_deduction_hours": commute["evening_commute_deduction_hours"],
+        "commute_deduction_hours": commute["commute_deduction_hours"],
+        "payable_ooh_hours": round_hours(payable_ooh_hours),
+        "productive_hours": activity["productive_hours"],
+        "inactive_hours": activity["inactive_hours"],
+        "utilisation_percent": activity["utilisation_percent"],
     }
 
 
@@ -1117,8 +1314,15 @@ def build_pay_summary(start_dt, end_dt, hours):
         f"End: {end_dt.strftime('%d/%m/%Y %H:%M')}\n"
         f"Total hours: {hours['total_hours']}\n"
         f"Normal hours: {hours['normal_hours']}\n"
-        f"OOH hours: {hours['ooh_hours']} at 1.5x\n"
-        f"Break deducted: {hours['break_deducted']}"
+        f"OOH before commute deduction: {hours['ooh_hours']} at 1.5x\n"
+        f"Morning commute deduction: {hours['morning_commute_deduction_hours']}\n"
+        f"Evening commute deduction: {hours['evening_commute_deduction_hours']}\n"
+        f"Total commute deduction: {hours['commute_deduction_hours']}\n"
+        f"Payable OOH hours: {hours['payable_ooh_hours']}\n"
+        f"Break deducted: {hours['break_deducted']}\n"
+        f"Productive hours: {hours['productive_hours']}\n"
+        f"Inactive/unproductive hours: {hours['inactive_hours']}\n"
+        f"Utilisation: {hours['utilisation_percent']}%"
     )
 
 
@@ -2818,7 +3022,12 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Start Time",
         )
         start_time = parse_sharepoint_datetime(start_time_value)
-        hours = calculate_day_pay_hours(start_time, end_time)
+        hours = calculate_day_pay_hours(
+            start_time,
+            end_time,
+            jobs_data=jobs_data,
+            engineer_name=end_day.get("engineer_name", ""),
+        )
         pay_summary = build_pay_summary(start_time, end_time, hours)
 
         start_mileage_value = get_field_value(
@@ -2854,6 +3063,22 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "NormalHours": hours["normal_hours"],
                 "OOH Hours": hours["ooh_hours"],
                 "OOHHours": hours["ooh_hours"],
+                "Payable OOH Hours": hours["payable_ooh_hours"],
+                "PayableOOHHours": hours["payable_ooh_hours"],
+                "Commute Deduction Hours": hours["commute_deduction_hours"],
+                "CommuteDeductionHours": hours["commute_deduction_hours"],
+                "Morning Commute Deduction Hours": hours["morning_commute_deduction_hours"],
+                "MorningCommuteDeductionHours": hours["morning_commute_deduction_hours"],
+                "Evening Commute Deduction Hours": hours["evening_commute_deduction_hours"],
+                "EveningCommuteDeductionHours": hours["evening_commute_deduction_hours"],
+                "Productive Hours": hours["productive_hours"],
+                "ProductiveHours": hours["productive_hours"],
+                "Inactive Hours": hours["inactive_hours"],
+                "InactiveHours": hours["inactive_hours"],
+                "Unproductive Hours": hours["inactive_hours"],
+                "UnproductiveHours": hours["inactive_hours"],
+                "Utilisation Percent": hours["utilisation_percent"],
+                "UtilisationPercent": hours["utilisation_percent"],
                 "Break Deducted": hours["break_deducted"],
                 "BreakDeducted": hours["break_deducted"],
             })
@@ -3155,7 +3380,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_FIND_JOB: "Find Job",
         MENU_CANCEL_JOB: "Cancel Job",
         MENU_DELETE_JOB: "Delete Job",
-        MENU_QUOTE_REMINDER: "Quote Reminder",
+        MENU_QUOTE_REMINDER: "Task / Activity",
         MENU_HELPDESK: "Helpdesk",
     }
 
@@ -7393,7 +7618,7 @@ async def remind_active_engineers_to_end_day(app):
                             "End of day reminder: if you have finished work, please tap 🏁 End Day. "
                             "This keeps timesheets, mileage and pay hours correct."
                         ),
-                        reply_markup=get_main_menu(await get_role_for_update(update)),
+                        reply_markup=get_engineer_menu(),
                     )
                 except Exception as e:
                     print(f"WARNING: Could not send end-day reminder to {telegram_id}: {e}")
@@ -7691,7 +7916,7 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not user_can_use_helpdesk(role):
         await update.message.reply_text(
-            "You do not have permission to create quote reminders.",
+            "You do not have permission to create task / activitys.",
             reply_markup=get_main_menu(role),
         )
         return ConversationHandler.END
@@ -7701,7 +7926,7 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
         recipients = get_quote_reminder_recipients(site_id)
         if not recipients:
             await update.message.reply_text(
-                "No active Telegram users were found to send the quote reminder to.",
+                "No active Telegram users were found to send the task / activity to.",
                 reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
             )
             return ConversationHandler.END
@@ -7715,9 +7940,9 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
         return QUOTE_RECIPIENT
 
     except Exception as e:
-        print(f"ERROR starting quote reminder: {e}")
+        print(f"ERROR starting task / activity: {e}")
         await update.message.reply_text(
-            "There was an error opening Quote Reminder. Please check Railway logs.",
+            "There was an error opening Task / Activity. Please check Railway logs.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
@@ -7808,7 +8033,7 @@ async def quote_reminder_scope(update: Update, context: ContextTypes.DEFAULT_TYP
 def build_quote_reminder_review(reminder):
     recipient = reminder.get("recipient", {})
     return (
-        "Please review this quote reminder:\n\n"
+        "Please review this task / activity:\n\n"
         f"Send to: {recipient.get('name', '')}\n"
         f"Client: {reminder.get('client', '')}\n"
         f"Address: {reminder.get('address', '')}\n"
@@ -7877,7 +8102,7 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
                 failed_names.append(f"{recipient.get('name', 'Unknown')}: {send_error}")
 
         if not sent_names:
-            raise Exception("No quote reminders were sent. " + "; ".join(failed_names))
+            raise Exception("No task / activitys were sent. " + "; ".join(failed_names))
 
         context.user_data.pop("quote_reminder", None)
         message = f"Quote reminder sent to {', '.join(sent_names)}."
@@ -7891,9 +8116,9 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     except Exception as e:
-        print(f"ERROR sending quote reminder: {e}")
+        print(f"ERROR sending task / activity: {e}")
         await update.message.reply_text(
-            "There was an error sending the quote reminder. Please check Railway logs.",
+            "There was an error sending the task / activity. Please check Railway logs.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
@@ -7966,7 +8191,7 @@ abortjob_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|👷 Engineer Menu|📌 Quote Reminder|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|👷 Engineer Menu|📌 Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
         group_chat_cleanup,
     ),
     group=0,
