@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "pdf-worksheet-photo-confirm-v3-small-photo-batches"
+BUILD_VERSION = "docx-pdf-layout-all-photos-max10-v7"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -1826,11 +1826,12 @@ async def notify_trade_group(context, worksheet, fields, updated_log, outcome):
 
 
 async def send_trade_group_photos(context, chat_id, worksheet):
-    """Send all engineer photos to the trade group safely.
+    """Send every engineer photo to the trade group using max-size Telegram albums.
 
-    Telegram media groups can time out when large photos are sent in big albums.
-    This version uses smaller albums, longer per-call timeouts, and falls back
-    to single-photo messages so one failed batch does not lose all photos.
+    Telegram media groups can contain a maximum of 10 photos. This function sends
+    all available photos in full 10-photo albums, then sends the final remainder.
+    If a media group times out or fails, it falls back to individual photo sends
+    for that batch so one bad upload does not stop the rest of the job photos.
     """
     photo_items = worksheet.get("photo_files_for_group", []) or []
 
@@ -1838,9 +1839,10 @@ async def send_trade_group_photos(context, chat_id, worksheet):
         print("Trade group photo send skipped: worksheet contains no photo bytes.")
         return
 
-    batch_size = 4
+    total_photos = len(photo_items)
     sent_total = 0
     failed_total = 0
+    invalid_total = 0
 
     async def send_single_photo(file_bytes, file_name):
         single_buffer = BytesIO(file_bytes)
@@ -1849,53 +1851,74 @@ async def send_trade_group_photos(context, chat_id, worksheet):
             chat_id=chat_id,
             photo=single_buffer,
             connect_timeout=30,
-            read_timeout=60,
-            write_timeout=60,
+            read_timeout=90,
+            write_timeout=120,
             pool_timeout=30,
         )
 
-    for batch_start in range(0, len(photo_items), batch_size):
-        batch = photo_items[batch_start:batch_start + batch_size]
-        valid_items = []
+    valid_items = []
+    for index, item in enumerate(photo_items):
+        if not isinstance(item, dict):
+            invalid_total += 1
+            continue
+
+        file_bytes = item.get("bytes")
+        file_name = item.get("file_name") or f"job_photo_{index + 1}.jpg"
+
+        if not file_bytes:
+            invalid_total += 1
+            continue
+
+        valid_items.append((file_bytes, file_name))
+
+    if not valid_items:
+        print("WARNING: Trade group photos had no valid photo bytes to send.")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📷 Sending {len(valid_items)} job photo(s) to this group.",
+        )
+    except Exception as e:
+        print(f"WARNING: Could not send trade group photo count notice: {e}")
+
+    # Max out Telegram albums at 10 photos per group: 24 photos = 10 + 10 + 4.
+    for batch_start in range(0, len(valid_items), 10):
+        batch = valid_items[batch_start:batch_start + 10]
+        batch_number = (batch_start // 10) + 1
+        batch_end = batch_start + len(batch)
+
         media = []
-
-        for index, item in enumerate(batch):
-            if not isinstance(item, dict):
-                failed_total += 1
-                continue
-
-            file_bytes = item.get("bytes")
-            file_name = item.get("file_name") or f"job_photo_{batch_start + index + 1}.jpg"
-
-            if not file_bytes:
-                failed_total += 1
-                continue
-
-            valid_items.append((file_bytes, file_name))
+        for file_bytes, file_name in batch:
             album_buffer = BytesIO(file_bytes)
             album_buffer.name = file_name
             media.append(InputMediaPhoto(media=album_buffer))
 
-        if not valid_items:
-            continue
-
         try:
             if len(media) == 1:
-                await send_single_photo(valid_items[0][0], valid_items[0][1])
+                await send_single_photo(batch[0][0], batch[0][1])
             else:
                 await context.bot.send_media_group(
                     chat_id=chat_id,
                     media=media,
                     connect_timeout=30,
-                    read_timeout=90,
-                    write_timeout=120,
+                    read_timeout=180,
+                    write_timeout=240,
                     pool_timeout=30,
                 )
-            sent_total += len(valid_items)
-            await asyncio.sleep(1.2)
+
+            sent_total += len(batch)
+            print(f"Trade group photo batch {batch_number} sent photos {batch_start + 1}-{batch_end}/{len(valid_items)}.")
+            await asyncio.sleep(1.0)
+
         except Exception as album_error:
-            print(f"WARNING: Trade group album batch starting at photo {batch_start + 1} failed, sending individually: {album_error}")
-            for file_bytes, file_name in valid_items:
+            print(
+                f"WARNING: Trade group photo album batch {batch_number} failed "
+                f"for photos {batch_start + 1}-{batch_end}; sending individually: {album_error}"
+            )
+
+            for file_bytes, file_name in batch:
                 try:
                     await send_single_photo(file_bytes, file_name)
                     sent_total += 1
@@ -1904,11 +1927,10 @@ async def send_trade_group_photos(context, chat_id, worksheet):
                     failed_total += 1
                     print(f"WARNING: Could not send trade group photo {file_name}: {single_error}")
 
-    if sent_total < len(photo_items):
-        print(f"WARNING: Trade group photos sent {sent_total}/{len(photo_items)}. Failed/invalid: {failed_total}.")
-    else:
-        print(f"Trade group photos sent successfully: {sent_total}/{len(photo_items)}.")
-
+    print(
+        f"Trade group photos sent {sent_total}/{len(valid_items)} valid photos "
+        f"from {total_photos} uploaded. Invalid: {invalid_total}. Failed: {failed_total}."
+    )
 
 async def notify_helpdesk(context, text):
     if HELPDESK_CHAT_ID:
