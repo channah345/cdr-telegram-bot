@@ -1593,9 +1593,24 @@ def get_signed_skip_keyboard():
 
 def get_review_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Submit worksheet", callback_data="review|submit")],
+        [InlineKeyboardButton("✅ Send / submit worksheet", callback_data="review|submit")],
+        [InlineKeyboardButton("✏️ Change outcome", callback_data="review|edit_outcome")],
+        [InlineKeyboardButton("⏱ Edit travel / on site / off site times", callback_data="review|edit_times")],
+        [InlineKeyboardButton("📝 Edit work completed", callback_data="review|edit_work")],
+        [InlineKeyboardButton("🧰 Edit materials", callback_data="review|edit_materials")],
+        [InlineKeyboardButton("🔁 Edit follow-on", callback_data="review|edit_follow_on")],
+        [InlineKeyboardButton("📷 Add more photos", callback_data="review|add_photos")],
+        [InlineKeyboardButton("✍️ Change signature required", callback_data="review|edit_signature")],
         [InlineKeyboardButton("🔄 Restart worksheet", callback_data="review|restart")],
         [InlineKeyboardButton("❌ Cancel", callback_data="review|cancel")],
+    ])
+
+
+def get_outcome_edit_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Completed", callback_data="review_outcome|Completed")],
+        [InlineKeyboardButton("🔁 Revisit Required", callback_data="review_outcome|Revisit Required")],
+        [InlineKeyboardButton("🚫 No Access", callback_data="review_outcome|No Access")],
     ])
 
 
@@ -2019,27 +2034,63 @@ def build_signature_url(cdr_number, token):
     return f"{SIGNATURE_BASE_URL.rstrip('/')}/sign/{cdr_number}?token={token}"
 
 
+def get_current_visit_times_from_worksheet(worksheet):
+    """Return travel/on-site/off-site times for the current engineer visit."""
+    edited = worksheet.get("EditedVisitTimes") or {}
+    times = {
+        "travel": edited.get("travel", ""),
+        "on_site": edited.get("on_site", ""),
+        "off_site": edited.get("off_site", ""),
+    }
+
+    if all(times.values()):
+        return times
+
+    fields = worksheet.get("fields", {}) or {}
+    log_text = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
+    engineer_name = str(worksheet.get("engineer_name", "") or "").strip().lower()
+
+    try:
+        visits = parse_engineer_visit_log(log_text)
+        matching = [
+            visit for visit in visits
+            if str(visit.get("engineer", "") or "").strip().lower() == engineer_name
+        ]
+        if matching:
+            latest = matching[-1]
+            times["travel"] = times["travel"] or latest.get("travel", "")
+            times["on_site"] = times["on_site"] or latest.get("on_site", "")
+            times["off_site"] = times["off_site"] or latest.get("off_site", "")
+    except Exception as e:
+        print(f"WARNING: Could not read current visit times for final review: {e}")
+
+    times["off_site"] = times["off_site"] or datetime.now(UK_TZ).strftime("%H:%M")
+    return times
+
+
 def build_review_text(worksheet):
     signature_required = "Yes" if worksheet.get("ClientSignatureRequired") else "No"
     outcome = worksheet.get("JobOutcome", "Completed")
     no_access_reason = worksheet.get("NoAccessReason", "")
     signature_received = "Yes" if worksheet.get("ClientSignatureReceived") else "No"
-    no_access_line = f"No Access reason: {no_access_reason}\n\n" if outcome == "No Access" and no_access_reason else ""
+    no_access_line = f"No Access reason: {no_access_reason}\n" if outcome == "No Access" and no_access_reason else ""
+    times = get_current_visit_times_from_worksheet(worksheet)
 
     return (
-        f"Please review worksheet for {worksheet['cdr_number']}:\n\n"
-        f"Outcome: {outcome}\n\n"
+        f"Final check before sending worksheet for {worksheet['cdr_number']}:\n\n"
+        f"Outcome: {outcome}\n"
         f"{no_access_line}"
+        f"Travel time: {times.get('travel') or 'Missing'}\n"
+        f"On site time: {times.get('on_site') or 'Missing'}\n"
+        f"Off site time: {times.get('off_site') or 'Missing'}\n\n"
         f"Work completed:\n{worksheet.get('WorkCompleted', '')}\n\n"
         f"Materials used:\n{worksheet.get('MaterialsUsed', '')}\n\n"
-        f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
-        f"Follow-on notes:\n{worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
+        f"Follow-on required: {'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n"
+        f"Follow-on notes: {worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
         f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
         f"Client signature required: {signature_required}\n"
         f"Client signature received: {signature_received}\n\n"
-        f"Tap Submit worksheet to complete the job.\n"
-        f"Tap Restart worksheet to redo the worksheet.\n"
-        f"Tap Cancel to abandon it."
+        "If anything is wrong, edit it below before pressing Send."
     )
 
 
@@ -7100,6 +7151,1427 @@ async def abort_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id=None, cdr_number=None, outcome="Completed", no_access_reason=""):
+    """Start a worksheet from either the Complete/Revisit/No Access button or legacy /complete."""
+    try:
+        is_callback = update.callback_query is not None
+        sender = update.callback_query.message if is_callback else update.message
+        user = update.callback_query.from_user if is_callback else update.effective_user
+        user_id = str(user.id)
+
+        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        engineers_by_telegram, _ = build_engineer_maps(engineers)
+        current_engineer = engineers_by_telegram.get(user_id)
+
+        if not current_engineer:
+            await sender.reply_text(
+                "You are not set up as an engineer yet. Please ask the office to add your Telegram ID.",
+                reply_markup=get_main_menu(await get_role_for_update(update)),
+            )
+            return ConversationHandler.END
+
+        if not engineer_has_active_day(site_id, user_id):
+            await sender.reply_text(
+                "Please start your day first using 🟢 Start Day or /startday before updating jobs.",
+                reply_markup=get_main_menu(await get_role_for_update(update)),
+            )
+            return ConversationHandler.END
+
+        job = find_job_by_item_id(jobs_data, item_id) if item_id else find_job_by_cdr(jobs_data, cdr_number)
+
+        if not job:
+            await sender.reply_text("Could not find this job. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+            return ConversationHandler.END
+
+        fields = job["fields"]
+
+        if is_closed_job(fields):
+            await sender.reply_text(
+                "This job has already been closed or returned to the office. No further action is required.",
+                reply_markup=get_main_menu(await get_role_for_update(update)),
+            )
+            return ConversationHandler.END
+
+        assigned_ids = get_assigned_engineer_ids(fields)
+        if current_engineer["lookup_id"] not in assigned_ids:
+            await sender.reply_text("You are not assigned to this job.", reply_markup=get_main_menu(await get_role_for_update(update)))
+            return ConversationHandler.END
+
+        allowed, reason = can_click_action(fields, current_engineer["name"], outcome)
+        if not allowed:
+            await sender.reply_text(reason, reply_markup=get_main_menu(await get_role_for_update(update)))
+            return ConversationHandler.END
+
+        cdr = fields.get("CDRNumber", "")
+        context.user_data["worksheet"] = {
+            "cdr_number": cdr,
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "item_id": job["id"],
+            "engineer_name": current_engineer["name"],
+            "engineer_lookup_id": current_engineer["lookup_id"],
+            "fields": fields,
+            "photo_links": [],
+            "photo_files_for_group": [],
+            "ClientSignatureRequired": False,
+            "ClientSignatureReceived": False,
+            "JobOutcome": outcome,
+            "NoAccessReason": no_access_reason,
+        }
+
+        if outcome == "Completed":
+            first_question = "What work was completed?"
+        elif outcome == "Revisit Required":
+            first_question = "What was done today, and why is a revisit required?"
+        else:
+            first_question = "Add any extra no access notes. If there is nothing else to add, type None."
+
+        no_access_line = f"\nNo Access reason: {no_access_reason}\n" if outcome == "No Access" and no_access_reason else ""
+
+        await sender.reply_text(
+            f"Starting worksheet for {cdr}.\n\n"
+            f"Outcome: {outcome}"
+            f"{no_access_line}\n"
+            f"You can type /cancel at any point before submitting.\n\n"
+            f"{first_question}"
+        )
+        return WORK_COMPLETED
+
+    except Exception as e:
+        print(f"ERROR starting worksheet: {e}")
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text("There was an error starting the worksheet.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+
+async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, item_id, outcome = query.data.split("|", 2)
+    except Exception:
+        await query.message.reply_text("Could not start this worksheet. Tap 📋 My Jobs and try again.")
+        return ConversationHandler.END
+
+    return await begin_worksheet_for_job(update, context, item_id=item_id, outcome=outcome)
+
+
+async def noaccess_reason_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    """Conversation entry point after an engineer chooses a No Access reason.
+
+    This must be an entry point on the worksheet ConversationHandler; otherwise
+    the next typed note is received by the bot but no worksheet state is active.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        _, item_id, reason_key = query.data.split("|", 2)
+    except Exception:
+        await query.message.reply_text("Could not start the No Access worksheet. Tap 📋 My Jobs and try again.")
+        return ConversationHandler.END
+
+    no_access_reason = NO_ACCESS_REASONS.get(reason_key, "Other / see notes")
+
+    return await begin_worksheet_for_job(
+        update,
+        context,
+        item_id=item_id,
+        outcome="No Access",
+        no_access_reason=no_access_reason,
+    )
+
+
+async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    if not context.args:
+        await update.message.reply_text(
+            "Use 📋 My Jobs, then tap Complete, Revisit or No Access on the job card.\n\n"
+            "The old /complete CDR number method still works if needed: /complete CDR00001",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
+    return await begin_worksheet_for_job(
+        update,
+        context,
+        cdr_number=context.args[0].strip(),
+        outcome="Completed",
+    )
+
+async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, WORK_COMPLETED)
+    if menu_result is not None:
+        return menu_result
+
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type the work completed, or type /cancel.")
+        return WORK_COMPLETED
+
+    context.user_data["worksheet"]["WorkCompleted"] = update.message.text
+    await update.message.reply_text("What materials were used? Type None if none.")
+    return MATERIALS_USED
+
+
+async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, MATERIALS_USED)
+    if menu_result is not None:
+        return menu_result
+
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type materials used, or type None.")
+        return MATERIALS_USED
+
+    context.user_data["worksheet"]["MaterialsUsed"] = update.message.text
+    await update.message.reply_text(
+        "Is a follow-on required?",
+        reply_markup=get_yes_no_keyboard("follow_on_required"),
+    )
+    return FOLLOW_ON_REQUIRED
+
+
+async def worksheet_follow_on_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, FOLLOW_ON_REQUIRED)
+    if menu_result is not None:
+        return menu_result
+
+    answer = update.message.text.strip().lower()
+
+    if answer not in ["yes", "no", "y", "n"]:
+        await update.message.reply_text("Please tap Yes or No.")
+        return FOLLOW_ON_REQUIRED
+
+    follow_on_required = answer in ["yes", "y"]
+    context.user_data["worksheet"]["FollowOnRequired"] = follow_on_required
+
+    if follow_on_required:
+        await update.message.reply_text("What follow-on is required?")
+        return FOLLOW_ON_NOTES
+
+    context.user_data["worksheet"]["FollowOnNotes"] = ""
+    await update.message.reply_text(
+        "Upload job photos now.\n\n"
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
+    )
+    return PHOTOS
+
+
+async def worksheet_follow_on_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    answer = query.data.split("|", 1)[1]
+    follow_on_required = answer == "yes"
+    worksheet["FollowOnRequired"] = follow_on_required
+
+    if follow_on_required:
+        await query.message.reply_text("What follow-on is required?")
+        return FOLLOW_ON_NOTES
+
+    worksheet["FollowOnNotes"] = ""
+    await query.message.reply_text(
+        "Upload job photos now.\n\n"
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
+    )
+    return PHOTOS
+
+
+async def worksheet_follow_on_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, FOLLOW_ON_NOTES)
+    if menu_result is not None:
+        return menu_result
+
+    if is_bot_menu_text(update.message.text):
+        await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type the follow-on required, or type /cancel.")
+        return FOLLOW_ON_NOTES
+
+    context.user_data["worksheet"]["FollowOnNotes"] = update.message.text
+    await update.message.reply_text(
+        "Upload job photos now.\n\n"
+        "Send one or more photos, then type DONE when finished.\n"
+        "If no photos are needed, type DONE."
+    )
+    return PHOTOS
+
+
+def get_photos_done_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Continue - photo count is correct", callback_data="photos_done|continue")],
+        [InlineKeyboardButton("➕ Add more photos / wait for uploads", callback_data="photos_done|add_more")],
+    ])
+
+
+async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, PHOTOS)
+    if menu_result is not None:
+        return menu_result
+
+    worksheet = context.user_data["worksheet"]
+
+    if update.message.text and update.message.text.strip().upper() == "DONE":
+        photo_count = len(worksheet.get("photo_links", []))
+        await update.message.reply_text(
+            f"I have received {photo_count} job photo(s).\n\n"
+            "Check this number before continuing. If the engineer sent 22 photos but this says 18, "
+            "do NOT continue yet. Wait for the missing photos to appear, or tap Add more photos / wait for uploads and resend the missing photos.\n\n"
+            "Tap Continue only when the photo count is definitely correct.",
+            reply_markup=get_photos_done_keyboard(),
+        )
+        return PHOTOS
+
+    if update.message.photo:
+        site_id = worksheet["site_id"]
+        cdr_number = worksheet["cdr_number"]
+
+        photo = update.message.photo[-1]
+        telegram_file = await context.bot.get_file(photo.file_id)
+        file_bytes = await telegram_file.download_as_bytearray()
+
+        timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
+        file_name = f"{cdr_number}_{timestamp}_{photo.file_unique_id}.jpg"
+
+        photo_link = upload_photo_to_sharepoint(
+            site_id,
+            cdr_number,
+            file_name,
+            bytes(file_bytes),
+        )
+
+        worksheet["photo_links"].append(photo_link)
+        worksheet.setdefault("photo_files_for_group", []).append({
+            "file_name": file_name,
+            "bytes": bytes(file_bytes),
+        })
+
+        count = len(worksheet.get("photo_links", []))
+
+        # Only acknowledge the first successful photo upload.
+        # This avoids spamming the engineer and reduces Telegram API calls when
+        # 10, 20+ photos are being uploaded from poor signal areas.
+        if not worksheet.get("photo_upload_started_notice_sent"):
+            worksheet["photo_upload_started_notice_sent"] = True
+            await update.message.reply_text(
+                "📷 Photo upload started. Send all required photos, then type DONE when finished."
+            )
+
+        return PHOTOS
+
+    await update.message.reply_text("Please send job photos, or type DONE when finished.")
+    return PHOTOS
+
+
+async def worksheet_photos_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    action = query.data.split("|", 1)[1]
+    photo_count = len(worksheet.get("photo_links", []))
+
+    if action == "add_more":
+        await query.message.reply_text(
+            f"No problem. I currently have {photo_count} photo(s). Send the missing photos now, then type DONE again."
+        )
+        return PHOTOS
+
+    if action == "continue":
+        await query.message.reply_text(
+            "Is a client signature required?",
+            reply_markup=get_yes_no_keyboard("signature_required"),
+        )
+        return SIGNATURE_REQUIRED
+
+    await query.message.reply_text("Please tap Continue or Add more photos.", reply_markup=get_photos_done_keyboard())
+    return PHOTOS
+
+
+async def worksheet_signature_required(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, SIGNATURE_REQUIRED)
+    if menu_result is not None:
+        return menu_result
+
+    answer = update.message.text.strip().lower()
+    worksheet = context.user_data["worksheet"]
+
+    if answer not in ["yes", "no", "y", "n"]:
+        await update.message.reply_text("Please tap Yes or No.")
+        return SIGNATURE_REQUIRED
+
+    signature_required = answer in ["yes", "y"]
+    worksheet["ClientSignatureRequired"] = signature_required
+
+    if not signature_required:
+        await update.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    try:
+        token = create_signature_token_for_job(
+            worksheet["site_id"],
+            worksheet["jobs_list_id"],
+            worksheet["item_id"],
+        )
+
+        signature_url = build_signature_url(worksheet["cdr_number"], token)
+        worksheet["SignatureToken"] = token
+        worksheet["SignatureUrl"] = signature_url
+
+        await update.message.reply_text(
+            "Client signature required.\n\n"
+            "Open this link on your phone and ask the client to sign:\n\n"
+            f"{signature_url}\n\n"
+            "Once signed, tap Signed. If no client is available, tap Skip.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+
+        return SIGNATURE_WAITING
+
+    except Exception as e:
+        print(f"ERROR creating signature link: {e}")
+        await update.message.reply_text(
+            "There was an error creating the signature link. Tap Skip to continue without a signature."
+        )
+        return SIGNATURE_WAITING
+
+
+async def worksheet_signature_required_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    signature_required = query.data.split("|", 1)[1] == "yes"
+    worksheet["ClientSignatureRequired"] = signature_required
+
+    if not signature_required:
+        await query.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    try:
+        token = create_signature_token_for_job(
+            worksheet["site_id"],
+            worksheet["jobs_list_id"],
+            worksheet["item_id"],
+        )
+
+        signature_url = build_signature_url(worksheet["cdr_number"], token)
+        worksheet["SignatureToken"] = token
+        worksheet["SignatureUrl"] = signature_url
+
+        await query.message.reply_text(
+            "Client signature required.\n\n"
+            "Open this link on your phone and ask the client to sign:\n\n"
+            f"{signature_url}\n\n"
+            "Once signed, tap Signed. If no client is available, tap Skip.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+
+        return SIGNATURE_WAITING
+
+    except Exception as e:
+        print(f"ERROR creating signature link: {e}")
+        await query.message.reply_text(
+            "There was an error creating the signature link. Tap Skip to continue without a signature.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+        return SIGNATURE_WAITING
+
+
+async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, SIGNATURE_WAITING)
+    if menu_result is not None:
+        return menu_result
+
+    answer = update.message.text.strip().upper()
+    worksheet = context.user_data["worksheet"]
+
+    if answer == "SKIP":
+        worksheet["ClientSignatureReceived"] = False
+        await update.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    if answer != "SIGNED":
+        await update.message.reply_text(
+            "Please tap Signed once the client has signed, or Skip to continue without a signature.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+        return SIGNATURE_WAITING
+
+    latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
+    job = find_job_by_item_id(latest_jobs, worksheet["item_id"])
+
+    if not job:
+        await update.message.reply_text("Could not check the signature. Please try SIGNED again or type SKIP.")
+        return SIGNATURE_WAITING
+
+    fields = job["fields"]
+
+    if bool_field(fields.get("ClientSignatureReceived")):
+        worksheet["ClientSignatureReceived"] = True
+        worksheet["ClientSignatureName"] = fields.get("ClientSignatureName", "")
+        worksheet["ClientSignatureLink"] = fields.get("ClientSignatureLink", "")
+        await update.message.reply_text("Signature received.")
+        await update.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    await update.message.reply_text(
+        "I cannot see the signature yet. Make sure the client pressed Submit Signature, then tap Signed again.",
+        reply_markup=get_signed_skip_keyboard(),
+    )
+    return SIGNATURE_WAITING
+
+
+async def worksheet_signature_waiting_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    action = query.data.split("|", 1)[1]
+
+    if action == "skip":
+        worksheet["ClientSignatureReceived"] = False
+        await query.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
+    job = find_job_by_item_id(latest_jobs, worksheet["item_id"])
+
+    if not job:
+        await query.message.reply_text(
+            "Could not check the signature. Tap Signed again or Skip.",
+            reply_markup=get_signed_skip_keyboard(),
+        )
+        return SIGNATURE_WAITING
+
+    fields = job["fields"]
+
+    if bool_field(fields.get("ClientSignatureReceived")):
+        worksheet["ClientSignatureReceived"] = True
+        worksheet["ClientSignatureName"] = fields.get("ClientSignatureName", "")
+        worksheet["ClientSignatureLink"] = fields.get("ClientSignatureLink", "")
+        await query.message.reply_text("Signature received.")
+        await query.message.reply_text(
+            build_review_text(worksheet),
+            reply_markup=get_review_keyboard(),
+        )
+        return REVIEW
+
+    await query.message.reply_text(
+        "I cannot see the signature yet. Make sure the client pressed Submit Signature, then tap Signed again.",
+        reply_markup=get_signed_skip_keyboard(),
+    )
+    return SIGNATURE_WAITING
+
+
+
+
+def clean_pdf_text(value):
+    text = str(value or "").strip()
+    return text if text and text.lower() != "none" else "N/A"
+
+
+def safe_pdf_filename(value):
+    cleaned = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in ["-", "_", " "]).strip()
+    return cleaned.replace(" ", "_") or "worksheet"
+
+
+
+def clean_engineer_log_extra(value):
+    """Keep EngineerVisitLog extra text to one safe line so it can be parsed back into the worksheet."""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def build_visit_comment_extra(worksheet):
+    """Create a compact visit comment for EngineerVisitLog and the final worksheet document."""
+    parts = []
+
+    outcome = worksheet.get("JobOutcome", "Completed")
+    if outcome:
+        parts.append(f"Outcome: {outcome}")
+
+    if outcome == "No Access" and worksheet.get("NoAccessReason"):
+        parts.append(f"No Access Reason: {worksheet.get('NoAccessReason')}")
+
+    work_completed = clean_engineer_log_extra(worksheet.get("WorkCompleted", ""))
+    if work_completed and work_completed.upper() != "N/A":
+        parts.append(f"Work/Comments: {work_completed}")
+
+    materials = clean_engineer_log_extra(worksheet.get("MaterialsUsed", ""))
+    if materials and materials.lower() not in ["none", "n/a", "no"]:
+        parts.append(f"Materials Used: {materials}")
+
+    if worksheet.get("FollowOnRequired"):
+        follow_on = clean_engineer_log_extra(worksheet.get("FollowOnNotes", ""))
+        parts.append(f"Follow-on Required: Yes{(' - ' + follow_on) if follow_on else ''}")
+    else:
+        parts.append("Follow-on Required: No")
+
+    return " | ".join(parts) or "Worksheet submitted"
+
+
+def normalise_visit_note(value):
+    note = clean_engineer_log_extra(value)
+    if not note:
+        return ""
+    if note == "Worksheet submitted":
+        return ""
+    return note.replace(" | ", "\n")
+
+
+def build_engineer_comments_for_pdf(visits, worksheet, fields):
+    """Show comments for every visit, not just the final completed visit."""
+    comment_blocks = []
+
+    for visit in visits:
+        note = normalise_visit_note(visit.get("notes", ""))
+        if not note:
+            continue
+
+        heading_bits = [
+            clean_pdf_text(visit.get("date")),
+            clean_pdf_text(visit.get("engineer")),
+            clean_pdf_text(visit.get("status")),
+        ]
+        heading = " - ".join([bit for bit in heading_bits if bit and bit != "N/A"])
+        comment_blocks.append(f"{heading}\n{note}")
+
+    # Fallback for older jobs where previous worksheet comments were not yet being written into EngineerVisitLog.
+    if not comment_blocks:
+        comments = worksheet.get("WorkCompleted", "")
+        if worksheet.get("MaterialsUsed") and str(worksheet.get("MaterialsUsed")).strip().lower() != "none":
+            comments += f"\n\nMaterials Used: {worksheet.get('MaterialsUsed')}"
+        if worksheet.get("FollowOnRequired"):
+            comments += f"\n\nFollow-on Required: Yes\n{worksheet.get('FollowOnNotes', '')}"
+        else:
+            comments += "\n\nFollow-on Required: No"
+        return comments
+
+    return "\n\n".join(comment_blocks)
+
+
+def parse_engineer_visit_log(log_text):
+    """
+    Build one worksheet visit row per attendance from EngineerVisitLog.
+    Expected log line format:
+    dd/mm/yyyy HH:MM - Engineer Name - Action - optional notes
+    """
+    visits = []
+    active_by_engineer = {}
+
+    for raw_line in str(log_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = re.match(
+            r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+-\s+(.+?)\s+-\s+(.+?)(?:\s+-\s+(.*))?$",
+            line,
+        )
+        if not match:
+            continue
+
+        visit_date = match.group(1)
+        visit_time = match.group(2)
+        engineer = match.group(3).strip()
+        action = match.group(4).strip()
+        extra = (match.group(5) or "").strip()
+        key = engineer.lower()
+
+        # Office/helpdesk/internal audit lines are useful in SharePoint, but they are not
+        # customer-facing engineer attendances and must not appear on the worksheet.
+        internal_actions = {
+            "Reassigned",
+            "Cancelled",
+            "Hard Deleted",
+            "Job logged via Telegram",
+            "Aborted Attendance",
+        }
+
+        is_internal_actor = key in ["helpdesk", "admin", "office"]
+        is_internal_action = action in internal_actions or action.startswith("Job logged via Telegram")
+
+        if action == "Aborted Attendance":
+            # If an engineer travelled/on-site then aborted, remove that incomplete
+            # attendance from the customer worksheet entirely. It stays in SharePoint
+            # for audit, but it is not a client visit/no-access/completion record.
+            current = active_by_engineer.pop(key, None)
+            if current and current in visits:
+                visits.remove(current)
+            continue
+
+        if is_internal_actor or is_internal_action:
+            continue
+
+        if action == "Travelling Reverted":
+            current = active_by_engineer.pop(key, None)
+            if current and current in visits:
+                visits.remove(current)
+            continue
+
+        if action == "Travelling":
+            # Start a fresh attendance for this engineer.
+            active_by_engineer[key] = {
+                "date": visit_date,
+                "travel": visit_time,
+                "on_site": "",
+                "engineer": engineer,
+                "status": "Travelling",
+                "off_site": "",
+                "notes": extra,
+            }
+            visits.append(active_by_engineer[key])
+            continue
+
+        if key not in active_by_engineer:
+            active_by_engineer[key] = {
+                "date": visit_date,
+                "travel": "",
+                "on_site": "",
+                "engineer": engineer,
+                "status": "",
+                "off_site": "",
+                "notes": "",
+            }
+            visits.append(active_by_engineer[key])
+
+        current = active_by_engineer[key]
+
+        if action == "On Site":
+            current["on_site"] = visit_time
+            current["status"] = "On Site"
+        elif action.startswith("Submitted for Helpdesk Review - "):
+            # Compatibility for older builds. These lines were created when the engineer
+            # submitted the worksheet, so they are the engineer's off-site/final action
+            # and must still count for productivity and worksheet visit history.
+            submitted_outcome = action.replace("Submitted for Helpdesk Review - ", "", 1).strip() or "Completed"
+            current["status"] = submitted_outcome
+            current["off_site"] = visit_time
+            if extra:
+                current["notes"] = extra
+            active_by_engineer.pop(key, None)
+        elif action in ["Completed", "No Access", "Revisit Required"]:
+            current["status"] = action
+            current["off_site"] = visit_time
+            if extra:
+                current["notes"] = extra
+            # This attendance is closed. A future Travelling click by the same engineer
+            # will create a new row rather than overwriting this one.
+            active_by_engineer.pop(key, None)
+        else:
+            current["status"] = action
+            if extra:
+                current["notes"] = extra
+
+    return visits
+
+
+def get_signature_image_bytes(site_id, cdr_number):
+    """Download the latest saved client signature image from SharePoint, if available."""
+    try:
+        drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
+        folder_path = f"{SIGNATURE_BASE_FOLDER}/{cdr_number}"
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{folder_path}:/children"
+        response = requests.get(url, headers=get_headers())
+
+        if response.status_code != 200:
+            print(f"Could not list signature folder for {cdr_number}: {response.text}")
+            return None
+
+        files = [item for item in response.json().get("value", []) if "file" in item]
+        if not files:
+            return None
+
+        files.sort(key=lambda item: item.get("lastModifiedDateTime", ""), reverse=True)
+        item_id = files[0]["id"]
+        content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+        content_response = requests.get(content_url, headers=get_headers(content_type=False))
+
+        if content_response.status_code != 200:
+            print(f"Could not download signature image for {cdr_number}: {content_response.text}")
+            return None
+
+        return content_response.content
+    except Exception as e:
+        print(f"ERROR getting signature image: {e}")
+        return None
+
+
+def get_logo_for_pdf(max_width=48 * mm, max_height=20 * mm):
+    for path in ["cdr-logo.png", "CDR-logo.png", "logo.png"]:
+        if os.path.exists(path):
+            try:
+                logo = Image(path)
+                logo._restrictSize(max_width, max_height)
+                return logo
+            except Exception as e:
+                print(f"Could not load logo {path}: {e}")
+    return Paragraph("<b>CDR</b>", ParagraphStyle("LogoFallback", fontSize=20, textColor=colors.HexColor("#f58220")))
+
+
+def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=None):
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle("CDRNormal", parent=styles["BodyText"], fontName="Helvetica", fontSize=8.8, leading=11)
+    small = ParagraphStyle("CDRSmall", parent=normal, fontSize=7.6, leading=9)
+    section = ParagraphStyle("CDRSection", parent=normal, fontName="Helvetica-Bold", fontSize=9.5, textColor=colors.white, leading=11)
+    title = ParagraphStyle("CDRTitle", parent=normal, fontName="Helvetica-Bold", fontSize=16, textColor=colors.HexColor("#111827"), alignment=2)
+
+    def escape_pdf(value):
+        return clean_pdf_text(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def ptxt(value):
+        return Paragraph(escape_pdf(value).replace("\n", "<br/>"), normal)
+
+    def section_box(title_text, body_text, height_padding=8):
+        table = Table(
+            [[Paragraph(title_text, section)], [ptxt(body_text)]],
+            colWidths=[182 * mm],
+        )
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.HexColor("#333333")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), height_padding),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), height_padding),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        return table
+
+    cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "")
+    date_logged = format_sharepoint_date(fields.get("Date", ""))
+    date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
+
+    customer_details = get_field_value(fields, "CustomerName", "Customer Name") or get_field_value(fields, "ClientName", "Client Name") or ""
+    site_details = fields.get("SiteName", "") or ""
+
+    order_number = get_field_value(fields, "CustomerOrderNumber", "Customer Order Number", "OrderNumber", "Order Number") or ""
+    job_category = get_field_value(fields, "JobCategory", "Job Category") or ""
+
+    story = []
+
+    header = Table(
+        [[get_logo_for_pdf(), Paragraph("JOB WORKSHEET", title)]],
+        colWidths=[85 * mm, 97 * mm],
+    )
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(header)
+
+    company = Table([[
+        Paragraph(
+            "<b>CDR M&amp;E Services Ltd</b><br/>"
+            "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA<br/>"
+            "Telephone: 01642 057939 &nbsp;&nbsp; Email: helpdesk@cdrme.co.uk<br/>"
+            "VAT Number: 397715249 &nbsp;&nbsp; Company No.: 13744971",
+            small,
+        )
+    ]], colWidths=[182 * mm])
+    company.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f7f7f7")),
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(company)
+    story.append(Spacer(1, 7))
+
+    details = Table(
+        [[Paragraph("<b>Customer Details</b><br/>" + escape_pdf(customer_details).replace("\n", "<br/>"), normal),
+          Paragraph("<b>Site Details</b><br/>" + escape_pdf(site_details).replace("\n", "<br/>"), normal)]],
+        colWidths=[91 * mm, 91 * mm],
+    )
+    details.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(details)
+    story.append(Spacer(1, 7))
+
+    job_data = [
+        ["Job Number:", clean_pdf_text(cdr_number), "Customer Order Number:", clean_pdf_text(order_number)],
+        ["Date Logged:", clean_pdf_text(date_logged), "Job Category:", clean_pdf_text(job_category)],
+        ["Date Complete:", clean_pdf_text(date_complete), "Status:", clean_pdf_text(outcome)],
+    ]
+    job_table = Table(job_data, colWidths=[38 * mm, 53 * mm, 46 * mm, 45 * mm])
+    job_table.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#999999")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(job_table)
+    story.append(Spacer(1, 7))
+
+    story.append(section_box("Description", fields.get("Task", "") or fields.get("Description", "") or fields.get("Notes", ""), 7))
+    story.append(Spacer(1, 7))
+
+    visits_data = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
+    visits = parse_engineer_visit_log(updated_log)
+    if not visits:
+        visits = [{
+            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
+            "travel": "",
+            "on_site": "",
+            "engineer": worksheet.get("engineer_name", ""),
+            "status": outcome,
+            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+        }]
+
+    for visit in visits:
+        visits_data.append([
+            clean_pdf_text(visit.get("date")),
+            clean_pdf_text(visit.get("travel")),
+            clean_pdf_text(visit.get("on_site")),
+            clean_pdf_text(visit.get("engineer")),
+            clean_pdf_text(visit.get("status")),
+            clean_pdf_text(visit.get("off_site")),
+        ])
+
+    visits_table = Table(visits_data, colWidths=[27 * mm, 25 * mm, 25 * mm, 45 * mm, 35 * mm, 25 * mm])
+    visits_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#999999")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(Paragraph("<b>Visits</b>", normal))
+    story.append(visits_table)
+    story.append(Spacer(1, 7))
+
+    comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
+
+    story.append(section_box("Engineer Comment", comments, 8))
+    story.append(Spacer(1, 7))
+
+    if worksheet.get("ClientSignatureRequired"):
+        signature_rows = []
+        if worksheet.get("ClientSignatureReceived"):
+            signature_rows.append([Paragraph(
+                f"<b>Client Name:</b> {escape_pdf(worksheet.get('ClientSignatureName', ''))}<br/>"
+                f"<b>Signed Digitally:</b> Yes",
+                normal,
+            )])
+            signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
+            if signature_bytes:
+                try:
+                    sig_img = Image(BytesIO(signature_bytes))
+                    sig_img._restrictSize(80 * mm, 28 * mm)
+                    signature_rows.append([sig_img])
+                except Exception as e:
+                    print(f"Could not embed signature image: {e}")
+                    signature_rows.append([Paragraph("Signature image saved in SharePoint but could not be embedded.", normal)])
+            else:
+                signature_rows.append([Paragraph("Signature image saved in SharePoint but could not be embedded.", normal)])
+        else:
+            signature_rows.append([Paragraph("Client signature required but not received.", normal)])
+    else:
+        signature_rows = [[Paragraph("Client signature not required.", normal)]]
+
+    signature = Table([[Paragraph("Client Signature", section)]] + signature_rows, colWidths=[182 * mm])
+    signature.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f58220")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#333333")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.HexColor("#333333")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(signature)
+
+    story.append(Spacer(1, 5))
+    story.append(Paragraph("CDR M&amp;E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk", small))
+
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+
+
+def clean_docx_text(value):
+    text = str(value or "").strip()
+    return text if text and text.lower() not in ["none", "nan"] else "N/A"
+
+
+def safe_docx_filename(value):
+    cleaned = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in ["-", "_", " "]).strip()
+    return cleaned.replace(" ", "_") or "worksheet"
+
+
+def docx_escape(value):
+    text = str(value or "")
+    text = "".join(ch for ch in text if ch in "\t\n\r" or ord(ch) >= 32)
+    return xml_escape(text)
+
+
+DOCX_PAGE_WIDTH = 11906
+DOCX_CONTENT_WIDTH = 10320
+DOCX_ORANGE = "F58220"
+DOCX_DARK = "333333"
+DOCX_LIGHT = "F7F7F7"
+DOCX_GREY = "D9D9D9"
+
+
+def docx_run(text, bold=False, size=18, color=None):
+    rpr = f"<w:sz w:val='{size}'/>"
+    if bold:
+        rpr += "<w:b/>"
+    if color:
+        rpr += f"<w:color w:val='{color}'/>"
+    return f"<w:r><w:rPr>{rpr}</w:rPr><w:t xml:space='preserve'>{docx_escape(text)}</w:t></w:r>"
+
+
+def docx_paragraph(value="", bold=False, size=18, align=None, spacing_after=80, color=None, clean=False):
+    ppr = f"<w:spacing w:after='{spacing_after}'/>"
+    if align:
+        ppr += f"<w:jc w:val='{align}'/>"
+
+    text = clean_docx_text(value) if clean else str(value or "")
+    lines = text.splitlines() or [""]
+    runs = []
+    for i, line in enumerate(lines):
+        if i:
+            runs.append("<w:r><w:br/></w:r>")
+        runs.append(docx_run(line, bold=bold, size=size, color=color))
+
+    return f"<w:p><w:pPr>{ppr}</w:pPr>{''.join(runs)}</w:p>"
+
+
+def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18, align=None):
+    tcpr = f"<w:tcPr><w:tcW w:w='{width}' w:type='dxa'/>"
+    tcpr += "<w:tcMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tcMar>"
+    tcpr += "<w:vAlign w:val='top'/>"
+    if shade:
+        tcpr += f"<w:shd w:val='clear' w:color='auto' w:fill='{shade}'/>"
+    tcpr += "</w:tcPr>"
+    return f"<w:tc>{tcpr}{docx_paragraph(value, bold=bold, size=size, spacing_after=0, color=color, align=align, clean=False)}</w:tc>"
+
+
+def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None):
+    if not rows:
+        return ""
+
+    column_count = max(len(row) for row in rows)
+    if not widths:
+        widths = [int(table_width / column_count)] * column_count
+
+    grid = "".join(f"<w:gridCol w:w='{widths[min(i, len(widths)-1)]}'/>" for i in range(column_count))
+    tbl = [
+        "<w:tbl>",
+        "<w:tblPr>",
+        f"<w:tblW w:w='{table_width}' w:type='dxa'/>",
+        "<w:tblLayout w:type='fixed'/>",
+        "<w:tblBorders>",
+        f"<w:top w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:left w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:bottom w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:right w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:insideH w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
+        f"<w:insideV w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
+        "</w:tblBorders>",
+        "<w:tblCellMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tblCellMar>",
+        "</w:tblPr>",
+        f"<w:tblGrid>{grid}</w:tblGrid>",
+    ]
+
+    label_columns = set(label_columns or [])
+    for row_index, row in enumerate(rows):
+        is_header = header_first and row_index == 0
+        tbl.append("<w:tr>")
+        for col_index in range(column_count):
+            raw_value = row[col_index] if col_index < len(row) else ""
+            value = clean_docx_text(raw_value)
+            is_label = col_index in label_columns and not is_header
+            shade = None
+            color = None
+            bold = False
+            if is_header:
+                shade = DOCX_ORANGE if header_orange else DOCX_LIGHT
+                color = "FFFFFF" if header_orange else None
+                bold = True
+            elif is_label:
+                shade = DOCX_LIGHT
+                bold = True
+            tbl.append(docx_cell(
+                value,
+                bold=bold,
+                width=widths[min(col_index, len(widths)-1)],
+                shade=shade,
+                color=color,
+                size=17,
+            ))
+        tbl.append("</w:tr>")
+
+    tbl.append("</w:tbl>")
+    return "".join(tbl)
+
+
+def docx_spacer(height=90):
+    return docx_paragraph("", spacing_after=height)
+
+
+def docx_section(title, value):
+    return (
+        docx_table([[title], [clean_docx_text(value)]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH])
+        + docx_spacer(100)
+    )
+
+
+def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
+    # Build an editable DOCX matching the previous professional PDF worksheet layout.
+    cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "") or fields.get("Title", "")
+    date_logged = format_sharepoint_date(fields.get("Date", ""))
+    date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
+
+    customer_details = (
+        get_field_value(fields, "CustomerName", "Customer Name")
+        or get_field_value(fields, "ClientName", "Client Name")
+        or ""
+    )
+    site_details = fields.get("SiteName", "") or ""
+    order_number = get_field_value(fields, "CustomerOrderNumber", "Customer Order Number", "OrderNumber", "Order Number") or ""
+    job_category = get_field_value(fields, "JobCategory", "Job Category") or ""
+    task = fields.get("Task", "") or fields.get("Description", "") or fields.get("Notes", "")
+
+    visits = parse_engineer_visit_log(updated_log)
+    if not visits:
+        visits = [{
+            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
+            "travel": "",
+            "on_site": "",
+            "engineer": worksheet.get("engineer_name", ""),
+            "status": outcome,
+            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+        }]
+
+    visit_rows = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
+    for visit in visits:
+        visit_rows.append([
+            visit.get("date", ""),
+            visit.get("travel", ""),
+            visit.get("on_site", ""),
+            visit.get("engineer", ""),
+            visit.get("status", ""),
+            visit.get("off_site", ""),
+        ])
+
+    comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
+
+    if worksheet.get("ClientSignatureRequired"):
+        if worksheet.get("ClientSignatureReceived"):
+            signature_text = (
+                f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
+                "Signed Digitally: Yes\n"
+                "Signature image is saved against the job in SharePoint."
+            )
+        else:
+            signature_text = "Client signature required but not received."
+    else:
+        signature_text = "Client signature not required."
+
+    body = []
+    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="center", spacing_after=60))
+    body.append(docx_paragraph(
+        "CDR M&E Services Ltd\n"
+        "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\n"
+        "Telephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\n"
+        "VAT Number: 397715249 | Company No.: 13744971",
+        size=17,
+        align="center",
+        spacing_after=160,
+    ))
+
+    body.append(docx_table(
+        [["Customer Details", "Site Details"], [customer_details, site_details]],
+        header_first=True,
+        header_orange=True,
+        widths=[5160, 5160],
+    ))
+    body.append(docx_spacer(110))
+
+    body.append(docx_table(
+        [
+            ["Job Number", cdr_number, "Customer Order Number", order_number],
+            ["Date Logged", date_logged, "Job Category", job_category],
+            ["Date Complete", date_complete, "Status", outcome],
+        ],
+        widths=[1950, 3210, 2450, 2710],
+        label_columns={0, 2},
+    ))
+    body.append(docx_spacer(110))
+
+    body.append(docx_section("Description", task))
+    body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
+    body.append(docx_spacer(110))
+    body.append(docx_section("Engineer Comment", comments))
+    body.append(docx_section("Client Signature", signature_text))
+    body.append(docx_paragraph(
+        "CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk",
+        size=16,
+        align="center",
+        spacing_after=0,
+    ))
+
+    document_xml = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
+<w:body>
+{''.join(body)}
+<w:sectPr>
+<w:pgSz w:w='{DOCX_PAGE_WIDTH}' w:h='16838'/>
+<w:pgMar w:top='680' w:right='793' w:bottom='680' w:left='793' w:header='720' w:footer='720' w:gutter='0'/>
+</w:sectPr>
+</w:body>
+</w:document>'''
+
+    content_types = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
+<Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
+<Default Extension='xml' ContentType='application/xml'/>
+<Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
+<Override PartName='/docProps/core.xml' ContentType='application/vnd.openxmlformats-package.core-properties+xml'/>
+<Override PartName='/docProps/app.xml' ContentType='application/vnd.openxmlformats-officedocument.extended-properties+xml'/>
+</Types>'''
+
+    root_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
+<Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='word/document.xml'/>
+<Relationship Id='rId2' Type='http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties' Target='docProps/core.xml'/>
+<Relationship Id='rId3' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties' Target='docProps/app.xml'/>
+</Relationships>'''
+
+    doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>'''
+
+    now_iso = datetime.now(UK_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    core = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<cp:coreProperties xmlns:cp='http://schemas.openxmlformats.org/package/2006/metadata/core-properties' xmlns:dc='http://purl.org/dc/elements/1.1/' xmlns:dcterms='http://purl.org/dc/terms/' xmlns:dcmitype='http://purl.org/dc/dcmitype/' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'>
+<dc:title>{docx_escape(cdr_number)} Worksheet</dc:title>
+<dc:creator>CDR Engineer Bot</dc:creator>
+<cp:lastModifiedBy>CDR Engineer Bot</cp:lastModifiedBy>
+<dcterms:created xsi:type='dcterms:W3CDTF'>{now_iso}</dcterms:created>
+<dcterms:modified xsi:type='dcterms:W3CDTF'>{now_iso}</dcterms:modified>
+</cp:coreProperties>'''
+
+    app_props = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Properties xmlns='http://schemas.openxmlformats.org/officeDocument/2006/extended-properties' xmlns:vt='http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'>
+<Application>CDR Engineer Bot</Application>
+</Properties>'''
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as docx:
+        docx.writestr("[Content_Types].xml", content_types)
+        docx.writestr("_rels/.rels", root_rels)
+        docx.writestr("word/_rels/document.xml.rels", doc_rels)
+        docx.writestr("word/document.xml", document_xml)
+        docx.writestr("docProps/core.xml", core)
+        docx.writestr("docProps/app.xml", app_props)
+
+    return buffer.getvalue()
+
+
+
+def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
+    # Generate and upload editable Word worksheet using the professional PDF-style layout.
+    # Function name is kept for compatibility with existing worksheet flow and SharePoint fields.
+    try:
+        docx_bytes = build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id)
+        cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
+        worksheet_folder_name = safe_folder_name(cdr_number)
+        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
+
+        worksheet_link = upload_file_to_sharepoint(
+            site_id,
+            WORKSHEET_BASE_FOLDER,
+            worksheet_folder_name,
+            file_name,
+            docx_bytes,
+        )
+        return worksheet_link
+    except Exception as e:
+        print(f"ERROR generating worksheet Word document: {e}")
+        return ""
+
+
+
+def get_engineer_by_lookup_id(engineers, lookup_id):
+    lookup_id = str(lookup_id or "")
+    for engineer in engineers or []:
+        fields = engineer.get("fields", {})
+        item_lookup_id = str(fields.get("id", "") or engineer.get("id", ""))
+        if item_lookup_id == lookup_id:
+            return {
+                "lookup_id": item_lookup_id,
+                "name": str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or f"Engineer {lookup_id}"),
+                "telegram_id": str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip(),
+            }
+    return None
+
+
+def get_engineer_by_name(engineers, name):
+    target = str(name or "").strip().lower()
+    if not target:
+        return None
+
+    for engineer in engineers or []:
+        fields = engineer.get("fields", {})
+        engineer_name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
+        if engineer_name.lower() == target:
+            lookup_id = str(fields.get("id", "") or engineer.get("id", ""))
+            return {
+                "lookup_id": lookup_id,
+                "name": engineer_name,
+                "telegram_id": str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip(),
+            }
+
+    return None
+
+
+def apply_manual_visit_times_to_log(fields, worksheet, outcome):
+    """Return an EngineerVisitLog that uses the engineer-approved final review times.
+
+    If the engineer edits times, add a Travelling Reverted marker and then clean
+    Travelling / On Site / final outcome lines using the approved times. This lets
+    the worksheet and timesheet parse the corrected attendance without Helpdesk review.
+    """
+    existing_log = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
+    engineer_name = worksheet.get("engineer_name", "Engineer")
+    manual_times = worksheet.get("EditedVisitTimes") or {}
+    comment = build_visit_comment_extra(worksheet)
+
+    if not manual_times:
+        return append_engineer_log(fields, engineer_name, outcome, comment)
+
+    today = datetime.now(UK_TZ).strftime("%d/%m/%Y")
+    travel = normalise_helpdesk_time(manual_times.get("travel", "")) or manual_times.get("travel", "")
+    on_site = normalise_helpdesk_time(manual_times.get("on_site", "")) or manual_times.get("on_site", "")
+    off_site = normalise_helpdesk_time(manual_times.get("off_site", "")) or manual_times.get("off_site", "") or datetime.now(UK_TZ).strftime("%H:%M")
+
+    lines = [line for line in str(existing_log).splitlines() if line.strip()]
+    lines.append(f"{now_log_time()} - {engineer_name} - Travelling Reverted - Times manually edited on final worksheet review")
+    if travel:
+        lines.append(f"{today} {travel} - {engineer_name} - Travelling - Time manually confirmed on worksheet")
+    if on_site:
+        lines.append(f"{today} {on_site} - {engineer_name} - On Site - Time manually confirmed on worksheet")
+    lines.append(f"{today} {off_site} - {engineer_name} - {outcome} - {comment}")
+    return "\n".join(lines)
+
+
+
 def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_final_engineer, worksheet_pdf_link=""):
     fields_to_update = {
         "WorkCompleted": worksheet.get("WorkCompleted", ""),
@@ -7212,6 +8684,95 @@ async def finalise_worksheet_direct(context, worksheet, fields, item_id, site_id
     return True, message, worksheet_link
 
 
+async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, sender):
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await sender.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    site_id = worksheet["site_id"]
+    jobs_list_id = worksheet["jobs_list_id"]
+    item_id = worksheet["item_id"]
+
+    latest_jobs = get_list_items(site_id, jobs_list_id)
+    job = find_job_by_item_id(latest_jobs, item_id)
+    fields = job["fields"] if job else worksheet["fields"]
+
+    if is_closed_job(fields):
+        context.user_data.pop("worksheet", None)
+        await sender.reply_text(
+            "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
+    assigned_ids_latest = get_assigned_engineer_ids(fields)
+    if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
+        context.user_data.pop("worksheet", None)
+        await sender.reply_text(
+            "You are no longer assigned to this job. Worksheet has not been submitted.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
+    outcome = worksheet.get("JobOutcome", "Completed")
+    updated_log = apply_manual_visit_times_to_log(fields, worksheet, outcome)
+
+    assigned_ids = get_assigned_engineer_ids(fields)
+    is_final_engineer = len(assigned_ids) <= 1 or worksheet["engineer_lookup_id"] not in [x for x in assigned_ids if x != worksheet["engineer_lookup_id"]]
+
+    worksheet_link = ""
+    if is_final_engineer and outcome == "Completed":
+        worksheet_link = generate_and_upload_worksheet_pdf(
+            site_id,
+            jobs_list_id,
+            item_id,
+            worksheet,
+            fields,
+            updated_log,
+            outcome,
+        )
+
+    update_payload = build_worksheet_update_fields(
+        worksheet,
+        fields,
+        updated_log,
+        outcome,
+        is_final_engineer,
+        worksheet_link,
+    )
+
+    # Helpdesk review has been removed from the engineer completion path. Do not
+    # write the large pending-review payload here; keeping the direct submission
+    # small avoids SharePoint Invalid request issues.
+
+    update_list_item_fields_in_safe_chunks(
+        site_id,
+        jobs_list_id,
+        item_id,
+        update_payload,
+        required_fields={"EngineerVisitLog", "WorksheetSubmitted"},
+    )
+
+    if is_final_engineer and outcome in ["Completed", "No Access", "Revisit Required"]:
+        await notify_trade_group(context, worksheet, fields, updated_log, outcome)
+
+    context.user_data.pop("worksheet", None)
+
+    if is_final_engineer:
+        if outcome == "Completed":
+            message = f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
+            if worksheet_link:
+                message += "\n\nWorksheet generated."
+        else:
+            message = f"Worksheet submitted and job returned to office for dispatch:\n\n{worksheet['cdr_number']} → {outcome}"
+    else:
+        message = f"Your worksheet has been submitted for {worksheet['cdr_number']}. Other assigned engineer(s) remain on the job."
+
+    await sender.reply_text(message, reply_markup=get_main_menu(await get_role_for_update(update)))
+    return ConversationHandler.END
+
+
 async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -7220,8 +8781,55 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if menu_result is not None:
         return menu_result
 
-    answer = update.message.text.strip().upper()
-    worksheet = context.user_data["worksheet"]
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await update.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    edit_mode = context.user_data.pop("worksheet_review_edit", "")
+    text = str(update.message.text or "").strip()
+    answer = text.upper()
+
+    if edit_mode == "times":
+        parts = [part.strip() for part in text.replace(";", ",").split(",")]
+        if len(parts) != 3:
+            await update.message.reply_text("Please reply with three times like: 08:15, 08:45, 15:30")
+            context.user_data["worksheet_review_edit"] = "times"
+            return REVIEW
+        travel, on_site, off_site = [normalise_helpdesk_time(part) for part in parts]
+        if not travel or not on_site or not off_site:
+            await update.message.reply_text("One of those times was not recognised. Please use 24-hour format, for example: 08:15, 08:45, 15:30")
+            context.user_data["worksheet_review_edit"] = "times"
+            return REVIEW
+        worksheet["EditedVisitTimes"] = {"travel": travel, "on_site": on_site, "off_site": off_site}
+        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
+        return REVIEW
+
+    if edit_mode == "work":
+        worksheet["WorkCompleted"] = text
+        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
+        return REVIEW
+
+    if edit_mode == "materials":
+        worksheet["MaterialsUsed"] = text
+        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
+        return REVIEW
+
+    if edit_mode == "follow_on":
+        lower = text.lower()
+        if lower in ["no", "n", "none", "n/a", "na"]:
+            worksheet["FollowOnRequired"] = False
+            worksheet["FollowOnNotes"] = ""
+        else:
+            worksheet["FollowOnRequired"] = True
+            worksheet["FollowOnNotes"] = text
+        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
+        return REVIEW
+
+    if edit_mode == "no_access_reason":
+        worksheet["NoAccessReason"] = text
+        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
+        return REVIEW
 
     if answer == "CANCEL":
         context.user_data.pop("worksheet", None)
@@ -7237,50 +8845,15 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worksheet["photo_files_for_group"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
-
-        await update.message.reply_text(
-            f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
-            f"What work was completed?"
-        )
-
+        worksheet.pop("EditedVisitTimes", None)
+        await update.message.reply_text(f"Restarting worksheet for {worksheet['cdr_number']}.\n\nWhat work was completed?")
         return WORK_COMPLETED
 
     if answer == "SUBMIT":
-        site_id = worksheet["site_id"]
-        jobs_list_id = worksheet["jobs_list_id"]
-        item_id = worksheet["item_id"]
-
-        latest_jobs = get_list_items(site_id, jobs_list_id)
-        job = find_job_by_item_id(latest_jobs, item_id)
-        fields = job["fields"] if job else worksheet["fields"]
-
-        if is_closed_job(fields):
-            context.user_data.pop("worksheet", None)
-            await update.message.reply_text(
-                "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
-                reply_markup=get_main_menu(await get_role_for_update(update)),
-            )
-            return ConversationHandler.END
-
-        ok, message, _ = await finalise_worksheet_direct(
-            context,
-            worksheet,
-            fields,
-            item_id,
-            site_id,
-            jobs_list_id,
-            update.effective_user.id,
-        )
-
-        context.user_data.pop("worksheet", None)
-        await update.message.reply_text(
-            message,
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
-        return ConversationHandler.END
+        return await submit_worksheet_direct(update, context, update.message)
 
     await update.message.reply_text(
-        "Please tap Submit worksheet, Restart worksheet or Cancel.",
+        "Please use the buttons below, or type SUBMIT, RESTART or CANCEL.",
         reply_markup=get_review_keyboard(),
     )
     return REVIEW
@@ -7314,61 +8887,78 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         worksheet["photo_files_for_group"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
-
-        await query.message.reply_text(
-            f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
-            f"What work was completed?"
-        )
+        worksheet.pop("EditedVisitTimes", None)
+        await query.message.reply_text(f"Restarting worksheet for {worksheet['cdr_number']}.\n\nWhat work was completed?")
         return WORK_COMPLETED
 
-    if action != "submit":
+    if action == "submit":
+        return await submit_worksheet_direct(update, context, query.message)
+
+    if action == "edit_outcome":
+        await query.message.reply_text("Select the correct outcome:", reply_markup=get_outcome_edit_keyboard())
+        return REVIEW
+
+    if action == "edit_times":
+        current = get_current_visit_times_from_worksheet(worksheet)
+        context.user_data["worksheet_review_edit"] = "times"
         await query.message.reply_text(
-            "Please tap Submit worksheet, Restart worksheet or Cancel.",
-            reply_markup=get_review_keyboard(),
+            "Reply with the correct travel, on site and off site times in this format:\n\n"
+            "08:15, 08:45, 15:30\n\n"
+            f"Current: {current.get('travel') or 'Missing'}, {current.get('on_site') or 'Missing'}, {current.get('off_site') or 'Missing'}"
         )
         return REVIEW
 
-    site_id = worksheet["site_id"]
-    jobs_list_id = worksheet["jobs_list_id"]
-    item_id = worksheet["item_id"]
+    if action == "edit_work":
+        context.user_data["worksheet_review_edit"] = "work"
+        await query.message.reply_text("Type the corrected work completed / comments.")
+        return REVIEW
 
-    latest_jobs = get_list_items(site_id, jobs_list_id)
-    job = find_job_by_item_id(latest_jobs, item_id)
-    fields = job["fields"] if job else worksheet["fields"]
+    if action == "edit_materials":
+        context.user_data["worksheet_review_edit"] = "materials"
+        await query.message.reply_text("Type the corrected materials used, or None.")
+        return REVIEW
 
-    if is_closed_job(fields):
-        context.user_data.pop("worksheet", None)
+    if action == "edit_follow_on":
+        context.user_data["worksheet_review_edit"] = "follow_on"
+        await query.message.reply_text("Type the follow-on required, or type No if no follow-on is required.")
+        return REVIEW
+
+    if action == "add_photos":
         await query.message.reply_text(
-            "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
+            "Send any extra job photos now, then type DONE when finished."
         )
+        return PHOTOS
+
+    if action == "edit_signature":
+        await query.message.reply_text("Is a client signature required?", reply_markup=get_yes_no_keyboard("signature_required"))
+        return SIGNATURE_REQUIRED
+
+    await query.message.reply_text("Please use one of the final review buttons.", reply_markup=get_review_keyboard())
+    return REVIEW
+
+
+async def worksheet_outcome_edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
         return ConversationHandler.END
 
-    assigned_ids_latest = get_assigned_engineer_ids(fields)
-    if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
-        context.user_data.pop("worksheet", None)
-        await query.message.reply_text(
-            "You are no longer assigned to this job. Worksheet has not been submitted.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
+    query = update.callback_query
+    await query.answer()
+
+    worksheet = context.user_data.get("worksheet")
+    if not worksheet:
+        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
-    ok, message, _ = await finalise_worksheet_direct(
-        context,
-        worksheet,
-        fields,
-        item_id,
-        site_id,
-        jobs_list_id,
-        query.from_user.id,
-    )
+    outcome = query.data.split("|", 1)[1]
+    worksheet["JobOutcome"] = outcome
 
-    context.user_data.pop("worksheet", None)
-    await query.message.reply_text(
-        message,
-        reply_markup=get_main_menu(await get_role_for_update(update)),
-    )
-    return ConversationHandler.END
+    if outcome == "No Access" and not worksheet.get("NoAccessReason"):
+        context.user_data["worksheet_review_edit"] = "no_access_reason"
+        await query.message.reply_text("Type the No Access reason / notes.")
+        return REVIEW
+
+    await query.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
+    return REVIEW
 
 
 async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8174,6 +9764,7 @@ worksheet_handler = ConversationHandler(
         ],
         REVIEW: [
             CallbackQueryHandler(worksheet_review_button, pattern=r"^review\|"),
+            CallbackQueryHandler(worksheet_outcome_edit_button, pattern=r"^review_outcome\|"),
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_review),
         ],
     },
