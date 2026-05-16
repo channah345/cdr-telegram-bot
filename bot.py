@@ -74,6 +74,8 @@ RECEIPT_BASE_FOLDER = "19 - RECEIPTS"
 
 # Keeps submitted worksheet photos/signatures available until Helpdesk/Admin approves.
 # SharePoint remains the permanent record; this cache is best-effort and is cleared after approval/rejection.
+PENDING_REVIEW_CACHE = {}
+
 DAY_ACTIVE_STATUS = "Active"
 DAY_CLOSED_STATUS = "Closed"
 
@@ -86,6 +88,7 @@ MENU_REQUEST_JOB = "📣 Request Job"
 MENU_QUOTE_REMINDER = "📋 Task / Activity"
 MENU_MESSAGE_ENGINEER = "📢 Message Engineer"
 MENU_CANCEL_TASK_ACTIVITY = "❌ Cancel Task / Activity"
+MENU_PENDING_REVIEWS = "📄 Pending Reviews"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
@@ -103,6 +106,7 @@ UK_TZ = ZoneInfo("Europe/London")
 VAN_CHECK_INTERVAL_DAYS = 14
 # Apprentice role supported. Apprentice users can be excluded from van/mileage prompts in the Start/End Day flow.
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
+AWAITING_HELPDESK_REVIEW_STATUS = "Awaiting Helpdesk Review"
 LEGACY_AWAITING_DEPLOYMENT_STATUS = "Awaiting Deployment"
 ASSIGNED_STATUS = "Assigned"
 TRAVELLING_STATUS = "Travelling"
@@ -175,7 +179,6 @@ CANCEL_TASK_SELECT = 75
 CANCEL_TASK_REASON = 76
 CANCEL_TASK_REVIEW = 77
 REASSIGN_DATE = 78
-REASSIGN_TIME = 84
 REOPENJOB_CDR_NUMBER = 79
 REOPENJOB_DATE = 80
 REOPENJOB_ASSIGN_ENGINEERS = 81
@@ -512,42 +515,6 @@ def append_engineer_log(fields, engineer_name, action, extra_text=""):
     return line
 
 
-def append_engineer_log_line(existing_log, engineer_name, action, extra_text=""):
-    """Append a log line to an already-built EngineerVisitLog string."""
-    line = f"{now_log_time()} - {engineer_name} - {action}"
-
-    if extra_text:
-        line += f" - {extra_text}"
-
-    if str(existing_log or "").strip():
-        return str(existing_log).strip() + "\n" + line
-
-    return line
-
-
-def append_attendance_reset_logs(existing_log, engineers, reason):
-    """
-    Add a per-engineer reset marker so old Travelling/On Site clicks do not
-    block a fresh attendance after Helpdesk rejection, approval/revisit or reassignment.
-    """
-    updated_log = existing_log or ""
-    seen = set()
-
-    for engineer in engineers or []:
-        name = str(engineer.get("name", "") or "").strip()
-        if not name or name.lower() in seen:
-            continue
-        seen.add(name.lower())
-        updated_log = append_engineer_log_line(
-            updated_log,
-            name,
-            "Attendance Reset",
-            reason,
-        )
-
-    return updated_log
-
-
 def get_current_engineer_visit_log_lines(fields, engineer_name):
     """
     Return only the log lines for the engineer's current visit attempt.
@@ -560,7 +527,7 @@ def get_current_engineer_visit_log_lines(fields, engineer_name):
     log = fields.get("EngineerVisitLog", "") or ""
     lines = [line for line in log.splitlines() if line.strip()]
 
-    reset_actions = ["Completed", "No Access", "Revisit Required", "Aborted Attendance", "Travelling Reverted", "Attendance Reset"]
+    reset_actions = ["Completed", "No Access", "Revisit Required", "Aborted Attendance", "Travelling Reverted"]
     last_reset_index = -1
 
     for index, line in enumerate(lines):
@@ -647,6 +614,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         MENU_LOG_JOB,
         MENU_REASSIGN_JOB,
         MENU_REOPEN_JOB,
+        MENU_PENDING_REVIEWS,
         MENU_OPEN_JOBS,
         MENU_FIND_JOB,
         MENU_CANCEL_JOB,
@@ -793,44 +761,6 @@ def get_time_keyboard():
         resize_keyboard=True,
         one_time_keyboard=False,
     )
-
-
-def get_reassign_date_keyboard():
-    return ReplyKeyboardMarkup(
-        [["Keep current date", "Today"], ["Tomorrow", "Monday"], ["Custom"]],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
-
-
-def get_reassign_time_keyboard():
-    return ReplyKeyboardMarkup(
-        [["Keep current time", "ASAP"], ["08:00", "11:00", "14:00"], ["Custom"]],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
-
-
-def parse_reassign_job_date(value):
-    text = str(value or "").strip().lower()
-
-    if text in ["monday", "mon"]:
-        from datetime import timedelta
-        today = datetime.now(UK_TZ).date()
-        days_ahead = (0 - today.weekday()) % 7
-        return (today + timedelta(days=days_ahead)).isoformat()
-
-    return parse_helpdesk_job_date(value)
-
-
-def get_current_job_date_display(fields):
-    current_date = format_sharepoint_date(fields.get("Date", ""))
-    return current_date or str(fields.get("Date", "") or "Not set")
-
-
-def get_current_job_time_display(fields):
-    current_time = fields.get("StartTime", "") or fields.get("Start Time", "")
-    return str(current_time or "Not set")
 
 
 def get_category_keyboard():
@@ -1152,9 +1082,6 @@ def build_reassign_review(data):
     final = ", ".join(e["name"] for e in data.get("final_engineers", [])) or "None"
     fields = data.get("job_fields", {})
 
-    attendance_date = data.get("new_date_display") or f"Keep current date ({get_current_job_date_display(fields)})"
-    attendance_time = data.get("new_time_display") or f"Keep current time ({get_current_job_time_display(fields)})"
-
     return (
         "Please review this reassignment before I update SharePoint:\n\n"
         f"CDR Number: {fields.get('CDRNumber', data.get('cdr_number', ''))}\n"
@@ -1163,8 +1090,6 @@ def build_reassign_review(data):
         f"Remove: {removing}\n"
         f"Assign/send to: {assigning}\n"
         f"Final assigned engineer(s): {final}\n"
-        f"Attendance date: {attendance_date}\n"
-        f"Attendance time: {attendance_time}\n"
         f"Reason: {data.get('reason', '') or 'N/A'}\n\n"
         "Reply YES to reassign and send, NO to cancel, or RESTART to start again."
     )
@@ -1393,20 +1318,9 @@ def get_engineer_productive_intervals_for_day(jobs_data, engineer_name, work_dat
                 continue
 
             start_text = visit.get("travel") or visit.get("on_site")
+            end_text = visit.get("off_site") or visit.get("on_site")
             interval_start = parse_engineer_log_datetime(date_text, start_text)
-
-            # Closed visits should count up to the final outcome/off-site time.
-            # Active visits should keep counting up to the dashboard/end-day calculation time.
-            # This prevents productivity dropping back to zero when a job is no longer the
-            # engineer's current open job, while still preserving the full day audit trail.
-            if visit.get("off_site"):
-                interval_end = parse_engineer_log_datetime(date_text, visit.get("off_site"))
-            elif end_dt:
-                interval_end = end_dt
-            elif visit.get("on_site"):
-                interval_end = parse_engineer_log_datetime(date_text, visit.get("on_site"))
-            else:
-                interval_end = None
+            interval_end = parse_engineer_log_datetime(date_text, end_text)
 
             if not interval_start or not interval_end or interval_end <= interval_start:
                 continue
@@ -1603,63 +1517,6 @@ def update_active_day_live_status(site_id, telegram_id, status, current_job=""):
     return
 
 
-def update_active_day_productivity_snapshot(site_id, telegram_id, engineer_name):
-    """Persist a live productivity snapshot to the engineer's active day log.
-
-    The dashboard calculates live values from EngineerVisitLog, but storing the latest
-    snapshot prevents the card falling back to old/blank values after a job is closed,
-    reassigned, or returned to the office.
-    """
-    try:
-        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        day_logs = get_list_items(site_id, day_logs_list_id)
-        jobs_data = get_list_items(site_id, jobs_list_id)
-        active_day = find_active_day_log(day_logs, telegram_id)
-
-        if not active_day:
-            return
-
-        day_fields = active_day.get("fields", {})
-        start_time = parse_sharepoint_datetime(get_field_value(day_fields, "StartTime", "Start Time"))
-        if not start_time:
-            return
-
-        hours = calculate_day_pay_hours(
-            start_time,
-            datetime.now(UK_TZ),
-            jobs_data=jobs_data,
-            engineer_name=engineer_name,
-        )
-
-        if not hours:
-            return
-
-        update_payload = build_field_payload_for_list(
-            site_id,
-            day_logs_list_id,
-            {
-                "Productive Hours": hours["productive_hours"],
-                "ProductiveHours": hours["productive_hours"],
-                "Inactive Hours": hours["inactive_hours"],
-                "InactiveHours": hours["inactive_hours"],
-                "Unproductive Hours": hours["inactive_hours"],
-                "UnproductiveHours": hours["inactive_hours"],
-                "Utilisation Percent": hours["utilisation_percent"],
-                "UtilisationPercent": hours["utilisation_percent"],
-                "LastProductivityRefresh": graph_datetime_now(),
-                "Last Productivity Refresh": graph_datetime_now(),
-            },
-        )
-
-        update_list_item_fields(site_id, day_logs_list_id, active_day.get("id"), update_payload)
-
-    except Exception as e:
-        print(f"WARNING: Could not update live productivity snapshot: {e}")
-
-
-
-
 def get_job_reference(fields):
     cdr_number = fields.get("CDRNumber", "")
     site_name = fields.get("SiteName", "")
@@ -1742,24 +1599,9 @@ def get_signed_skip_keyboard():
 
 def get_review_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Send / submit worksheet", callback_data="review|submit")],
-        [InlineKeyboardButton("✏️ Change outcome", callback_data="review|edit_outcome")],
-        [InlineKeyboardButton("⏱ Edit travel / on site / off site times", callback_data="review|edit_times")],
-        [InlineKeyboardButton("📝 Edit work completed", callback_data="review|edit_work")],
-        [InlineKeyboardButton("🧰 Edit materials", callback_data="review|edit_materials")],
-        [InlineKeyboardButton("🔁 Edit follow-on", callback_data="review|edit_follow_on")],
-        [InlineKeyboardButton("📷 Add more photos", callback_data="review|add_photos")],
-        [InlineKeyboardButton("✍️ Change signature required", callback_data="review|edit_signature")],
+        [InlineKeyboardButton("✅ Submit worksheet", callback_data="review|submit")],
         [InlineKeyboardButton("🔄 Restart worksheet", callback_data="review|restart")],
         [InlineKeyboardButton("❌ Cancel", callback_data="review|cancel")],
-    ])
-
-
-def get_outcome_edit_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Completed", callback_data="review_outcome|Completed")],
-        [InlineKeyboardButton("🔁 Revisit Required", callback_data="review_outcome|Revisit Required")],
-        [InlineKeyboardButton("🚫 No Access", callback_data="review_outcome|No Access")],
     ])
 
 
@@ -1878,7 +1720,7 @@ def is_closed_job(fields):
     if status in open_statuses:
         return False
 
-    return status in ["No Access", "Revisit Required"] or outcome in ["No Access", "Revisit Required"]
+    return status in ["No Access", "Revisit Required", AWAITING_HELPDESK_REVIEW_STATUS] or outcome in ["No Access", "Revisit Required"]
 
 
 def has_engineer_action(fields, engineer_name, action):
@@ -2183,63 +2025,27 @@ def build_signature_url(cdr_number, token):
     return f"{SIGNATURE_BASE_URL.rstrip('/')}/sign/{cdr_number}?token={token}"
 
 
-def get_current_visit_times_from_worksheet(worksheet):
-    """Return travel/on-site/off-site times for the current engineer visit."""
-    edited = worksheet.get("EditedVisitTimes") or {}
-    times = {
-        "travel": edited.get("travel", ""),
-        "on_site": edited.get("on_site", ""),
-        "off_site": edited.get("off_site", ""),
-    }
-
-    if all(times.values()):
-        return times
-
-    fields = worksheet.get("fields", {}) or {}
-    log_text = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
-    engineer_name = str(worksheet.get("engineer_name", "") or "").strip().lower()
-
-    try:
-        visits = parse_engineer_visit_log(log_text)
-        matching = [
-            visit for visit in visits
-            if str(visit.get("engineer", "") or "").strip().lower() == engineer_name
-        ]
-        if matching:
-            latest = matching[-1]
-            times["travel"] = times["travel"] or latest.get("travel", "")
-            times["on_site"] = times["on_site"] or latest.get("on_site", "")
-            times["off_site"] = times["off_site"] or latest.get("off_site", "")
-    except Exception as e:
-        print(f"WARNING: Could not read current visit times for final review: {e}")
-
-    times["off_site"] = times["off_site"] or datetime.now(UK_TZ).strftime("%H:%M")
-    return times
-
-
 def build_review_text(worksheet):
     signature_required = "Yes" if worksheet.get("ClientSignatureRequired") else "No"
     outcome = worksheet.get("JobOutcome", "Completed")
     no_access_reason = worksheet.get("NoAccessReason", "")
     signature_received = "Yes" if worksheet.get("ClientSignatureReceived") else "No"
-    no_access_line = f"No Access reason: {no_access_reason}\n" if outcome == "No Access" and no_access_reason else ""
-    times = get_current_visit_times_from_worksheet(worksheet)
+    no_access_line = f"No Access reason: {no_access_reason}\n\n" if outcome == "No Access" and no_access_reason else ""
 
     return (
-        f"Final check before sending worksheet for {worksheet['cdr_number']}:\n\n"
-        f"Outcome: {outcome}\n"
+        f"Please review worksheet for {worksheet['cdr_number']}:\n\n"
+        f"Outcome: {outcome}\n\n"
         f"{no_access_line}"
-        f"Travel time: {times.get('travel') or 'Missing'}\n"
-        f"On site time: {times.get('on_site') or 'Missing'}\n"
-        f"Off site time: {times.get('off_site') or 'Missing'}\n\n"
         f"Work completed:\n{worksheet.get('WorkCompleted', '')}\n\n"
         f"Materials used:\n{worksheet.get('MaterialsUsed', '')}\n\n"
-        f"Follow-on required: {'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n"
-        f"Follow-on notes: {worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
+        f"Follow-on required:\n{'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n\n"
+        f"Follow-on notes:\n{worksheet.get('FollowOnNotes', '') or 'None'}\n\n"
         f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
         f"Client signature required: {signature_required}\n"
         f"Client signature received: {signature_received}\n\n"
-        "If anything is wrong, edit it below before pressing Send."
+        f"Tap Submit worksheet to complete the job.\n"
+        f"Tap Restart worksheet to redo the worksheet.\n"
+        f"Tap Cancel to abandon it."
     )
 
 
@@ -2797,24 +2603,6 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
             productive = live_hours.get("productive_hours") if live_hours else "-"
             inactive = live_hours.get("inactive_hours") if live_hours else "-"
 
-            # Do not let the dashboard appear to lose productivity already earned
-            # earlier in the day if SharePoint has a stored snapshot from the last
-            # job status change and the live parser temporarily cannot read a closed job.
-            stored_productive = get_field_value(day_fields, "ProductiveHours", "Productive Hours")
-            stored_inactive = get_field_value(day_fields, "InactiveHours", "Inactive Hours", "UnproductiveHours", "Unproductive Hours")
-            stored_util = get_field_value(day_fields, "UtilisationPercent", "Utilisation Percent")
-            try:
-                if stored_productive not in [None, ""] and productive not in ["-", None, ""]:
-                    productive = max(float(productive), float(stored_productive))
-            except Exception:
-                pass
-            if productive in ["-", None, ""] and stored_productive not in [None, ""]:
-                productive = stored_productive
-            if inactive in ["-", None, ""] and stored_inactive not in [None, ""]:
-                inactive = stored_inactive
-            if util in ["-", None, ""] and stored_util not in [None, ""]:
-                util = stored_util
-
         idle_minutes = 0
         if css == "idle" and current_status_start:
             try:
@@ -3335,8 +3123,10 @@ def signature_page(cdr_number: str, token: str):
             label {{ font-weight: bold; display: block; margin-top: 15px; }}
             input[type="text"] {{ width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; }}
             canvas {{ width: 100%; height: 260px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; touch-action: none; -ms-touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; display: block; }}
+            body.signature-page, body.signature-page .container, body.signature-page .container p, body.signature-page .container label, body.signature-page .container h1, body.signature-page .container h2, body.signature-page .job-box, body.signature-page .small {{ color: #111827 !important; }}
+            body.signature-page .job-box {{ background: #f7f7f7 !important; }}
             button {{ width: 100%; padding: 14px; margin-top: 15px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }}
-            .submit {{ background: #f58220; color: white; font-weight: bold; }}
+            .submit {{ background: #f58220; color: white !important; font-weight: bold; }}
             .clear {{ background: #555; color: white; }}
             .small {{ font-size: 13px; color: #555; margin-top: 15px; }}
         
@@ -3673,7 +3463,7 @@ td:last-child {{
 <meta name="theme-color" content="#070b12">
 <meta name="apple-mobile-web-app-capable" content="yes">
 </head>
-    <body>
+    <body class="signature-page">
         <div class="container">
             <img src="/logo.png" alt="CDR M&E Services Ltd" style="display:block; max-width:320px; width:80%; margin:0 auto 20px auto;">
             <h2 style="text-align:center;">Client Signature</h2>
@@ -4828,7 +4618,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ENGINEER_MENU]:
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_PENDING_REVIEWS, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4900,6 +4690,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_DELETE_JOB:
         return await deletejob_start(update, context)
 
+    if text == MENU_PENDING_REVIEWS:
+        return await pending_reviews_start(update, context)
+
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
 
@@ -4918,6 +4711,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_CANCEL_JOB: "Cancel Job",
         MENU_DELETE_JOB: "Delete Job",
         MENU_QUOTE_REMINDER: "Task / Activity",
+        MENU_PENDING_REVIEWS: "Pending Reviews",
         MENU_HELPDESK: "Helpdesk",
     }
 
@@ -5451,85 +5245,6 @@ async def reopenjob_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return REOPENJOB_REVIEW
 
 
-
-def build_previous_worksheet_comment_from_fields(fields):
-    """Build a compact comment from the existing worksheet fields before reopening.
-
-    Reopening resets the job for another attendance, but the final worksheet still
-    needs to show the earlier visit and what was recorded at that point.
-    """
-    parts = []
-
-    old_outcome = get_field_value(fields, "JobOutcome", "Job Outcome") or fields.get("Status", "") or "Previous Visit"
-    if old_outcome:
-        parts.append(f"Outcome: {old_outcome}")
-
-    no_access_reason = get_field_value(fields, "NoAccessReason", "No Access Reason")
-    if old_outcome == "No Access" and no_access_reason:
-        parts.append(f"No Access Reason: {no_access_reason}")
-
-    work_completed = clean_engineer_log_extra(get_field_value(fields, "WorkCompleted", "Work Completed"))
-    if work_completed and work_completed.upper() != "N/A":
-        parts.append(f"Work/Comments: {work_completed}")
-
-    materials = clean_engineer_log_extra(get_field_value(fields, "MaterialsUsed", "Materials Used"))
-    if materials and materials.lower() not in ["none", "n/a", "no"]:
-        parts.append(f"Materials Used: {materials}")
-
-    follow_on = get_field_value(fields, "FollowOnRequired", "Follow On Required")
-    follow_on_notes = clean_engineer_log_extra(get_field_value(fields, "FollowOnNotes", "Follow On Notes"))
-    if bool_field(follow_on):
-        parts.append(f"Follow-on Required: Yes{(' - ' + follow_on_notes) if follow_on_notes else ''}")
-    elif follow_on not in [None, ""]:
-        parts.append("Follow-on Required: No")
-
-    return " | ".join(parts)
-
-
-def preserve_previous_worksheet_visit_on_reopen(fields, updated_log):
-    """Add previous worksheet details to EngineerVisitLog before a reopen reset.
-
-    This keeps the old visit visible on the next generated worksheet even after
-    the job is reopened/reissued and the engineer submits a new final worksheet.
-    """
-    existing_log = str(updated_log or get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or "")
-    previous_comment = build_previous_worksheet_comment_from_fields(fields)
-    if not previous_comment:
-        return existing_log
-
-    old_outcome = str(get_field_value(fields, "JobOutcome", "Job Outcome") or fields.get("Status", "") or "Revisit Required").strip()
-    if old_outcome not in ["Completed", "No Access", "Revisit Required"]:
-        old_outcome = "Revisit Required"
-
-    try:
-        visits = parse_engineer_visit_log(existing_log)
-    except Exception:
-        visits = []
-
-    # If the previous visit already carries worksheet comments, do not add another line.
-    for visit in reversed(visits):
-        if visit.get("status") == old_outcome and str(visit.get("notes", "")).strip():
-            return existing_log
-
-    previous_visit = visits[-1] if visits else {}
-    engineer_name = str(previous_visit.get("engineer") or "Engineer").strip()
-    visit_date = str(previous_visit.get("date") or datetime.now(UK_TZ).strftime("%d/%m/%Y")).strip()
-    visit_time = str(
-        previous_visit.get("off_site")
-        or previous_visit.get("on_site")
-        or previous_visit.get("travel")
-        or datetime.now(UK_TZ).strftime("%H:%M")
-    ).strip()
-
-    preserved_line = f"{visit_date} {visit_time} - {engineer_name} - {old_outcome} - {previous_comment}"
-    if preserved_line in existing_log:
-        return existing_log
-
-    if existing_log.strip():
-        return existing_log.strip() + "\n" + preserved_line
-    return preserved_line
-
-
 async def reopenjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -5549,16 +5264,7 @@ async def reopenjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fields = data.get("job_fields", {})
         final_engineers = data.get("assign_engineers", [])
         reason = data.get("reason", "Reopened by Helpdesk")
-        updated_log = preserve_previous_worksheet_visit_on_reopen(
-            fields,
-            get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or "",
-        )
-        updated_log = append_engineer_log_line(updated_log, "Helpdesk", "Reopened", reason)
-        updated_log = append_attendance_reset_logs(
-            updated_log,
-            final_engineers,
-            "Job reopened / reissued by Helpdesk",
-        )
+        updated_log = append_engineer_log(fields, "Helpdesk", "Reopened", reason)
         payload_fields = {
             "Date": data.get("new_date"),
             "Status": ASSIGNED_STATUS if final_engineers else AWAITING_DEPLOYMENT_STATUS,
@@ -5763,14 +5469,8 @@ async def reassign_assign_engineers(update: Update, context: ContextTypes.DEFAUL
 
     data["final_engineers"] = final
 
-    fields = data.get("job_fields", {})
-    await update.message.reply_text(
-        "What date should the engineer attend?\n\n"
-        f"Current job date: {get_current_job_date_display(fields)}\n\n"
-        "Choose a button or type a date, for example 18/05/2026.",
-        reply_markup=get_reassign_date_keyboard(),
-    )
-    return REASSIGN_DATE
+    await update.message.reply_text("Reason for reassignment?\n\nExample: Engineer delayed on another job / change of plan / emergency priority.")
+    return REASSIGN_REASON
 
 
 
@@ -5783,72 +5483,20 @@ async def reassign_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please start again using 🔁 Reassign Job.")
         return ConversationHandler.END
 
-    fields = data.get("job_fields", {})
     value = update.message.text.strip()
-    lowered = value.lower()
-
-    if lowered in ["keep", "same", "skip", "no change", "keep current date", "custom"]:
-        if lowered == "custom":
-            await update.message.reply_text("Please type the attendance date, for example 18/05/2026, or type KEEP.")
-            return REASSIGN_DATE
+    if value.lower() in ["keep", "same", "skip", "no change"]:
         data["new_date"] = None
-        data["new_date_display"] = f"Keep current date ({get_current_job_date_display(fields)})"
+        data["new_date_display"] = "Keep current date"
     else:
-        parsed_date = parse_reassign_job_date(value)
+        parsed_date = parse_helpdesk_job_date(value)
         if not parsed_date:
-            await update.message.reply_text(
-                "Please enter a valid date, or type KEEP. Example: Today, Tomorrow, Monday, 18/05/2026",
-                reply_markup=get_reassign_date_keyboard(),
-            )
+            await update.message.reply_text("Please enter a valid date, or type KEEP. Example: Today, Tomorrow, 15/05/2026")
             return REASSIGN_DATE
         data["new_date"] = parsed_date
         data["new_date_display"] = format_sharepoint_date(parsed_date) or parsed_date
 
-    await update.message.reply_text(
-        "What time should the engineer attend?\n\n"
-        f"Current job time: {get_current_job_time_display(fields)}\n\n"
-        "Choose a button or type a time, for example 08:00.",
-        reply_markup=get_reassign_time_keyboard(),
-    )
-    return REASSIGN_TIME
-
-
-async def reassign_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_group_chat(update):
-        return ConversationHandler.END
-
-    data = context.user_data.get("reassign_job")
-    if not data:
-        await update.message.reply_text("Please start again using 🔁 Reassign Job.")
-        return ConversationHandler.END
-
-    fields = data.get("job_fields", {})
-    value = update.message.text.strip()
-    lowered = value.lower()
-
-    if lowered in ["keep", "same", "skip", "no change", "keep current time", "custom"]:
-        if lowered == "custom":
-            await update.message.reply_text("Please type the attendance time, for example 08:00, or type KEEP.")
-            return REASSIGN_TIME
-        data["new_time"] = None
-        data["new_time_display"] = f"Keep current time ({get_current_job_time_display(fields)})"
-    else:
-        parsed_time = normalise_helpdesk_time(value)
-        if not parsed_time:
-            await update.message.reply_text(
-                "Please enter a valid time, or type KEEP. Example: ASAP, 08:00, 11:00, 14:00",
-                reply_markup=get_reassign_time_keyboard(),
-            )
-            return REASSIGN_TIME
-        data["new_time"] = parsed_time
-        data["new_time_display"] = parsed_time
-
-    await update.message.reply_text(
-        "Reason for reassignment?\n\nExample: revisit booked / no access rebooked / change of plan / emergency priority.",
-        reply_markup=get_skip_keyboard(),
-    )
+    await update.message.reply_text("Reason for reassignment?\n\nExample: revisit booked / no access rebooked / change of plan / emergency priority.")
     return REASSIGN_REASON
-
 
 async def reassign_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
@@ -5904,19 +5552,10 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Assigned: {', '.join(e['name'] for e in new_engineers) or 'None'}; "
             f"Final: {', '.join(e['name'] for e in final_engineers) or 'None'}"
         )
-        if data.get("new_date_display"):
-            reassignment_note += f"; Attendance date: {data['new_date_display']}"
-        if data.get("new_time_display"):
-            reassignment_note += f"; Attendance time: {data['new_time_display']}"
         if data.get("reason"):
             reassignment_note += f"; Reason: {data['reason']}"
 
         updated_log = append_engineer_log(fields, "Helpdesk", "Reassigned", reassignment_note)
-        updated_log = append_attendance_reset_logs(
-            updated_log,
-            final_engineers,
-            "Job reassigned / reissued by Helpdesk",
-        )
 
         # First place the job back into dispatch while the assignment is changed.
         interim_fields = {
@@ -5928,9 +5567,6 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         if data.get("new_date"):
             interim_fields["Date"] = data.get("new_date")
-        if data.get("new_time"):
-            interim_fields["StartTime"] = data.get("new_time")
-            interim_fields["Start Time"] = data.get("new_time")
         interim_payload = build_field_payload_for_list(
             site_id,
             jobs_list_id,
@@ -5948,8 +5584,6 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         if data.get("new_date"):
             send_fields["Date"] = data.get("new_date")
-        if data.get("new_time"):
-            send_fields["StartTime"] = data.get("new_time")
         sent_to_any, failed = await send_created_job_to_engineers(
             context.bot,
             item_id,
@@ -7434,7 +7068,6 @@ async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
         update_active_day_live_status(site_id, abort_job["user_id"], "Aborted Attendance", get_job_reference(fields))
-        update_active_day_productivity_snapshot(site_id, abort_job["user_id"], engineer_name)
 
         await update.message.reply_text(
             f"Attendance aborted and sent back for reassignment.\n\n"
@@ -7475,6 +7108,258 @@ async def abort_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+def format_pending_review_card(job):
+    fields = job.get("fields", {})
+    cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+    site = get_field_value(fields, "SiteName", "Site Name") or ""
+    engineer = get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer"
+    outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or ""
+    work = get_field_value(fields, "PendingWorkCompleted", "Pending Work Completed") or ""
+    materials = get_field_value(fields, "PendingMaterialsUsed", "Pending Materials Used") or "None"
+    follow_on = "Yes" if bool_field(get_field_value(fields, "PendingFollowOnRequired", "Pending Follow On Required")) else "No"
+    follow_notes = get_field_value(fields, "PendingFollowOnNotes", "Pending Follow On Notes") or "None"
+    photo_count = get_field_value(fields, "PendingPhotoCount", "Pending Photo Count") or "0"
+
+    return (
+        "🧾 Pending Helpdesk/Admin Review\n\n"
+        f"CDR Number: {cdr_number}\n"
+        f"Site: {site}\n"
+        f"Engineer: {engineer}\n"
+        f"Engineer selected: {outcome}\n\n"
+        f"Work completed / notes:\n{work}\n\n"
+        f"Materials used:\n{materials}\n\n"
+        f"Follow-on required: {follow_on}\n"
+        f"Follow-on notes: {follow_notes}\n"
+        f"Photos uploaded: {photo_count}\n\n"
+        "Approve, change the outcome, or reject below."
+    )
+
+
+async def pending_reviews_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    role = await get_role_for_update(update)
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "Only Helpdesk/Admin users can view pending reviews.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        pending_jobs = []
+
+        for job in jobs_data:
+            fields = job.get("fields", {})
+            pending = bool_field(get_field_value(fields, "PendingHelpdeskReview", "Pending Helpdesk Review"))
+            status = str(get_field_value(fields, "Status") or "").strip()
+            if pending or status == AWAITING_HELPDESK_REVIEW_STATUS:
+                pending_jobs.append(job)
+
+        if not pending_jobs:
+            await update.message.reply_text(
+                "There are no jobs currently awaiting Helpdesk/Admin review.",
+                reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+            )
+            return ConversationHandler.END
+
+        pending_jobs.sort(
+            key=lambda job: str(get_field_value(job.get("fields", {}), "PendingOutcomeDateTime", "Pending Outcome Date Time") or ""),
+            reverse=True,
+        )
+
+        await update.message.reply_text(
+            f"Found {len(pending_jobs)} pending review(s).",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+
+        for job in pending_jobs[:10]:
+            await update.message.reply_text(
+                format_pending_review_card(job),
+                reply_markup=get_helpdesk_review_keyboard(job.get("id")),
+            )
+
+        if len(pending_jobs) > 10:
+            await update.message.reply_text(f"Showing the latest 10 of {len(pending_jobs)} pending reviews.")
+
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR loading pending reviews: {e}")
+        await update.message.reply_text(
+            "There was an error loading pending reviews. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
+async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        data = query.data.split("|")
+        item_id = data[1]
+        decision = data[2]
+
+        role = get_bot_user_role(get_site_id(), query.from_user.id)
+        if not user_can_use_helpdesk(role):
+            await query.message.reply_text("Only Helpdesk/Admin users can approve job reviews.")
+            return
+
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        engineers = get_list_items(site_id, engineers_list_id)
+        job = find_job_by_item_id(jobs_data, item_id)
+
+        if not job:
+            await query.message.reply_text("Could not find that job.")
+            return
+
+        fields = job.get("fields", {})
+        pending = bool_field(get_field_value(fields, "PendingHelpdeskReview", "Pending Helpdesk Review"))
+        if not pending and str(fields.get("Status", "")) != AWAITING_HELPDESK_REVIEW_STATUS:
+            await query.message.reply_text("This job is no longer awaiting Helpdesk review.")
+            return
+
+        pending_outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or ""
+        cached_pending = PENDING_REVIEW_CACHE.get(str(item_id), {}) or {}
+        pending_engineer_lookup_id = str(
+            cached_pending.get("engineer_lookup_id")
+            or get_field_value(fields, "PendingOutcomeEngineerLookupID", "Pending Outcome Engineer Lookup ID")
+            or ""
+        )
+        pending_engineer_name = get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or cached_pending.get("engineer_name") or "Engineer"
+        if not pending_engineer_lookup_id and pending_engineer_name:
+            matched_engineer = get_engineer_by_name(engineers, pending_engineer_name)
+            if matched_engineer:
+                pending_engineer_lookup_id = str(matched_engineer.get("lookup_id", ""))
+        cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+
+        reviewer_name = query.from_user.full_name or str(query.from_user.id)
+        updated_log = append_engineer_log(
+            fields,
+            "Helpdesk",
+            f"Review decision: {decision}",
+            f"Engineer submitted: {pending_outcome}; reviewed by {reviewer_name}",
+        )
+
+        if decision == "Reject":
+            engineer = get_engineer_by_lookup_id(engineers, pending_engineer_lookup_id)
+            update_payload = {
+                "Status": ASSIGNED_STATUS,
+                "JobOutcome": "",
+                "EngineerVisitLog": updated_log,
+                "TelegramNotified": False,
+                "WorksheetSubmitted": False,
+                "WorksheetGenerated": False,
+            }
+            update_payload.update(clear_pending_review_fields())
+            if pending_engineer_lookup_id:
+                update_payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
+                update_payload["EngineerLookupId"] = [int(pending_engineer_lookup_id)]
+
+            update_list_item_fields_in_safe_chunks(
+                site_id,
+                jobs_list_id,
+                item_id,
+                update_payload,
+                required_fields={"Status", "EngineerVisitLog", "EngineerLookupId"},
+            )
+            PENDING_REVIEW_CACHE.pop(str(item_id), None)
+
+            if engineer and engineer.get("telegram_id"):
+                try:
+                    await context.bot.send_message(
+                        chat_id=engineer["telegram_id"],
+                        text=(
+                            f"Job sent back for correction:\n\n"
+                            f"{format_job(fields, engineer.get('name'))}\n\n"
+                            "The office rejected the submitted outcome. Please review and submit again."
+                        ),
+                        reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not resend rejected job to engineer: {e}")
+
+            await query.message.reply_text(f"Rejected and sent back to {pending_engineer_name}.")
+            return
+
+        final_outcome = decision
+        worksheet_link = ""
+        worksheet = build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id)
+
+        if final_outcome == "Completed":
+            worksheet["JobOutcome"] = "Completed"
+            worksheet_link = generate_and_upload_worksheet_pdf(
+                site_id,
+                jobs_list_id,
+                item_id,
+                worksheet,
+                fields,
+                updated_log,
+                "Completed",
+            )
+            update_payload = build_worksheet_update_fields(
+                worksheet,
+                fields,
+                updated_log,
+                "Completed",
+                True,
+                worksheet_link,
+            )
+            update_payload["HelpdeskReviewDecision"] = "Approved Complete"
+        else:
+            update_payload = {
+                "Status": AWAITING_DEPLOYMENT_STATUS,
+                "JobOutcome": final_outcome,
+                "EngineerVisitLog": updated_log,
+                "TelegramNotified": False,
+                "WorksheetSubmitted": False,
+                "WorksheetGenerated": False,
+                "HelpdeskReviewDecision": f"Approved {final_outcome}",
+            }
+            update_payload.update(clear_engineer_assignment_payload())
+
+        update_payload.update({
+            "PendingHelpdeskReview": False,
+            "HelpdeskApprovedBy": reviewer_name,
+            "HelpdeskApprovedDateTime": graph_datetime_now(),
+        })
+
+        # Clear most pending fields after using them.
+        clear_payload = clear_pending_review_fields()
+        for key, value in clear_payload.items():
+            if key not in ["HelpdeskReviewDecision", "HelpdeskApprovedBy", "HelpdeskApprovedDateTime", "Helpdesk Approved Date Time"]:
+                update_payload[key] = value
+
+        update_list_item_fields_in_safe_chunks(
+            site_id,
+            jobs_list_id,
+            item_id,
+            update_payload,
+            required_fields={"Status", "JobOutcome", "EngineerVisitLog"},
+        )
+
+        if final_outcome in ["Completed", "No Access", "Revisit Required"]:
+            await notify_trade_group(context, worksheet, fields, updated_log, final_outcome)
+
+        PENDING_REVIEW_CACHE.pop(str(item_id), None)
+
+        await query.message.reply_text(
+            f"Helpdesk review approved:\n\n{cdr_number} → {final_outcome}"
+            + (f"\nWorksheet generated." if worksheet_link else "")
+        )
+
+    except Exception as e:
+        print(f"ERROR handling helpdesk review: {e}")
+        await query.message.reply_text("There was an error processing the Helpdesk review. Please check Railway logs.")
 
 
 
@@ -7720,7 +7605,6 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_status,
                 get_job_reference(fields),
             )
-            update_active_day_productivity_snapshot(site_id, user_id, current_engineer["name"])
 
             reply_markup = None
             if selected_status == "Travelling":
@@ -8559,7 +8443,6 @@ def parse_engineer_visit_log(log_text):
             "Hard Deleted",
             "Job logged via Telegram",
             "Aborted Attendance",
-            "Attendance Reset",
         }
 
         is_internal_actor = key in ["helpdesk", "admin", "office"]
@@ -8598,29 +8481,6 @@ def parse_engineer_visit_log(log_text):
             continue
 
         if key not in active_by_engineer:
-            # If a final outcome/comment line is added later for an already-closed
-            # visit, merge it back into that visit instead of creating a duplicate
-            # worksheet row. This is important when Helpdesk reopens a job and we
-            # preserve the previous worksheet comments for the final combined sheet.
-            if action in ["Completed", "No Access", "Revisit Required"]:
-                previous_visit = None
-                for candidate in reversed(visits):
-                    if (
-                        str(candidate.get("engineer", "")).strip().lower() == key
-                        and candidate.get("date") == visit_date
-                        and candidate.get("status") in [action, "On Site", "Travelling", ""]
-                    ):
-                        previous_visit = candidate
-                        break
-
-                if previous_visit is not None:
-                    previous_visit["status"] = action
-                    previous_visit["off_site"] = previous_visit.get("off_site") or visit_time
-                    if extra:
-                        previous_visit["notes"] = extra
-                    active_by_engineer.pop(key, None)
-                    continue
-
             active_by_engineer[key] = {
                 "date": visit_date,
                 "travel": "",
@@ -8649,83 +8509,6 @@ def parse_engineer_visit_log(log_text):
             current["status"] = action
             if extra:
                 current["notes"] = extra
-
-    return visits
-
-
-def merge_log_lines_for_worksheet(fields, updated_log):
-    """Return the fullest EngineerVisitLog available for worksheet generation.
-
-    Helpdesk approval can build a fresh updated_log while SharePoint fields may still
-    contain previous attendance history.  This merges both sources without duplicate
-    lines so the worksheet visit table keeps every attendance/revisit/no-access row.
-    """
-    lines = []
-    seen = set()
-
-    for source in [
-        get_field_value(fields or {}, "EngineerVisitLog", "Engineer Visit Log") or "",
-        updated_log or "",
-    ]:
-        for raw_line in str(source or "").splitlines():
-            line = raw_line.strip()
-            if not line or line in seen:
-                continue
-            seen.add(line)
-            lines.append(line)
-
-    return "\n".join(lines)
-
-
-def ensure_current_worksheet_visit_present(visits, worksheet, outcome):
-    """Make sure the currently approved/submitted worksheet appears as a visit row.
-
-    Older logs or edited SharePoint logs may not contain the final engineer outcome
-    line.  Rather than losing the latest attendance from the worksheet, add a safe
-    fallback row only when that engineer/outcome/date is not already represented.
-    """
-    engineer_name = str(worksheet.get("engineer_name", "") or "").strip()
-    if not engineer_name:
-        return visits
-
-    today = datetime.now(UK_TZ).strftime("%d/%m/%Y")
-    outcome = outcome or worksheet.get("JobOutcome", "Completed")
-
-    for visit in visits or []:
-        if (
-            str(visit.get("engineer", "")).strip().lower() == engineer_name.lower()
-            and str(visit.get("status", "")).strip() == str(outcome).strip()
-        ):
-            return visits
-
-    fallback = {
-        "date": today,
-        "travel": "",
-        "on_site": "",
-        "engineer": engineer_name,
-        "status": outcome,
-        "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
-        "notes": build_visit_comment_extra(worksheet),
-    }
-    return list(visits or []) + [fallback]
-
-
-def get_worksheet_visits(fields, updated_log, worksheet, outcome):
-    """Build worksheet visits from all available log history, preserving revisits."""
-    full_log = merge_log_lines_for_worksheet(fields, updated_log)
-    visits = parse_engineer_visit_log(full_log)
-    visits = ensure_current_worksheet_visit_present(visits, worksheet, outcome)
-
-    if not visits:
-        visits = [{
-            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
-            "travel": "",
-            "on_site": "",
-            "engineer": worksheet.get("engineer_name", ""),
-            "status": outcome,
-            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
-            "notes": build_visit_comment_extra(worksheet),
-        }]
 
     return visits
 
@@ -8900,7 +8683,16 @@ def build_worksheet_pdf_bytes(worksheet, fields, updated_log, outcome, site_id=N
     story.append(Spacer(1, 7))
 
     visits_data = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
-    visits = get_worksheet_visits(fields, updated_log, worksheet, outcome)
+    visits = parse_engineer_visit_log(updated_log)
+    if not visits:
+        visits = [{
+            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
+            "travel": "",
+            "on_site": "",
+            "engineer": worksheet.get("engineer_name", ""),
+            "status": outcome,
+            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+        }]
 
     for visit in visits:
         visits_data.append([
@@ -9112,6 +8904,45 @@ def docx_section(title, value):
     )
 
 
+def docx_image_paragraph(relationship_id, width_emu=3024000, height_emu=1058400):
+    """Return WordprocessingML for an embedded image.
+
+    Default size is roughly 80mm x 28mm, matching the PDF worksheet signature size.
+    """
+    return f"""
+<w:p>
+<w:pPr><w:spacing w:after='100'/><w:jc w:val='left'/></w:pPr>
+<w:r>
+<w:drawing>
+<wp:inline distT='0' distB='0' distL='0' distR='0'>
+<wp:extent cx='{width_emu}' cy='{height_emu}'/>
+<wp:effectExtent l='0' t='0' r='0' b='0'/>
+<wp:docPr id='1' name='Client Signature'/>
+<wp:cNvGraphicFramePr/>
+<a:graphic>
+<a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>
+<pic:pic>
+<pic:nvPicPr>
+<pic:cNvPr id='0' name='client_signature.png'/>
+<pic:cNvPicPr/>
+</pic:nvPicPr>
+<pic:blipFill>
+<a:blip r:embed='{relationship_id}'/>
+<a:stretch><a:fillRect/></a:stretch>
+</pic:blipFill>
+<pic:spPr>
+<a:xfrm><a:off x='0' y='0'/><a:ext cx='{width_emu}' cy='{height_emu}'/></a:xfrm>
+<a:prstGeom prst='rect'><a:avLst/></a:prstGeom>
+</pic:spPr>
+</pic:pic>
+</a:graphicData>
+</a:graphic>
+</wp:inline>
+</w:drawing>
+</w:r>
+</w:p>"""
+
+
 def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
     # Build an editable DOCX matching the previous professional PDF worksheet layout.
     cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "") or fields.get("Title", "")
@@ -9128,7 +8959,16 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     job_category = get_field_value(fields, "JobCategory", "Job Category") or ""
     task = fields.get("Task", "") or fields.get("Description", "") or fields.get("Notes", "")
 
-    visits = get_worksheet_visits(fields, updated_log, worksheet, outcome)
+    visits = parse_engineer_visit_log(updated_log)
+    if not visits:
+        visits = [{
+            "date": datetime.now(UK_TZ).strftime("%d/%m/%Y"),
+            "travel": "",
+            "on_site": "",
+            "engineer": worksheet.get("engineer_name", ""),
+            "status": outcome,
+            "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
+        }]
 
     visit_rows = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
     for visit in visits:
@@ -9143,12 +8983,14 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 
     comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
 
+    signature_image_bytes = None
     if worksheet.get("ClientSignatureRequired"):
         if worksheet.get("ClientSignatureReceived"):
+            signature_image_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
             signature_text = (
                 f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
-                "Signed Digitally: Yes\n"
-                "Signature image is saved against the job in SharePoint."
+                "Signed Digitally: Yes"
+                + ("\nSignature embedded below." if signature_image_bytes else "\nSignature image saved in SharePoint but could not be embedded.")
             )
         else:
             signature_text = "Client signature required but not received."
@@ -9190,7 +9032,10 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
     body.append(docx_spacer(110))
     body.append(docx_section("Engineer Comment", comments))
-    body.append(docx_section("Client Signature", signature_text))
+    body.append(docx_table([["Client Signature"], [signature_text]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH]))
+    if signature_image_bytes:
+        body.append(docx_image_paragraph("rIdSignature1"))
+    body.append(docx_spacer(100))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk",
         size=16,
@@ -9199,7 +9044,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     ))
 
     document_xml = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
+<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships' xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>
 <w:body>
 {''.join(body)}
 <w:sectPr>
@@ -9213,6 +9058,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
 <Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
 <Default Extension='xml' ContentType='application/xml'/>
+<Default Extension='png' ContentType='image/png'/>
 <Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
 <Override PartName='/docProps/core.xml' ContentType='application/vnd.openxmlformats-package.core-properties+xml'/>
 <Override PartName='/docProps/app.xml' ContentType='application/vnd.openxmlformats-officedocument.extended-properties+xml'/>
@@ -9225,7 +9071,13 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Relationship Id='rId3' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties' Target='docProps/app.xml'/>
 </Relationships>'''
 
-    doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    if signature_image_bytes:
+        doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
+<Relationship Id='rIdSignature1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/client_signature.png'/>
+</Relationships>'''
+    else:
+        doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>'''
 
     now_iso = datetime.now(UK_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -9249,6 +9101,8 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         docx.writestr("_rels/.rels", root_rels)
         docx.writestr("word/_rels/document.xml.rels", doc_rels)
         docx.writestr("word/document.xml", document_xml)
+        if signature_image_bytes:
+            docx.writestr("word/media/client_signature.png", signature_image_bytes)
         docx.writestr("docProps/core.xml", core)
         docx.writestr("docProps/app.xml", app_props)
 
@@ -9312,6 +9166,125 @@ def get_engineer_by_name(engineers, name):
     return None
 
 
+def build_pending_review_update_fields(worksheet, fields, updated_log, outcome):
+    """Store engineer submission for Helpdesk review and remove current engineer.
+
+    This deliberately does not generate a worksheet and does not final-close the job.
+    """
+    payload = {
+        "Status": AWAITING_HELPDESK_REVIEW_STATUS,
+        "PendingHelpdeskReview": True,
+        "PendingOutcome": outcome,
+        "PendingOutcomeEngineer": worksheet.get("engineer_name", ""),
+        "PendingOutcomeEngineerLookupID": str(worksheet.get("engineer_lookup_id", "") or ""),
+        "PendingOutcomeDateTime": graph_datetime_now(),
+        "PendingWorkCompleted": worksheet.get("WorkCompleted", ""),
+        "PendingMaterialsUsed": worksheet.get("MaterialsUsed", ""),
+        "PendingFollowOnRequired": worksheet.get("FollowOnRequired", False),
+        "PendingFollowOnNotes": worksheet.get("FollowOnNotes", ""),
+        "PendingNoAccessReason": worksheet.get("NoAccessReason", ""),
+        "PendingClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
+        "PendingPhotoCount": len(worksheet.get("photo_links", [])),
+        "EngineerVisitLog": updated_log,
+        "WorksheetSubmitted": False,
+        "WorksheetGenerated": False,
+        "TelegramNotified": False,
+    }
+    payload.update(
+        remove_current_engineer_assignment_payload(
+            fields,
+            worksheet.get("engineer_lookup_id", ""),
+        )
+    )
+    return payload
+
+
+def build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id):
+    cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+    outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or "Completed"
+    cached = PENDING_REVIEW_CACHE.get(str(item_id), {}) or {}
+
+    worksheet = {
+        "site_id": site_id,
+        "jobs_list_id": jobs_list_id,
+        "item_id": item_id,
+        "cdr_number": cdr_number,
+        "engineer_name": get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer",
+        "engineer_lookup_id": str(cached.get("engineer_lookup_id") or get_field_value(fields, "PendingOutcomeEngineerLookupID", "Pending Outcome Engineer Lookup ID") or ""),
+        "JobOutcome": outcome,
+        "WorkCompleted": get_field_value(fields, "PendingWorkCompleted", "Pending Work Completed") or "",
+        "MaterialsUsed": get_field_value(fields, "PendingMaterialsUsed", "Pending Materials Used") or "",
+        "FollowOnRequired": bool_field(get_field_value(fields, "PendingFollowOnRequired", "Pending Follow On Required")),
+        "FollowOnNotes": get_field_value(fields, "PendingFollowOnNotes", "Pending Follow On Notes") or "",
+        "NoAccessReason": get_field_value(fields, "PendingNoAccessReason", "Pending No Access Reason") or "",
+        "ClientSignatureRequired": bool_field(get_field_value(fields, "PendingClientSignatureRequired", "Pending Client Signature Required")),
+        "ClientSignatureReceived": bool_field(get_field_value(fields, "ClientSignatureReceived")),
+        "photo_links": cached.get("photo_links", []),
+        "photo_files_for_group": cached.get("photo_files_for_group", []),
+        "fields": fields,
+    }
+
+    # Keep any live worksheet values that are not safely persisted into the SharePoint pending fields.
+    for key in ["ClientSignatureName", "ClientSignatureDateTime", "ClientSignatureLink"]:
+        if cached.get(key):
+            worksheet[key] = cached.get(key)
+
+    return worksheet
+
+
+def clear_pending_review_fields():
+    return {
+        "PendingHelpdeskReview": False,
+        "PendingOutcome": "",
+        "PendingOutcomeEngineer": "",
+        "PendingOutcomeEngineerLookupID": "",
+        "PendingOutcomeDateTime": "",
+        "PendingWorkCompleted": "",
+        "PendingMaterialsUsed": "",
+        "PendingFollowOnRequired": False,
+        "PendingFollowOnNotes": "",
+        "PendingNoAccessReason": "",
+        "PendingClientSignatureRequired": False,
+        "PendingPhotoCount": "",
+        "HelpdeskReviewDecision": "",
+        "HelpdeskApprovedBy": "",
+        "HelpdeskApprovedDateTime": "",
+    }
+
+
+def get_helpdesk_review_keyboard(item_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Approve Complete / Generate Worksheet", callback_data=f"helpdesk_review|{item_id}|Completed")],
+        [InlineKeyboardButton("🔁 Approve Revisit Required", callback_data=f"helpdesk_review|{item_id}|Revisit Required")],
+        [InlineKeyboardButton("🚫 Approve No Access", callback_data=f"helpdesk_review|{item_id}|No Access")],
+        [InlineKeyboardButton("⏹ Approve Abandoned", callback_data=f"helpdesk_review|{item_id}|Abandoned")],
+        [InlineKeyboardButton("❌ Reject / Send Back to Engineer", callback_data=f"helpdesk_review|{item_id}|Reject")],
+    ])
+
+
+async def notify_helpdesk_review_required(context, worksheet, fields, outcome):
+    if not HELPDESK_CHAT_ID:
+        return
+
+    await context.bot.send_message(
+        chat_id=HELPDESK_CHAT_ID,
+        text=(
+            "🧾 Job Awaiting Helpdesk Review\n\n"
+            f"CDR Number: {worksheet.get('cdr_number', '')}\n"
+            f"Site: {fields.get('SiteName', '')}\n"
+            f"Engineer: {worksheet.get('engineer_name', '')}\n"
+            f"Engineer selected: {outcome}\n\n"
+            f"Work completed / notes:\n{worksheet.get('WorkCompleted', '')}\n\n"
+            f"Materials used:\n{worksheet.get('MaterialsUsed', '') or 'None'}\n\n"
+            f"Follow-on required: {'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n"
+            f"Follow-on notes: {worksheet.get('FollowOnNotes', '') or 'None'}\n"
+            f"No Access reason: {worksheet.get('NoAccessReason', 'N/A') if outcome == 'No Access' else 'N/A'}\n"
+            f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
+            f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n\n"
+            "Please approve or change the outcome below."
+        ),
+        reply_markup=get_helpdesk_review_keyboard(worksheet.get("item_id")),
+    )
 
 
 def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_final_engineer, worksheet_pdf_link=""):
@@ -9354,126 +9327,6 @@ def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_fi
 
     return fields_to_update
 
-def apply_manual_visit_times_to_log(fields, worksheet, outcome):
-    """Return an EngineerVisitLog that uses the engineer-approved final review times.
-
-    If the engineer edits times, add a Travelling Reverted marker and then clean
-    Travelling / On Site / final outcome lines using the approved times. This lets
-    the worksheet and timesheet parse the corrected attendance without Helpdesk review.
-    """
-    existing_log = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
-    engineer_name = worksheet.get("engineer_name", "Engineer")
-    manual_times = worksheet.get("EditedVisitTimes") or {}
-    comment = build_visit_comment_extra(worksheet)
-
-    if not manual_times:
-        return append_engineer_log(fields, engineer_name, outcome, comment)
-
-    today = datetime.now(UK_TZ).strftime("%d/%m/%Y")
-    travel = normalise_helpdesk_time(manual_times.get("travel", "")) or manual_times.get("travel", "")
-    on_site = normalise_helpdesk_time(manual_times.get("on_site", "")) or manual_times.get("on_site", "")
-    off_site = normalise_helpdesk_time(manual_times.get("off_site", "")) or manual_times.get("off_site", "") or datetime.now(UK_TZ).strftime("%H:%M")
-
-    lines = [line for line in str(existing_log).splitlines() if line.strip()]
-    lines.append(f"{now_log_time()} - {engineer_name} - Travelling Reverted - Times manually edited on final worksheet review")
-    if travel:
-        lines.append(f"{today} {travel} - {engineer_name} - Travelling - Time manually confirmed on worksheet")
-    if on_site:
-        lines.append(f"{today} {on_site} - {engineer_name} - On Site - Time manually confirmed on worksheet")
-    lines.append(f"{today} {off_site} - {engineer_name} - {outcome} - {comment}")
-    return "\n".join(lines)
-
-
-async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, sender):
-    worksheet = context.user_data.get("worksheet")
-    if not worksheet:
-        await sender.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
-        return ConversationHandler.END
-
-    site_id = worksheet["site_id"]
-    jobs_list_id = worksheet["jobs_list_id"]
-    item_id = worksheet["item_id"]
-
-    latest_jobs = get_list_items(site_id, jobs_list_id)
-    job = find_job_by_item_id(latest_jobs, item_id)
-    fields = job["fields"] if job else worksheet["fields"]
-
-    if is_closed_job(fields):
-        context.user_data.pop("worksheet", None)
-        await sender.reply_text(
-            "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
-        return ConversationHandler.END
-
-    assigned_ids_latest = get_assigned_engineer_ids(fields)
-    if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
-        context.user_data.pop("worksheet", None)
-        await sender.reply_text(
-            "You are no longer assigned to this job. Worksheet has not been submitted.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
-        return ConversationHandler.END
-
-    outcome = worksheet.get("JobOutcome", "Completed")
-    updated_log = apply_manual_visit_times_to_log(fields, worksheet, outcome)
-
-    assigned_ids = get_assigned_engineer_ids(fields)
-    is_final_engineer = len(assigned_ids) <= 1 or worksheet["engineer_lookup_id"] not in [x for x in assigned_ids if x != worksheet["engineer_lookup_id"]]
-
-    worksheet_link = ""
-    if is_final_engineer and outcome == "Completed":
-        worksheet_link = generate_and_upload_worksheet_pdf(
-            site_id,
-            jobs_list_id,
-            item_id,
-            worksheet,
-            fields,
-            updated_log,
-            outcome,
-        )
-
-    update_payload = build_worksheet_update_fields(
-        worksheet,
-        fields,
-        updated_log,
-        outcome,
-        is_final_engineer,
-        worksheet_link,
-    )
-
-    # Helpdesk review has been removed from the engineer completion path. Do not
-    # write the large pending-review payload here; keeping the direct submission
-    # small avoids SharePoint Invalid request issues.
-
-    update_list_item_fields_in_safe_chunks(
-        site_id,
-        jobs_list_id,
-        item_id,
-        update_payload,
-        required_fields={"EngineerVisitLog", "WorksheetSubmitted"},
-    )
-    update_active_day_productivity_snapshot(site_id, str(update.effective_user.id), worksheet.get("engineer_name", "Engineer"))
-
-    if is_final_engineer and outcome in ["Completed", "No Access", "Revisit Required"]:
-        await notify_trade_group(context, worksheet, fields, updated_log, outcome)
-
-    context.user_data.pop("worksheet", None)
-
-    if is_final_engineer:
-        if outcome == "Completed":
-            message = f"Worksheet submitted and job completed:\n\n{worksheet['cdr_number']}"
-            if worksheet_link:
-                message += "\n\nWorksheet generated."
-        else:
-            message = f"Worksheet submitted and job returned to office for dispatch:\n\n{worksheet['cdr_number']} → {outcome}"
-    else:
-        message = f"Your worksheet has been submitted for {worksheet['cdr_number']}. Other assigned engineer(s) remain on the job."
-
-    await sender.reply_text(message, reply_markup=get_main_menu(await get_role_for_update(update)))
-    return ConversationHandler.END
-
-
 async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -9482,55 +9335,8 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if menu_result is not None:
         return menu_result
 
-    worksheet = context.user_data.get("worksheet")
-    if not worksheet:
-        await update.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
-        return ConversationHandler.END
-
-    edit_mode = context.user_data.pop("worksheet_review_edit", "")
-    text = str(update.message.text or "").strip()
-    answer = text.upper()
-
-    if edit_mode == "times":
-        parts = [part.strip() for part in text.replace(";", ",").split(",")]
-        if len(parts) != 3:
-            await update.message.reply_text("Please reply with three times like: 08:15, 08:45, 15:30")
-            context.user_data["worksheet_review_edit"] = "times"
-            return REVIEW
-        travel, on_site, off_site = [normalise_helpdesk_time(part) for part in parts]
-        if not travel or not on_site or not off_site:
-            await update.message.reply_text("One of those times was not recognised. Please use 24-hour format, for example: 08:15, 08:45, 15:30")
-            context.user_data["worksheet_review_edit"] = "times"
-            return REVIEW
-        worksheet["EditedVisitTimes"] = {"travel": travel, "on_site": on_site, "off_site": off_site}
-        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
-        return REVIEW
-
-    if edit_mode == "work":
-        worksheet["WorkCompleted"] = text
-        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
-        return REVIEW
-
-    if edit_mode == "materials":
-        worksheet["MaterialsUsed"] = text
-        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
-        return REVIEW
-
-    if edit_mode == "follow_on":
-        lower = text.lower()
-        if lower in ["no", "n", "none", "n/a", "na"]:
-            worksheet["FollowOnRequired"] = False
-            worksheet["FollowOnNotes"] = ""
-        else:
-            worksheet["FollowOnRequired"] = True
-            worksheet["FollowOnNotes"] = text
-        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
-        return REVIEW
-
-    if edit_mode == "no_access_reason":
-        worksheet["NoAccessReason"] = text
-        await update.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
-        return REVIEW
+    answer = update.message.text.strip().upper()
+    worksheet = context.user_data["worksheet"]
 
     if answer == "CANCEL":
         context.user_data.pop("worksheet", None)
@@ -9546,15 +9352,79 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worksheet["photo_files_for_group"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
-        worksheet.pop("EditedVisitTimes", None)
-        await update.message.reply_text(f"Restarting worksheet for {worksheet['cdr_number']}.\n\nWhat work was completed?")
+
+        await update.message.reply_text(
+            f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
+            f"What work was completed?"
+        )
+
         return WORK_COMPLETED
 
     if answer == "SUBMIT":
-        return await submit_worksheet_direct(update, context, update.message)
+        site_id = worksheet["site_id"]
+        jobs_list_id = worksheet["jobs_list_id"]
+        item_id = worksheet["item_id"]
+
+        latest_jobs = get_list_items(site_id, jobs_list_id)
+        job = find_job_by_item_id(latest_jobs, item_id)
+        fields = job["fields"] if job else worksheet["fields"]
+
+        if is_closed_job(fields):
+            context.user_data.pop("worksheet", None)
+            await update.message.reply_text(
+                "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
+                reply_markup=get_main_menu(await get_role_for_update(update)),
+            )
+            return ConversationHandler.END
+
+        assigned_ids_latest = get_assigned_engineer_ids(fields)
+        if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
+            context.user_data.pop("worksheet", None)
+            await update.message.reply_text(
+                "You are no longer assigned to this job. Worksheet has not been submitted.",
+                reply_markup=get_main_menu(await get_role_for_update(update)),
+            )
+            return ConversationHandler.END
+
+        outcome = worksheet.get("JobOutcome", "Completed")
+
+        updated_log = append_engineer_log(
+            fields,
+            worksheet["engineer_name"],
+            f"Submitted for Helpdesk Review - {outcome}",
+            build_visit_comment_extra(worksheet),
+        )
+
+        pending_update = build_pending_review_update_fields(
+            worksheet,
+            fields,
+            updated_log,
+            outcome,
+        )
+
+        update_list_item_fields(site_id, jobs_list_id, item_id, pending_update)
+        PENDING_REVIEW_CACHE[str(item_id)] = worksheet.copy()
+
+        update_active_day_live_status(
+            site_id,
+            str(update.effective_user.id),
+            "Awaiting Helpdesk Review",
+            get_job_reference(fields),
+        )
+
+        await update.message.reply_text(
+            f"Submitted for Helpdesk review:\n\n{worksheet['cdr_number']} → {outcome}\n\n"
+            "You have been removed from this job and can move on. The office will approve or change the outcome.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+
+        await notify_helpdesk_review_required(context, worksheet, fields, outcome)
+
+        context.user_data.pop("worksheet", None)
+        return ConversationHandler.END
 
     await update.message.reply_text(
-        "Please use the buttons below, or type SUBMIT, RESTART or CANCEL.",
+        "Please tap Submit worksheet, Restart worksheet or Cancel.",
         reply_markup=get_review_keyboard(),
     )
     return REVIEW
@@ -9588,78 +9458,81 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
         worksheet["photo_files_for_group"] = []
         worksheet["ClientSignatureRequired"] = False
         worksheet["ClientSignatureReceived"] = False
-        worksheet.pop("EditedVisitTimes", None)
-        await query.message.reply_text(f"Restarting worksheet for {worksheet['cdr_number']}.\n\nWhat work was completed?")
+
+        await query.message.reply_text(
+            f"Restarting worksheet for {worksheet['cdr_number']}.\n\n"
+            f"What work was completed?"
+        )
         return WORK_COMPLETED
 
-    if action == "submit":
-        return await submit_worksheet_direct(update, context, query.message)
-
-    if action == "edit_outcome":
-        await query.message.reply_text("Select the correct outcome:", reply_markup=get_outcome_edit_keyboard())
-        return REVIEW
-
-    if action == "edit_times":
-        current = get_current_visit_times_from_worksheet(worksheet)
-        context.user_data["worksheet_review_edit"] = "times"
+    if action != "submit":
         await query.message.reply_text(
-            "Reply with the correct travel, on site and off site times in this format:\n\n"
-            "08:15, 08:45, 15:30\n\n"
-            f"Current: {current.get('travel') or 'Missing'}, {current.get('on_site') or 'Missing'}, {current.get('off_site') or 'Missing'}"
+            "Please tap Submit worksheet, Restart worksheet or Cancel.",
+            reply_markup=get_review_keyboard(),
         )
         return REVIEW
 
-    if action == "edit_work":
-        context.user_data["worksheet_review_edit"] = "work"
-        await query.message.reply_text("Type the corrected work completed / comments.")
-        return REVIEW
+    site_id = worksheet["site_id"]
+    jobs_list_id = worksheet["jobs_list_id"]
+    item_id = worksheet["item_id"]
 
-    if action == "edit_materials":
-        context.user_data["worksheet_review_edit"] = "materials"
-        await query.message.reply_text("Type the corrected materials used, or None.")
-        return REVIEW
+    latest_jobs = get_list_items(site_id, jobs_list_id)
+    job = find_job_by_item_id(latest_jobs, item_id)
+    fields = job["fields"] if job else worksheet["fields"]
 
-    if action == "edit_follow_on":
-        context.user_data["worksheet_review_edit"] = "follow_on"
-        await query.message.reply_text("Type the follow-on required, or type No if no follow-on is required.")
-        return REVIEW
-
-    if action == "add_photos":
+    if is_closed_job(fields):
+        context.user_data.pop("worksheet", None)
         await query.message.reply_text(
-            "Send any extra job photos now, then type DONE when finished."
+            "This job has already been closed or returned to the office. Worksheet has not been submitted again.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
         )
-        return PHOTOS
-
-    if action == "edit_signature":
-        await query.message.reply_text("Is a client signature required?", reply_markup=get_yes_no_keyboard("signature_required"))
-        return SIGNATURE_REQUIRED
-
-    await query.message.reply_text("Please use one of the final review buttons.", reply_markup=get_review_keyboard())
-    return REVIEW
-
-
-async def worksheet_outcome_edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_group_chat(update):
         return ConversationHandler.END
 
-    query = update.callback_query
-    await query.answer()
-
-    worksheet = context.user_data.get("worksheet")
-    if not worksheet:
-        await query.message.reply_text("Worksheet not found. Tap 📋 My Jobs and try again.", reply_markup=get_main_menu(await get_role_for_update(update)))
+    assigned_ids_latest = get_assigned_engineer_ids(fields)
+    if worksheet["engineer_lookup_id"] not in assigned_ids_latest:
+        context.user_data.pop("worksheet", None)
+        await query.message.reply_text(
+            "You are no longer assigned to this job. Worksheet has not been submitted.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
         return ConversationHandler.END
 
-    outcome = query.data.split("|", 1)[1]
-    worksheet["JobOutcome"] = outcome
+    outcome = worksheet.get("JobOutcome", "Completed")
 
-    if outcome == "No Access" and not worksheet.get("NoAccessReason"):
-        context.user_data["worksheet_review_edit"] = "no_access_reason"
-        await query.message.reply_text("Type the No Access reason / notes.")
-        return REVIEW
+    updated_log = append_engineer_log(
+        fields,
+        worksheet["engineer_name"],
+        f"Submitted for Helpdesk Review - {outcome}",
+        build_visit_comment_extra(worksheet),
+    )
 
-    await query.message.reply_text(build_review_text(worksheet), reply_markup=get_review_keyboard())
-    return REVIEW
+    pending_update = build_pending_review_update_fields(
+        worksheet,
+        fields,
+        updated_log,
+        outcome,
+    )
+
+    update_list_item_fields(site_id, jobs_list_id, item_id, pending_update)
+    PENDING_REVIEW_CACHE[str(item_id)] = worksheet.copy()
+
+    update_active_day_live_status(
+        site_id,
+        str(query.from_user.id),
+        "Awaiting Helpdesk Review",
+        get_job_reference(fields),
+    )
+
+    await query.message.reply_text(
+        f"Submitted for Helpdesk review:\n\n{worksheet['cdr_number']} → {outcome}\n\n"
+        "You have been removed from this job and can move on. The office will approve or change the outcome.",
+        reply_markup=get_main_menu(await get_role_for_update(update)),
+    )
+
+    await notify_helpdesk_review_required(context, worksheet, fields, outcome)
+
+    context.user_data.pop("worksheet", None)
+    return ConversationHandler.END
 
 
 async def worksheet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10465,7 +10338,6 @@ worksheet_handler = ConversationHandler(
         ],
         REVIEW: [
             CallbackQueryHandler(worksheet_review_button, pattern=r"^review\|"),
-            CallbackQueryHandler(worksheet_outcome_edit_button, pattern=r"^review_outcome\|"),
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_review),
         ],
     },
@@ -10512,7 +10384,6 @@ reassign_handler = ConversationHandler(
         REASSIGN_REMOVE_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_remove_engineers)],
         REASSIGN_ASSIGN_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_assign_engineers)],
         REASSIGN_DATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_date)],
-        REASSIGN_TIME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_time)],
         REASSIGN_REASON: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_reason)],
         REASSIGN_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_review)],
     },
@@ -11014,7 +10885,8 @@ telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_PENDING_REVIEWS}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(CallbackQueryHandler(helpdesk_review_button, pattern="^helpdesk_review\\|"))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
