@@ -367,13 +367,35 @@ def build_field_payload_for_list(site_id, list_id, fields):
 def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
 
-    response = requests.patch(
-        url,
-        headers=get_headers(),
-        json=fields_to_update,
-    )
+    # SharePoint Graph rejects the entire update if even one optional column name
+    # is not present in the list.  The pending-review flow must not get stuck
+    # because one helper/audit field has not been created yet, so remove only the
+    # rejected field and retry. Core fields that do exist will still be saved.
+    payload = dict(fields_to_update or {})
+    ignored_fields = []
 
-    if response.status_code not in [200, 204]:
+    while True:
+        response = requests.patch(
+            url,
+            headers=get_headers(),
+            json=payload,
+        )
+
+        if response.status_code in [200, 204]:
+            if ignored_fields:
+                print(f"WARNING: SharePoint ignored missing field(s) on item {item_id}: {', '.join(ignored_fields)}")
+            return
+
+        error_text = response.text or ""
+        match = re.search(r"Field '([^']+)' is not recognized", error_text)
+        if match:
+            missing_field = match.group(1)
+            if missing_field in payload:
+                payload.pop(missing_field, None)
+                payload.pop(f"{missing_field}@odata.type", None)
+                ignored_fields.append(missing_field)
+                continue
+
         raise Exception(f"Could not update item {item_id}: {response.text}")
 
 
@@ -7177,8 +7199,17 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         pending_outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or ""
-        pending_engineer_lookup_id = str(get_field_value(fields, "PendingOutcomeEngineerLookupId", "Pending Outcome Engineer Lookup Id") or "")
-        pending_engineer_name = get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer"
+        cached_pending = PENDING_REVIEW_CACHE.get(str(item_id), {}) or {}
+        pending_engineer_lookup_id = str(
+            cached_pending.get("engineer_lookup_id")
+            or get_field_value(fields, "PendingOutcomeEngineerLookupID", "Pending Outcome Engineer Lookup ID")
+            or ""
+        )
+        pending_engineer_name = get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or cached_pending.get("engineer_name") or "Engineer"
+        if not pending_engineer_lookup_id and pending_engineer_name:
+            matched_engineer = get_engineer_by_name(engineers, pending_engineer_name)
+            if matched_engineer:
+                pending_engineer_lookup_id = str(matched_engineer.get("lookup_id", ""))
         cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
 
         reviewer_name = query.from_user.full_name or str(query.from_user.id)
@@ -9022,6 +9053,25 @@ def get_engineer_by_lookup_id(engineers, lookup_id):
     return None
 
 
+def get_engineer_by_name(engineers, name):
+    target = str(name or "").strip().lower()
+    if not target:
+        return None
+
+    for engineer in engineers or []:
+        fields = engineer.get("fields", {})
+        engineer_name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
+        if engineer_name.lower() == target:
+            lookup_id = str(fields.get("id", "") or engineer.get("id", ""))
+            return {
+                "lookup_id": lookup_id,
+                "name": engineer_name,
+                "telegram_id": str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip(),
+            }
+
+    return None
+
+
 def build_pending_review_update_fields(worksheet, fields, updated_log, outcome):
     """Store engineer submission for Helpdesk review and remove current engineer.
 
@@ -9032,7 +9082,7 @@ def build_pending_review_update_fields(worksheet, fields, updated_log, outcome):
         "PendingHelpdeskReview": True,
         "PendingOutcome": outcome,
         "PendingOutcomeEngineer": worksheet.get("engineer_name", ""),
-        "PendingOutcomeEngineerLookupId": str(worksheet.get("engineer_lookup_id", "")),
+        "PendingOutcomeEngineerLookupID": str(worksheet.get("engineer_lookup_id", "") or ""),
         "PendingOutcomeDateTime": graph_datetime_now(),
         "PendingWorkCompleted": worksheet.get("WorkCompleted", ""),
         "PendingMaterialsUsed": worksheet.get("MaterialsUsed", ""),
@@ -9066,7 +9116,7 @@ def build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id):
         "item_id": item_id,
         "cdr_number": cdr_number,
         "engineer_name": get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer",
-        "engineer_lookup_id": str(get_field_value(fields, "PendingOutcomeEngineerLookupId", "Pending Outcome Engineer Lookup Id") or ""),
+        "engineer_lookup_id": str(cached.get("engineer_lookup_id") or get_field_value(fields, "PendingOutcomeEngineerLookupID", "Pending Outcome Engineer Lookup ID") or ""),
         "JobOutcome": outcome,
         "WorkCompleted": get_field_value(fields, "PendingWorkCompleted", "Pending Work Completed") or "",
         "MaterialsUsed": get_field_value(fields, "PendingMaterialsUsed", "Pending Materials Used") or "",
@@ -9093,7 +9143,7 @@ def clear_pending_review_fields():
         "PendingHelpdeskReview": False,
         "PendingOutcome": "",
         "PendingOutcomeEngineer": "",
-        "PendingOutcomeEngineerLookupId": "",
+        "PendingOutcomeEngineerLookupID": "",
         "PendingOutcomeDateTime": "",
         "PendingWorkCompleted": "",
         "PendingMaterialsUsed": "",
