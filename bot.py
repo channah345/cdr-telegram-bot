@@ -1393,9 +1393,20 @@ def get_engineer_productive_intervals_for_day(jobs_data, engineer_name, work_dat
                 continue
 
             start_text = visit.get("travel") or visit.get("on_site")
-            end_text = visit.get("off_site") or visit.get("on_site")
             interval_start = parse_engineer_log_datetime(date_text, start_text)
-            interval_end = parse_engineer_log_datetime(date_text, end_text)
+
+            # Closed visits should count up to the final outcome/off-site time.
+            # Active visits should keep counting up to the dashboard/end-day calculation time.
+            # This prevents productivity dropping back to zero when a job is no longer the
+            # engineer's current open job, while still preserving the full day audit trail.
+            if visit.get("off_site"):
+                interval_end = parse_engineer_log_datetime(date_text, visit.get("off_site"))
+            elif end_dt:
+                interval_end = end_dt
+            elif visit.get("on_site"):
+                interval_end = parse_engineer_log_datetime(date_text, visit.get("on_site"))
+            else:
+                interval_end = None
 
             if not interval_start or not interval_end or interval_end <= interval_start:
                 continue
@@ -1590,6 +1601,63 @@ def update_active_day_live_status(site_id, telegram_id, status, current_job=""):
     Kept as a no-op so older call sites cannot break the bot.
     """
     return
+
+
+def update_active_day_productivity_snapshot(site_id, telegram_id, engineer_name):
+    """Persist a live productivity snapshot to the engineer's active day log.
+
+    The dashboard calculates live values from EngineerVisitLog, but storing the latest
+    snapshot prevents the card falling back to old/blank values after a job is closed,
+    reassigned, or returned to the office.
+    """
+    try:
+        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        day_logs = get_list_items(site_id, day_logs_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        active_day = find_active_day_log(day_logs, telegram_id)
+
+        if not active_day:
+            return
+
+        day_fields = active_day.get("fields", {})
+        start_time = parse_sharepoint_datetime(get_field_value(day_fields, "StartTime", "Start Time"))
+        if not start_time:
+            return
+
+        hours = calculate_day_pay_hours(
+            start_time,
+            datetime.now(UK_TZ),
+            jobs_data=jobs_data,
+            engineer_name=engineer_name,
+        )
+
+        if not hours:
+            return
+
+        update_payload = build_field_payload_for_list(
+            site_id,
+            day_logs_list_id,
+            {
+                "Productive Hours": hours["productive_hours"],
+                "ProductiveHours": hours["productive_hours"],
+                "Inactive Hours": hours["inactive_hours"],
+                "InactiveHours": hours["inactive_hours"],
+                "Unproductive Hours": hours["inactive_hours"],
+                "UnproductiveHours": hours["inactive_hours"],
+                "Utilisation Percent": hours["utilisation_percent"],
+                "UtilisationPercent": hours["utilisation_percent"],
+                "LastProductivityRefresh": graph_datetime_now(),
+                "Last Productivity Refresh": graph_datetime_now(),
+            },
+        )
+
+        update_list_item_fields(site_id, day_logs_list_id, active_day.get("id"), update_payload)
+
+    except Exception as e:
+        print(f"WARNING: Could not update live productivity snapshot: {e}")
+
+
 
 
 def get_job_reference(fields):
@@ -2728,6 +2796,24 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
             util = live_hours.get("utilisation_percent") if live_hours else "-"
             productive = live_hours.get("productive_hours") if live_hours else "-"
             inactive = live_hours.get("inactive_hours") if live_hours else "-"
+
+            # Do not let the dashboard appear to lose productivity already earned
+            # earlier in the day if SharePoint has a stored snapshot from the last
+            # job status change and the live parser temporarily cannot read a closed job.
+            stored_productive = get_field_value(day_fields, "ProductiveHours", "Productive Hours")
+            stored_inactive = get_field_value(day_fields, "InactiveHours", "Inactive Hours", "UnproductiveHours", "Unproductive Hours")
+            stored_util = get_field_value(day_fields, "UtilisationPercent", "Utilisation Percent")
+            try:
+                if stored_productive not in [None, ""] and productive not in ["-", None, ""]:
+                    productive = max(float(productive), float(stored_productive))
+            except Exception:
+                pass
+            if productive in ["-", None, ""] and stored_productive not in [None, ""]:
+                productive = stored_productive
+            if inactive in ["-", None, ""] and stored_inactive not in [None, ""]:
+                inactive = stored_inactive
+            if util in ["-", None, ""] and stored_util not in [None, ""]:
+                util = stored_util
 
         idle_minutes = 0
         if css == "idle" and current_status_start:
@@ -7348,6 +7434,7 @@ async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
         update_active_day_live_status(site_id, abort_job["user_id"], "Aborted Attendance", get_job_reference(fields))
+        update_active_day_productivity_snapshot(site_id, abort_job["user_id"], engineer_name)
 
         await update.message.reply_text(
             f"Attendance aborted and sent back for reassignment.\n\n"
@@ -7633,6 +7720,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_status,
                 get_job_reference(fields),
             )
+            update_active_day_productivity_snapshot(site_id, user_id, current_engineer["name"])
 
             reply_markup = None
             if selected_status == "Travelling":
@@ -9365,6 +9453,7 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
         update_payload,
         required_fields={"EngineerVisitLog", "WorksheetSubmitted"},
     )
+    update_active_day_productivity_snapshot(site_id, str(update.effective_user.id), worksheet.get("engineer_name", "Engineer"))
 
     if is_final_engineer and outcome in ["Completed", "No Access", "Revisit Required"]:
         await notify_trade_group(context, worksheet, fields, updated_log, outcome)
