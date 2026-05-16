@@ -537,18 +537,16 @@ def get_engineer_menu(include_helpdesk_menu=False):
 def get_helpdesk_menu(include_engineer_menu=False):
     rows = [
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
-        [MENU_REOPEN_JOB],
+        [MENU_REOPEN_JOB, MENU_PENDING_REVIEWS],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
-        [MENU_CANCEL_JOB],
-        [MENU_BUG_IDEA, MENU_UPLOAD_RECEIPTS],
+        [MENU_CANCEL_JOB, MENU_DELETE_JOB] if include_engineer_menu else [MENU_CANCEL_JOB],
         [MENU_QUOTE_REMINDER, MENU_MESSAGE_ENGINEER],
-        [MENU_CANCEL_TASK_ACTIVITY],
-        [MENU_PENDING_REVIEWS],
+        [MENU_CANCEL_TASK_ACTIVITY, MENU_UPLOAD_RECEIPTS],
+        [MENU_BUG_IDEA, MENU_ENGINEER_MENU] if include_engineer_menu else [MENU_BUG_IDEA],
     ]
 
-    if include_engineer_menu:
-        rows.append([MENU_DELETE_JOB])
-        rows.append([MENU_ENGINEER_MENU])
+    if False:
+        pass
 
     return ReplyKeyboardMarkup(
         rows,
@@ -1568,9 +1566,6 @@ def get_job_buttons(item_id, maps_query=None):
     rows = [
         [
             InlineKeyboardButton("🚗 Start Travelling", callback_data=f"status|{item_id}|Travelling"),
-        ],
-        [
-            InlineKeyboardButton("↩️ Undo Travelling", callback_data=f"undo_travelling|{item_id}"),
         ],
         [
             InlineKeyboardButton("📍 Arrived On Site", callback_data=f"status|{item_id}|On Site"),
@@ -7253,7 +7248,6 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
                 worksheet_link,
             )
             update_payload["HelpdeskReviewDecision"] = "Approved Complete"
-            update_payload["Helpdesk Review Decision"] = "Approved Complete"
         else:
             update_payload = {
                 "Status": AWAITING_DEPLOYMENT_STATUS,
@@ -7263,23 +7257,19 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
                 "WorksheetSubmitted": False,
                 "WorksheetGenerated": False,
                 "HelpdeskReviewDecision": f"Approved {final_outcome}",
-                "Helpdesk Review Decision": f"Approved {final_outcome}",
             }
             update_payload.update(clear_engineer_assignment_payload())
 
         update_payload.update({
             "PendingHelpdeskReview": False,
-            "Pending Helpdesk Review": False,
             "HelpdeskApprovedBy": reviewer_name,
-            "Helpdesk Approved By": reviewer_name,
             "HelpdeskApprovedDateTime": graph_datetime_now(),
-            "Helpdesk Approved Date Time": graph_datetime_now(),
         })
 
         # Clear most pending fields after using them.
         clear_payload = clear_pending_review_fields()
         for key, value in clear_payload.items():
-            if key not in ["HelpdeskReviewDecision", "Helpdesk Review Decision", "HelpdeskApprovedBy", "Helpdesk Approved By", "HelpdeskApprovedDateTime", "Helpdesk Approved Date Time"]:
+            if key not in ["HelpdeskReviewDecision", "HelpdeskApprovedBy", "HelpdeskApprovedDateTime", "Helpdesk Approved Date Time"]:
                 update_payload[key] = value
 
         update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
@@ -7486,7 +7476,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             await query.message.reply_text(
-                f"Travelling reversed:\n\n{fields.get('CDRNumber', '')} → Assigned\n\nThe job is still assigned to you."
+                f"Travelling reversed:\n\n{fields.get('CDRNumber', '')} → Assigned\n\nThe job is still assigned to you. You can press Start Travelling again when needed."
             )
 
             await notify_helpdesk(
@@ -7543,8 +7533,15 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 get_job_reference(fields),
             )
 
+            reply_markup = None
+            if selected_status == "Travelling":
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Undo Travelling", callback_data=f"undo_travelling|{item_id}")]
+                ])
+
             await query.message.reply_text(
-                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}"
+                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}",
+                reply_markup=reply_markup,
             )
 
             await notify_helpdesk(
@@ -8390,6 +8387,12 @@ def parse_engineer_visit_log(log_text):
         if is_internal_actor or is_internal_action:
             continue
 
+        if action == "Travelling Reverted":
+            current = active_by_engineer.pop(key, None)
+            if current and current in visits:
+                visits.remove(current)
+            continue
+
         if action == "Travelling":
             # Start a fresh attendance for this engineer.
             active_by_engineer[key] = {
@@ -9027,29 +9030,17 @@ def build_pending_review_update_fields(worksheet, fields, updated_log, outcome):
     payload = {
         "Status": AWAITING_HELPDESK_REVIEW_STATUS,
         "PendingHelpdeskReview": True,
-        "Pending Helpdesk Review": True,
         "PendingOutcome": outcome,
-        "Pending Outcome": outcome,
         "PendingOutcomeEngineer": worksheet.get("engineer_name", ""),
-        "Pending Outcome Engineer": worksheet.get("engineer_name", ""),
         "PendingOutcomeEngineerLookupId": str(worksheet.get("engineer_lookup_id", "")),
-        "Pending Outcome Engineer Lookup Id": str(worksheet.get("engineer_lookup_id", "")),
         "PendingOutcomeDateTime": graph_datetime_now(),
-        "Pending Outcome Date Time": graph_datetime_now(),
         "PendingWorkCompleted": worksheet.get("WorkCompleted", ""),
-        "Pending Work Completed": worksheet.get("WorkCompleted", ""),
         "PendingMaterialsUsed": worksheet.get("MaterialsUsed", ""),
-        "Pending Materials Used": worksheet.get("MaterialsUsed", ""),
         "PendingFollowOnRequired": worksheet.get("FollowOnRequired", False),
-        "Pending Follow On Required": worksheet.get("FollowOnRequired", False),
         "PendingFollowOnNotes": worksheet.get("FollowOnNotes", ""),
-        "Pending Follow On Notes": worksheet.get("FollowOnNotes", ""),
         "PendingNoAccessReason": worksheet.get("NoAccessReason", ""),
-        "Pending No Access Reason": worksheet.get("NoAccessReason", ""),
         "PendingClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
-        "Pending Client Signature Required": worksheet.get("ClientSignatureRequired", False),
         "PendingPhotoCount": len(worksheet.get("photo_links", [])),
-        "Pending Photo Count": len(worksheet.get("photo_links", [])),
         "EngineerVisitLog": updated_log,
         "WorksheetSubmitted": False,
         "WorksheetGenerated": False,
@@ -9100,35 +9091,20 @@ def build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id):
 def clear_pending_review_fields():
     return {
         "PendingHelpdeskReview": False,
-        "Pending Helpdesk Review": False,
         "PendingOutcome": "",
-        "Pending Outcome": "",
         "PendingOutcomeEngineer": "",
-        "Pending Outcome Engineer": "",
         "PendingOutcomeEngineerLookupId": "",
-        "Pending Outcome Engineer Lookup Id": "",
         "PendingOutcomeDateTime": "",
-        "Pending Outcome Date Time": "",
         "PendingWorkCompleted": "",
-        "Pending Work Completed": "",
         "PendingMaterialsUsed": "",
-        "Pending Materials Used": "",
         "PendingFollowOnRequired": False,
-        "Pending Follow On Required": False,
         "PendingFollowOnNotes": "",
-        "Pending Follow On Notes": "",
         "PendingNoAccessReason": "",
-        "Pending No Access Reason": "",
         "PendingClientSignatureRequired": False,
-        "Pending Client Signature Required": False,
         "PendingPhotoCount": "",
-        "Pending Photo Count": "",
         "HelpdeskReviewDecision": "",
-        "Helpdesk Review Decision": "",
         "HelpdeskApprovedBy": "",
-        "Helpdesk Approved By": "",
         "HelpdeskApprovedDateTime": "",
-        "Helpdesk Approved Date Time": "",
     }
 
 
