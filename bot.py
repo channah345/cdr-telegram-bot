@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-deploy-first-v29-undo-travelling"
+BUILD_VERSION = "phase1-deploy-first-v30-helpdesk-safe-task-cancel-menu"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -399,6 +399,59 @@ def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
         raise Exception(f"Could not update item {item_id}: {response.text}")
 
 
+def update_list_item_fields_in_safe_chunks(site_id, list_id, item_id, fields_to_update, required_fields=None, chunk_size=6):
+    """Update SharePoint using small chunks, with individual fallback for optional fields.
+
+    This is used by Helpdesk approval/rejection because those updates can include
+    many optional pending-review/audit fields. One invalid optional field should not
+    block the core status/outcome update. Lookup collection @odata.type keys are
+    kept with their matching LookupId field so Graph receives a valid payload.
+    """
+    required_fields = set(required_fields or [])
+    fields_to_update = dict(fields_to_update or {})
+
+    grouped_items = []
+    consumed = set()
+    for key, value in fields_to_update.items():
+        if key in consumed or key.endswith("@odata.type"):
+            continue
+
+        group = {}
+        odata_key = f"{key}@odata.type"
+        if odata_key in fields_to_update:
+            group[odata_key] = fields_to_update[odata_key]
+            consumed.add(odata_key)
+        group[key] = value
+        consumed.add(key)
+        grouped_items.append(group)
+
+    for key, value in fields_to_update.items():
+        if key not in consumed:
+            grouped_items.append({key: value})
+            consumed.add(key)
+
+    for start in range(0, len(grouped_items), chunk_size):
+        chunk_groups = grouped_items[start:start + chunk_size]
+        chunk_payload = {}
+        for group in chunk_groups:
+            chunk_payload.update(group)
+
+        try:
+            update_list_item_fields(site_id, list_id, item_id, chunk_payload)
+            continue
+        except Exception as chunk_error:
+            print(f"WARNING: SharePoint chunk update failed for item {item_id}; retrying fields individually: {chunk_error}")
+
+        for group in chunk_groups:
+            required_group = any(key in required_fields for key in group.keys())
+            try:
+                update_list_item_fields(site_id, list_id, item_id, group)
+            except Exception as field_error:
+                if required_group:
+                    raise
+                print(f"WARNING: SharePoint optional field skipped on item {item_id}: {', '.join(group.keys())} - {field_error}")
+
+
 def create_list_item_fields(site_id, list_id, fields_to_create):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
 
@@ -557,18 +610,31 @@ def get_engineer_menu(include_helpdesk_menu=False):
 
 
 def get_helpdesk_menu(include_engineer_menu=False):
-    rows = [
-        [MENU_LOG_JOB, MENU_REASSIGN_JOB],
-        [MENU_REOPEN_JOB, MENU_PENDING_REVIEWS],
-        [MENU_OPEN_JOBS, MENU_FIND_JOB],
-        [MENU_CANCEL_JOB, MENU_DELETE_JOB] if include_engineer_menu else [MENU_CANCEL_JOB],
-        [MENU_QUOTE_REMINDER, MENU_MESSAGE_ENGINEER],
-        [MENU_CANCEL_TASK_ACTIVITY, MENU_UPLOAD_RECEIPTS],
-        [MENU_BUG_IDEA, MENU_ENGINEER_MENU] if include_engineer_menu else [MENU_BUG_IDEA],
+    buttons = [
+        MENU_LOG_JOB,
+        MENU_REASSIGN_JOB,
+        MENU_REOPEN_JOB,
+        MENU_PENDING_REVIEWS,
+        MENU_OPEN_JOBS,
+        MENU_FIND_JOB,
+        MENU_CANCEL_JOB,
     ]
 
-    if False:
-        pass
+    if include_engineer_menu:
+        buttons.append(MENU_DELETE_JOB)
+
+    buttons.extend([
+        MENU_QUOTE_REMINDER,
+        MENU_MESSAGE_ENGINEER,
+        MENU_CANCEL_TASK_ACTIVITY,
+        MENU_UPLOAD_RECEIPTS,
+        MENU_BUG_IDEA,
+    ])
+
+    if include_engineer_menu:
+        buttons.append(MENU_ENGINEER_MENU)
+
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
 
     return ReplyKeyboardMarkup(
         rows,
@@ -1865,44 +1931,6 @@ def get_drive_web_url(site_id, drive_name):
 
     raise Exception(f"Document library not found: {drive_name}")
 
-
-def colour_sharepoint_folder_green(site_id, base_folder, folder_name):
-    """Best-effort SharePoint folder colour update.
-
-    If the tenant/app permissions do not allow SharePoint REST folder colouring,
-    the worksheet upload still succeeds and this only logs a warning.
-    """
-    try:
-        site_url = SHAREPOINT_SITE.rstrip("/")
-        drive_web_url = get_drive_web_url(site_id, PHOTO_LIBRARY)
-
-        parsed_drive = urlparse(drive_web_url)
-        library_server_relative = parsed_drive.path.rstrip("/")
-        folder_server_relative = f"{library_server_relative}/{base_folder}/{folder_name}"
-
-        # SharePoint folder colour codes are 0-15. 11 is light green.
-        endpoint = (
-            f"{site_url}/_api/foldercoloring/stampcolor"
-            f"(DecodedUrl='{folder_server_relative}')"
-        )
-
-        body = {
-            "coloringInformation": {
-                "ColorHex": "11"
-            }
-        }
-
-        response = requests.post(
-            endpoint,
-            headers=get_sharepoint_rest_headers(),
-            json=body,
-        )
-
-        if response.status_code not in [200, 201, 204]:
-            print(f"WARNING: Could not colour worksheet folder green: {response.status_code} {response.text}")
-
-    except Exception as e:
-        print(f"WARNING: Could not colour worksheet folder green: {e}")
 
 
 
@@ -7235,7 +7263,13 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
                 update_payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
                 update_payload["EngineerLookupId"] = [int(pending_engineer_lookup_id)]
 
-            update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
+            update_list_item_fields_in_safe_chunks(
+                site_id,
+                jobs_list_id,
+                item_id,
+                update_payload,
+                required_fields={"Status", "EngineerVisitLog", "EngineerLookupId"},
+            )
             PENDING_REVIEW_CACHE.pop(str(item_id), None)
 
             if engineer and engineer.get("telegram_id"):
@@ -7303,7 +7337,13 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
             if key not in ["HelpdeskReviewDecision", "HelpdeskApprovedBy", "HelpdeskApprovedDateTime", "Helpdesk Approved Date Time"]:
                 update_payload[key] = value
 
-        update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
+        update_list_item_fields_in_safe_chunks(
+            site_id,
+            jobs_list_id,
+            item_id,
+            update_payload,
+            required_fields={"Status", "JobOutcome", "EngineerVisitLog"},
+        )
 
         if final_outcome in ["Completed", "No Access", "Revisit Required"]:
             await notify_trade_group(context, worksheet, fields, updated_log, final_outcome)
@@ -9031,7 +9071,6 @@ def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet,
             file_name,
             docx_bytes,
         )
-        colour_sharepoint_folder_green(site_id, WORKSHEET_BASE_FOLDER, worksheet_folder_name)
         return worksheet_link
     except Exception as e:
         print(f"ERROR generating worksheet Word document: {e}")
@@ -9902,12 +9941,25 @@ def task_is_active_or_future(fields):
     return bool(task_date) and task_date >= today
 
 
+def task_assigned_names_from_fields(fields):
+    assigned = task_assigned_names_from_fields(fields)
+    if assigned:
+        return assigned
+
+    # Older records may only have Telegram IDs. Show a useful fallback rather than blank.
+    telegram_ids = task_telegram_ids_from_fields(fields)
+    if telegram_ids:
+        return ", ".join(telegram_ids)
+
+    return ""
+
+
 def format_task_activity_option(index, task):
     fields = task.get("fields", {})
     title = str(get_field_value(fields, "Title") or "Task / Activity")
     task_date = task_date_iso_from_fields(fields)
     time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "")
-    assigned = str(get_field_value(fields, "AssignedNames", "Assigned Names") or "").strip()
+    assigned = task_assigned_names_from_fields(fields)
     details = str(get_field_value(fields, "TaskDetails", "Task Details") or "").strip()
 
     line = f"{index}. {title} | {task_date or 'No date'}"
@@ -9916,16 +9968,16 @@ def format_task_activity_option(index, task):
     if assigned:
         line += f" | {assigned}"
     if details:
-        short_details = details.replace("\\n", " ")
+        short_details = details.replace("\\n", " ").replace("\n", " ")
         if len(short_details) > 70:
             short_details = short_details[:67] + "..."
-        line += f"\\n   {short_details}"
+        line += f"\n   {short_details}"
     return line
 
 
 def task_telegram_ids_from_fields(fields):
     telegram_ids_raw = str(get_field_value(fields, "AssignedTelegramIDs", "Assigned Telegram IDs") or "")
-    return [x.strip() for x in re.split(r"[\\n,;]+", telegram_ids_raw) if x.strip()]
+    return [x.strip() for x in re.split(r"[\n,;]+", telegram_ids_raw) if x.strip()]
 
 
 async def start_cancel_task_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9956,9 +10008,9 @@ async def start_cancel_task_activity(update: Update, context: ContextTypes.DEFAU
     context.user_data["cancel_task_list_id"] = tasks_list_id
     context.user_data["cancel_task_items"] = active_tasks
 
-    options = "\\n\\n".join(format_task_activity_option(i, task) for i, task in enumerate(active_tasks, start=1))
+    options = "\n\n".join(format_task_activity_option(i, task) for i, task in enumerate(active_tasks, start=1))
     await update.message.reply_text(
-        "Which Task / Activity do you want to cancel? Reply with the number.\\n\\n" + options,
+        "Which Task / Activity do you want to cancel? Reply with the number.\n\n" + options,
         reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
     )
     return CANCEL_TASK_SELECT
@@ -10000,15 +10052,15 @@ async def cancel_task_reason(update: Update, context: ContextTypes.DEFAULT_TYPE)
     title = str(get_field_value(fields, "Title") or "Task / Activity")
     task_date = task_date_iso_from_fields(fields)
     time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "")
-    assigned = str(get_field_value(fields, "AssignedNames", "Assigned Names") or "").strip()
+    assigned = task_assigned_names_from_fields(fields)
 
     await update.message.reply_text(
-        "Review cancellation:\\n\\n"
-        f"Task: {title}\\n"
-        f"Date: {task_date or 'N/A'}\\n"
-        f"Time: {time_text or 'N/A'}\\n"
-        f"Assigned: {assigned or 'N/A'}\\n\\n"
-        f"Reason:\\n{reason}\\n\\n"
+        "Review cancellation:\n\n"
+        f"Task: {title}\n"
+        f"Date: {task_date or 'N/A'}\n"
+        f"Time: {time_text or 'N/A'}\n"
+        f"Assigned: {assigned or 'N/A'}\n\n"
+        f"Reason:\n{reason}\n\n"
         "Reply YES to cancel and notify, or NO to stop.",
         reply_markup=get_review_reply_keyboard(),
     )
@@ -10063,12 +10115,12 @@ async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await context.bot.send_message(
                 chat_id=telegram_id,
                 text=(
-                    "❌ Task / Activity Cancelled\\n\\n"
-                    "Please do not attend the following:\\n\\n"
-                    f"{title}\\n"
-                    f"Date: {task_date or 'N/A'}\\n"
-                    f"Time: {time_text or 'N/A'}\\n\\n"
-                    f"{details}\\n\\n"
+                    "❌ Task / Activity Cancelled\n\n"
+                    "Please do not attend the following:\n\n"
+                    f"{title}\n"
+                    f"Date: {task_date or 'N/A'}\n"
+                    f"Time: {time_text or 'N/A'}\n\n"
+                    f"{details}\n\n"
                     f"Reason: {reason}"
                 ),
             )
@@ -10081,11 +10133,11 @@ async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await context.bot.send_message(
                 chat_id=HELPDESK_CHAT_ID,
                 text=(
-                    "❌ Task / Activity cancelled\\n\\n"
-                    f"Task: {title}\\n"
-                    f"Date: {task_date or 'N/A'}\\n"
-                    f"Time: {time_text or 'N/A'}\\n"
-                    f"Reason: {reason}\\n"
+                    "❌ Task / Activity cancelled\n\n"
+                    f"Task: {title}\n"
+                    f"Date: {task_date or 'N/A'}\n"
+                    f"Time: {time_text or 'N/A'}\n"
+                    f"Reason: {reason}\n"
                     f"Notified: {len(sent)}"
                 ),
             )
@@ -10094,7 +10146,7 @@ async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     reply = f"Task / Activity cancelled and notification sent to {len(sent)} recipient(s)."
     if failed:
-        reply += "\\n\\nFailed to notify:\\n" + "\\n".join(failed)
+        reply += "\n\nFailed to notify:\n" + "\n".join(failed)
 
     await update.message.reply_text(reply, reply_markup=get_helpdesk_menu(include_engineer_menu=True))
     return ConversationHandler.END
