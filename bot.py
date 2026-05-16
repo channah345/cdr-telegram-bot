@@ -55,13 +55,14 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "dashboard-ops-centre-v22"
+BUILD_VERSION = "phase1-deploy-first-v28"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
 DAY_LOGS_LIST = "Engineer Day Logs"
 BUG_IDEAS_LIST = "Bug Ideas"
 BOT_USERS_LIST = "Bot Users"
+TASK_ACTIVITIES_LIST = "Task Activities"
 
 
 PHOTO_LIBRARY = "Documents"
@@ -81,9 +82,12 @@ MENU_BUG_IDEA = "🐞 Bug / Ideas"
 MENU_UPLOAD_RECEIPTS = "🧾 Receipts / Returns"
 MENU_REQUEST_JOB = "📣 Request Job"
 MENU_QUOTE_REMINDER = "📋 Task / Activity"
+MENU_MESSAGE_ENGINEER = "📢 Message Engineer"
+MENU_CANCEL_TASK_ACTIVITY = "❌ Cancel Task / Activity"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
+MENU_REOPEN_JOB = "♻️ Reopen Job"
 MENU_OPEN_JOBS = "📋 Open Jobs"
 MENU_FIND_JOB = "🔎 Find Job"
 MENU_CANCEL_JOB = "❌ Cancel Job"
@@ -95,7 +99,9 @@ UK_TZ = ZoneInfo("Europe/London")
 
 
 VAN_CHECK_INTERVAL_DAYS = 14
+# Apprentice role supported. Apprentice users can be excluded from van/mileage prompts in the Start/End Day flow.
 AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
+AWAITING_HELPDESK_REVIEW_STATUS = "Awaiting Helpdesk Review"
 LEGACY_AWAITING_DEPLOYMENT_STATUS = "Awaiting Deployment"
 ASSIGNED_STATUS = "Assigned"
 TRAVELLING_STATUS = "Travelling"
@@ -160,6 +166,19 @@ QUOTE_TIME = 67
 QUOTE_SCOPE = 68
 QUOTE_REVIEW = 69
 QUOTE_RECIPIENT = 70
+MESSAGE_ENGINEER_SELECT = 71
+MESSAGE_ENGINEER_TEMPLATE = 72
+MESSAGE_ENGINEER_TEXT = 73
+MESSAGE_ENGINEER_REVIEW = 74
+CANCEL_TASK_SELECT = 75
+CANCEL_TASK_REASON = 76
+CANCEL_TASK_REVIEW = 77
+REASSIGN_DATE = 78
+REOPENJOB_CDR_NUMBER = 79
+REOPENJOB_DATE = 80
+REOPENJOB_ASSIGN_ENGINEERS = 81
+REOPENJOB_REASON = 82
+REOPENJOB_REVIEW = 83
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -513,10 +532,12 @@ def get_engineer_menu(include_helpdesk_menu=False):
 def get_helpdesk_menu(include_engineer_menu=False):
     rows = [
         [MENU_LOG_JOB, MENU_REASSIGN_JOB],
+        [MENU_REOPEN_JOB],
         [MENU_OPEN_JOBS, MENU_FIND_JOB],
         [MENU_CANCEL_JOB],
         [MENU_BUG_IDEA, MENU_UPLOAD_RECEIPTS],
-        [MENU_QUOTE_REMINDER],
+        [MENU_QUOTE_REMINDER, MENU_MESSAGE_ENGINEER],
+        [MENU_CANCEL_TASK_ACTIVITY],
     ]
 
     if include_engineer_menu:
@@ -597,7 +618,7 @@ def get_bot_user_role(site_id, telegram_id):
 
         role = str(get_field_value(fields, "Role") or "Engineer").strip()
 
-        if role.lower() in ["admin", "helpdesk", "engineer"]:
+        if role.lower() in ["admin", "helpdesk", "engineer", "apprentice"]:
             return role.title()
 
         return "Engineer"
@@ -608,6 +629,10 @@ def get_bot_user_role(site_id, telegram_id):
 
 def user_can_use_helpdesk(role):
     return str(role or "").strip().lower() in ["helpdesk", "admin"]
+
+def role_counts_for_utilisation(role):
+    return str(role or "").strip().lower() == "engineer"
+
 
 
 JOB_CATEGORY_CHOICES = [
@@ -689,6 +714,67 @@ def parse_helpdesk_job_date(value):
     return None
 
 
+
+def parse_task_activity_datetime(value):
+    """Parse Task / Activity date input into ISO date and display text."""
+    raw = str(value or "").strip()
+    parsed_date = parse_helpdesk_job_date(raw)
+    if parsed_date:
+        return parsed_date, format_sharepoint_date(parsed_date) or parsed_date, ""
+
+    # Accept date/time in one line: 15/05/2026 10:00 or Today 10:00
+    parts = raw.split()
+    if len(parts) >= 2:
+        candidate_date = " ".join(parts[:-1])
+        candidate_time = parts[-1]
+        parsed_date = parse_helpdesk_job_date(candidate_date)
+        parsed_time = normalise_helpdesk_time(candidate_time)
+        if parsed_date:
+            return parsed_date, format_sharepoint_date(parsed_date) or parsed_date, parsed_time or ""
+
+    return None, "", ""
+
+
+def create_task_activity_record(site_id, reminder):
+    """Store Task / Activity so 08:00 reminders and cancellation survive restarts."""
+    tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
+    recipients = reminder.get("recipients_selected") or [reminder.get("recipient", {})]
+    telegram_ids = [str(r.get("telegram_id", "")).strip() for r in recipients if str(r.get("telegram_id", "")).strip()]
+    names = [str(r.get("name", "")).strip() for r in recipients if str(r.get("name", "")).strip()]
+    details = (
+        f"Client/Site: {reminder.get('client', '')}\n"
+        f"Address/Site: {reminder.get('address', '')}\n"
+        f"Details: {reminder.get('scope', '')}\n"
+        f"Sent by: {reminder.get('set_by', 'Helpdesk')}"
+    )
+    task_date = reminder.get("date") or get_today_iso()
+    reminder_sent = task_date <= get_today_iso()
+    payload = build_field_payload_for_list(
+        site_id,
+        tasks_list_id,
+        {
+            "Title": reminder.get("client") or reminder.get("scope") or "Task / Activity",
+            "TaskDate": task_date,
+            "Task Date": task_date,
+            "TaskTime": reminder.get("time", ""),
+            "Task Time": reminder.get("time", ""),
+            "TaskDetails": details,
+            "Task Details": details,
+            "AssignedTelegramIDs": "\n".join(telegram_ids),
+            "Assigned Telegram IDs": "\n".join(telegram_ids),
+            "AssignedNames": ", ".join(names),
+            "Assigned Names": ", ".join(names),
+            "Status": "Active",
+            "ReminderSent": reminder_sent,
+            "Reminder Sent": reminder_sent,
+            "CreatedBy": reminder.get("set_by", "Helpdesk"),
+            "Created By": reminder.get("set_by", "Helpdesk"),
+            "CreatedDateTime": graph_datetime_now(),
+            "Created Date Time": graph_datetime_now(),
+        },
+    )
+    return create_list_item_fields(site_id, tasks_list_id, payload)
+
 def normalise_helpdesk_time(value):
     text = str(value or "").strip().lower().replace(".", ":")
 
@@ -723,7 +809,7 @@ def get_active_assignable_engineers(engineers):
             continue
 
         # Admins can be assigned if needed, but Helpdesk-only users should not receive engineering jobs.
-        if role not in ["engineer", "admin"]:
+        if role not in ["engineer", "admin", "apprentice"]:
             continue
 
         if lookup_id and name and telegram_id:
@@ -1476,7 +1562,7 @@ def get_job_buttons(item_id, maps_query=None):
             InlineKeyboardButton("📍 Arrived On Site", callback_data=f"status|{item_id}|On Site"),
         ],
         [
-            InlineKeyboardButton("✅ Complete Job", callback_data=f"start_worksheet|{item_id}|Completed"),
+            InlineKeyboardButton("✅ Complete Job", callback_data=f"confirm_outcome|{item_id}|Completed"),
         ],
         [
             InlineKeyboardButton("🔁 Revisit Required", callback_data=f"confirm_outcome|{item_id}|Revisit Required"),
@@ -1491,7 +1577,7 @@ def get_job_buttons(item_id, maps_query=None):
 
     if maps_query:
         maps_url = (
-            "https://www.google.com/maps/search/?api=1&query="
+            "https://www.google.com/maps/dir/?api=1&destination="
             + quote_plus(str(maps_query))
         )
         rows.append([
@@ -1537,7 +1623,7 @@ def is_closed_job(fields):
     if status in open_statuses:
         return False
 
-    return status in ["No Access", "Revisit Required"] or outcome in ["No Access", "Revisit Required"]
+    return status in ["No Access", "Revisit Required", AWAITING_HELPDESK_REVIEW_STATUS] or outcome in ["No Access", "Revisit Required"]
 
 
 def has_engineer_action(fields, engineer_name, action):
@@ -1827,7 +1913,6 @@ def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url):
 
     image_base64 = signature_data_url.split(",", 1)[1]
     image_bytes = base64.b64decode(image_base64)
-    image_bytes = prepare_signature_image_for_export(image_bytes)
     file_name = f"{cdr_number}_client_signature_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.png"
 
     return upload_file_to_sharepoint(
@@ -2338,7 +2423,7 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
             continue
 
         role = str(get_field_value(fields, "Role") or "Engineer").strip().lower()
-        if role not in ["engineer", "admin"]:
+        if role not in ["engineer", "admin", "apprentice"]:
             continue
 
         name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "").strip()
@@ -2487,6 +2572,7 @@ def dashboard_engineer_rows(engineers, day_logs, jobs_data):
             "last": f"{last_event['label']} - {last_event['cdr']}" if last_event else "-",
             "sort_rank": sort_rank,
             "idle_minutes": idle_minutes,
+            "telegram_id": telegram_id,
         })
 
     rows.sort(key=lambda row: (row["sort_rank"], str(row["name"]).lower()))
@@ -2691,108 +2777,52 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
     nav = dashboard_nav(view, token)
     ops = dashboard_ops_summary(rows, job_rows)
 
-    def render_control_feed():
-        feed_rows = []
-        priority_jobs = [job for job in job_rows if job.get("overdue") or job.get("awaiting") or job.get("open")][:9]
-        for job in priority_jobs:
-            marker = "danger" if job.get("overdue") else "amber" if job.get("awaiting") else "blue"
-            label = "Overdue" if job.get("overdue") else "Awaiting dispatch" if job.get("awaiting") else "Live job"
-            feed_rows.append(f"""
-                <div class='feed-item'>
-                    <span class='feed-dot {marker}'></span>
-                    <div>
-                        <strong>{html_safe(job['cdr'])} · {html_safe(job['site'])}</strong>
-                        <small>{html_safe(label)} · {html_safe(job['assigned'])} · {html_safe(job['date'])}</small>
-                    </div>
-                </div>
-            """)
-        if not feed_rows:
-            return "<div class='empty premium-empty'>No live exceptions showing.</div>"
-        return "".join(feed_rows)
-
     top_metrics = f"""
-        <div class='summary-card hero-stat'><span>Active Engineers</span><strong>{html_safe(ops['active_engineers'])}</strong><em>Currently clocked in</em></div>
-        <div class='summary-card hero-stat'><span>Open Jobs</span><strong>{html_safe(ops['open_jobs'])}</strong><em>Live workload</em></div>
-        <div class='summary-card hero-stat amber'><span>Awaiting Dispatch</span><strong>{html_safe(ops['awaiting_dispatch'])}</strong><em>Needs allocation</em></div>
-        <div class='summary-card hero-stat danger'><span>Overdue</span><strong>{html_safe(ops['overdue'])}</strong><em>Requires attention</em></div>
-        <div class='summary-card hero-stat good'><span>Completed Today</span><strong>{html_safe(ops['completed_today'])}</strong><em>Closed out</em></div>
-        <div class='summary-card hero-stat blue'><span>Revisit</span><strong>{html_safe(ops['revisit'])}</strong><em>Follow-up queue</em></div>
-        <div class='summary-card hero-stat slate'><span>No Access</span><strong>{html_safe(ops['no_access'])}</strong><em>Exceptions</em></div>
-    """
-
-    control_room = f"""
-        <section class='control-room'>
-            <div class='control-left'>
-                <div class='eyebrow'>CDR Live Operations</div>
-                <h1>{html_safe(title if 'title' in locals() else 'Engineer Dashboard')}</h1>
-                <p>Engineer status, priority jobs and live exceptions in one control-room view.</p>
-            </div>
-            <div class='control-right'>
-                <div class='control-chip'><span>Refresh</span><strong>30s</strong></div>
-                <div class='control-chip'><span>Updated</span><strong>{html_safe(generated[-8:] if generated else '')}</strong></div>
-            </div>
-        </section>
+        <div class='summary-card'><span>Active Engineers</span><strong>{html_safe(ops['active_engineers'])}</strong></div>
+        <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(ops['open_jobs'])}</strong></div>
+        <div class='summary-card amber'><span>Awaiting Dispatch</span><strong>{html_safe(ops['awaiting_dispatch'])}</strong></div>
+        <div class='summary-card danger'><span>Overdue</span><strong>{html_safe(ops['overdue'])}</strong></div>
+        <div class='summary-card good'><span>Completed Today</span><strong>{html_safe(ops['completed_today'])}</strong></div>
+        <div class='summary-card blue'><span>Revisit</span><strong>{html_safe(ops['revisit'])}</strong></div>
+        <div class='summary-card'><span>No Access</span><strong>{html_safe(ops['no_access'])}</strong></div>
     """
 
     if view == "ops":
+        content = f"""
+            <section class='summary'>{top_metrics}</section>
+            <section class='panel-grid'>
+                <div class='panel'><h2>Priority Queue</h2>{render_job_table(job_rows, 'open')}</div>
+                <div class='panel'><h2>Engineer Snapshot</h2><div class='mini-grid'>{engineer_cards_html}</div></div>
+            </section>
+        """
         title = "Ops Board"
-        content = f"""
-            <section class='summary premium-summary'>{top_metrics}</section>
-            <section class='ops-layout'>
-                <div class='panel priority-panel'><div class='panel-title'><h2>Priority Queue</h2><span>Open / overdue / awaiting</span></div>{render_job_table(job_rows, 'open')}</div>
-                <aside class='side-stack'>
-                    <div class='panel'><div class='panel-title'><h2>Live Activity</h2><span>Auto-refreshed</span></div><div class='feed'>{render_control_feed()}</div></div>
-                    <div class='panel'><div class='panel-title'><h2>Engineer Snapshot</h2><span>Today</span></div><div class='mini-grid'>{engineer_cards_html}</div></div>
-                </aside>
-            </section>
-        """
     elif view == "jobs":
+        content = f"<section class='summary'>{top_metrics}</section><section class='panel'><h2>Open Jobs</h2>{render_job_table(job_rows, 'open')}</section>"
         title = "Open Jobs"
-        content = f"<section class='summary premium-summary'>{top_metrics}</section><section class='panel priority-panel'><div class='panel-title'><h2>Open Jobs</h2><span>Dispatch list</span></div>{render_job_table(job_rows, 'open')}</section>"
     elif view == "sla":
+        content = f"<section class='summary'>{top_metrics}</section><section class='panel'><h2>SLA / Overdue Jobs</h2>{render_job_table(job_rows, 'sla')}</section>"
         title = "SLA / Overdue"
-        content = f"<section class='summary premium-summary'>{top_metrics}</section><section class='panel priority-panel'><div class='panel-title'><h2>SLA / Overdue Jobs</h2><span>Red items first</span></div>{render_job_table(job_rows, 'sla')}</section>"
     elif view == "reports":
+        content = f"""
+            <section class='summary'>{top_metrics}</section>
+            <section class='panel-grid'>
+                <div class='panel'><h2>Today / Exceptions</h2>{render_job_table(job_rows, 'reports')}</div>
+                <div class='panel'><h2>Notes</h2><div class='empty'>This page is read-only for now. Next stage can add weekly reports, engineer performance and client summaries.</div></div>
+            </section>
+        """
         title = "Reports"
-        content = f"""
-            <section class='summary premium-summary'>{top_metrics}</section>
-            <section class='ops-layout'>
-                <div class='panel priority-panel'><div class='panel-title'><h2>Today / Exceptions</h2><span>Completed, revisit and no access</span></div>{render_job_table(job_rows, 'reports')}</div>
-                <aside class='side-stack'><div class='panel'><div class='panel-title'><h2>Next Stage</h2><span>Read-only</span></div><div class='empty premium-empty'>Weekly reports, engineer performance and client summaries can be added next without changing the engineer workflow.</div></div></aside>
-            </section>
-        """
     else:
-        title = "Engineer Dashboard"
         metric_cards = f"""
-            <div class='summary-card hero-stat'><span>Active</span><strong>{html_safe(summary['active'])}</strong><em>Working today</em></div>
-            <div class='summary-card hero-stat good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong><em>At location</em></div>
-            <div class='summary-card hero-stat blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong><em>En route</em></div>
-            <div class='summary-card hero-stat amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong><em>Needs review</em></div>
-            <div class='summary-card hero-stat'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong><em>Assigned today</em></div>
-            <div class='summary-card hero-stat good'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong><em>Closed</em></div>
-            <div class='summary-card hero-stat slate'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong><em>Productive time</em></div>
+            <div class='summary-card'><span>Active</span><strong>{html_safe(summary['active'])}</strong></div>
+            <div class='summary-card good'><span>On Site</span><strong>{html_safe(summary['on_site'])}</strong></div>
+            <div class='summary-card blue'><span>Travelling</span><strong>{html_safe(summary['travelling'])}</strong></div>
+            <div class='summary-card amber'><span>Idle</span><strong>{html_safe(summary['idle'])}</strong></div>
+            <div class='summary-card'><span>Open Jobs</span><strong>{html_safe(summary['open_jobs'])}</strong></div>
+            <div class='summary-card'><span>Completed Today</span><strong>{html_safe(summary['completed_today'])}</strong></div>
+            <div class='summary-card'><span>Avg Utilisation</span><strong>{html_safe(summary['average_util'])}%</strong></div>
         """
-        content = f"""
-            <section class='summary premium-summary'>{metric_cards}</section>
-            <section class='dashboard-split'>
-                <div class='engineer-board'><div class='section-heading'><h2>Engineer Control Board</h2><span>Live status cards</span></div><div class='grid'>{engineer_cards_html if engineer_cards_html else '<p>No engineers found.</p>'}</div></div>
-                <aside class='panel live-panel'><div class='panel-title'><h2>Live Activity</h2><span>Exceptions & queue</span></div><div class='feed'>{render_control_feed()}</div></aside>
-            </section>
-        """
-
-    control_room = f"""
-        <section class='control-room'>
-            <div class='control-left'>
-                <div class='eyebrow'>CDR Live Operations</div>
-                <h1>{html_safe(title)}</h1>
-                <p>Engineer status, priority jobs and live exceptions in one control-room view.</p>
-            </div>
-            <div class='control-right'>
-                <div class='control-chip'><span>Refresh</span><strong>30s</strong></div>
-                <div class='control-chip'><span>Updated</span><strong>{html_safe(generated[-8:] if generated else '')}</strong></div>
-            </div>
-        </section>
-    """
+        content = f"<section class='summary'>{metric_cards}</section><section class='grid'>{engineer_cards_html if engineer_cards_html else '<p>No engineers found.</p>'}</section>"
+        title = "Engineer Dashboard"
 
     return HTMLResponse(f"""
 <!DOCTYPE html>
@@ -2803,95 +2833,157 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
     <meta http-equiv='refresh' content='30'>
     <style>
         :root {{
-            --orange:#f58220; --orange-2:#ffb15f; --ink:#e5eefb; --muted:#94a3b8; --muted-2:#64748b;
-            --bg:#070b12; --panel:#0f172a; --panel-2:#111c31; --glass:rgba(255,255,255,.07); --line:rgba(148,163,184,.20);
-            --green:#22c55e; --blue:#38bdf8; --amber:#f59e0b; --red:#ef4444; --purple:#a78bfa; --grey:#64748b;
-            --radius:24px; --shadow:0 24px 70px rgba(0,0,0,.32);
+            --orange:#f58220; --dark:#0f172a; --muted:#64748b; --bg:#eef2f7; --card:#ffffff; --line:#e5e7eb;
+            --green:#16a34a; --blue:#2563eb; --amber:#f59e0b; --red:#dc2626; --purple:#7c3aed; --grey:#6b7280;
         }}
-        * {{ box-sizing:border-box; }}
-        body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; background:
-            radial-gradient(circle at top left, rgba(245,130,32,.22), transparent 34rem),
-            radial-gradient(circle at 82% 10%, rgba(56,189,248,.14), transparent 28rem),
-            linear-gradient(180deg, #05070c 0%, #0b1220 48%, #070b12 100%); color:var(--ink); min-height:100vh; }}
-        body:before {{ content:''; position:fixed; inset:0; pointer-events:none; background-image:linear-gradient(rgba(255,255,255,.026) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.026) 1px, transparent 1px); background-size:38px 38px; mask-image:linear-gradient(to bottom, black, transparent 75%); }}
-        header {{ position:sticky; top:0; z-index:10; backdrop-filter:blur(18px); background:rgba(7,11,18,.82); border-bottom:1px solid var(--line); }}
-        .topbar {{ width:min(1500px, calc(100% - 36px)); margin:0 auto; padding:16px 0; display:flex; align-items:center; justify-content:space-between; gap:22px; }}
-        .brand-lockup {{ display:flex; align-items:center; gap:14px; min-width:220px; }}
-        .logo-frame {{ background:rgba(255,255,255,.96); padding:8px 12px; border-radius:18px; box-shadow:0 18px 45px rgba(0,0,0,.35); }}
-        .logo-frame img {{ height:48px; width:auto; max-width:230px; object-fit:contain; display:block; }}
-        .brand-text strong {{ display:block; font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:#fff; }}
-        .brand-text span {{ display:block; margin-top:3px; color:var(--muted); font-size:12px; }}
-        nav {{ display:flex; justify-content:center; gap:8px; flex-wrap:wrap; padding:7px; border:1px solid var(--line); background:rgba(255,255,255,.05); border-radius:999px; }}
-        nav a {{ color:var(--muted); text-decoration:none; padding:10px 14px; border-radius:999px; font-weight:800; font-size:13px; transition:all .18s ease; }}
-        nav a:hover {{ color:#fff; background:rgba(255,255,255,.08); }}
-        nav a.active {{ color:#111827; background:linear-gradient(135deg, var(--orange), var(--orange-2)); box-shadow:0 12px 30px rgba(245,130,32,.28); }}
-        .build-pill {{ color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:10px 12px; font-weight:800; font-size:12px; background:rgba(255,255,255,.045); }}
-        .wrap {{ width:min(1500px, calc(100% - 36px)); margin:0 auto; padding:24px 0 34px; }}
-        .control-room {{ display:flex; align-items:flex-end; justify-content:space-between; gap:22px; margin:12px 0 20px; padding:28px; border:1px solid var(--line); border-radius:32px; background:linear-gradient(135deg, rgba(255,255,255,.09), rgba(255,255,255,.035)); box-shadow:var(--shadow); overflow:hidden; position:relative; }}
-        .control-room:after {{ content:''; position:absolute; right:-90px; top:-90px; width:260px; height:260px; border-radius:50%; background:rgba(245,130,32,.20); filter:blur(12px); }}
-        .eyebrow {{ color:var(--orange-2); font-weight:950; text-transform:uppercase; letter-spacing:.18em; font-size:12px; }}
-        .control-room h1 {{ position:relative; margin:8px 0 8px; font-size:clamp(34px, 5vw, 62px); line-height:.95; letter-spacing:-.06em; }}
-        .control-room p {{ margin:0; color:var(--muted); font-size:16px; max-width:720px; }}
-        .control-right {{ display:flex; gap:10px; position:relative; z-index:1; }}
-        .control-chip {{ min-width:112px; padding:13px 15px; border-radius:18px; background:rgba(0,0,0,.24); border:1px solid var(--line); }}
-        .control-chip span {{ display:block; color:var(--muted); font-size:11px; text-transform:uppercase; font-weight:900; letter-spacing:.1em; }}
-        .control-chip strong {{ display:block; margin-top:4px; font-size:18px; }}
-        .premium-summary {{ display:grid; grid-template-columns:repeat(7, minmax(130px, 1fr)); gap:14px; margin:0 0 20px; }}
-        .summary-card {{ position:relative; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,.092), rgba(255,255,255,.04)); border:1px solid var(--line); border-radius:22px; padding:17px 18px; box-shadow:0 18px 48px rgba(0,0,0,.20); }}
-        .summary-card:before {{ content:''; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--orange); }}
-        .summary-card.good:before {{ background:var(--green); }} .summary-card.blue:before {{ background:var(--blue); }} .summary-card.amber:before {{ background:var(--amber); }} .summary-card.danger:before {{ background:var(--red); }} .summary-card.slate:before {{ background:var(--grey); }}
-        .summary-card span {{ display:block; color:var(--muted); font-size:11px; font-weight:950; text-transform:uppercase; letter-spacing:.12em; }}
-        .summary-card strong {{ display:block; margin-top:7px; font-size:32px; line-height:1; letter-spacing:-.04em; }}
-        .summary-card em {{ display:block; margin-top:8px; color:var(--muted-2); font-style:normal; font-size:12px; font-weight:700; }}
-        .dashboard-split {{ display:grid; grid-template-columns:minmax(0, 1fr) 380px; gap:18px; align-items:start; }}
-        .ops-layout {{ display:grid; grid-template-columns:minmax(0, 1.28fr) 480px; gap:18px; align-items:start; }}
-        .side-stack {{ display:grid; gap:18px; }}
-        .section-heading, .panel-title {{ display:flex; align-items:flex-end; justify-content:space-between; gap:14px; margin:0 0 14px; }}
-        .section-heading h2, .panel-title h2 {{ margin:0; font-size:22px; letter-spacing:-.035em; }}
-        .section-heading span, .panel-title span {{ color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:.12em; }}
-        .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:18px; align-items:stretch; }}
-        .mini-grid {{ display:grid; grid-template-columns:1fr; gap:12px; }}
-        .panel, .card {{ background:linear-gradient(180deg, rgba(17,28,49,.94), rgba(15,23,42,.96)); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); }}
-        .panel {{ padding:18px; }}
-        .card {{ position:relative; min-height:285px; padding:20px; overflow:hidden; }}
-        .card:before {{ content:''; position:absolute; inset:0 auto 0 0; width:6px; background:var(--grey); }}
-        .card:after {{ content:''; position:absolute; right:-50px; top:-70px; width:160px; height:160px; border-radius:50%; background:rgba(255,255,255,.05); }}
-        .card.on-site:before {{ background:var(--green); box-shadow:0 0 24px rgba(34,197,94,.48); }} .card.travelling:before {{ background:var(--blue); box-shadow:0 0 24px rgba(56,189,248,.42); }} .card.active:before {{ background:var(--purple); }} .card.idle:before {{ background:var(--amber); }} .card.ended:before {{ background:var(--grey); }} .card.not-started:before {{ background:var(--red); }}
-        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; position:relative; z-index:1; }}
-        .identity {{ display:flex; gap:13px; align-items:center; min-width:0; }}
-        .avatar {{ width:52px; height:52px; flex:0 0 52px; border-radius:19px; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg, #1e293b, #020617); color:#fff; font-weight:950; box-shadow:inset 0 1px 0 rgba(255,255,255,.10), 0 12px 28px rgba(0,0,0,.28); }}
-        h2 {{ margin:0; font-size:22px; letter-spacing:-.035em; }}
-        .status {{ display:inline-flex; align-items:center; gap:5px; margin-top:8px; padding:7px 10px; border-radius:999px; background:rgba(255,255,255,.07); border:1px solid var(--line); color:#dbeafe; font-size:12px; font-weight:900; }}
-        .util {{ min-width:78px; text-align:center; border-radius:18px; padding:10px 11px; font-weight:950; font-size:17px; color:white; background:#334155; box-shadow:inset 0 1px 0 rgba(255,255,255,.12); }} .util-good {{ background:linear-gradient(135deg, #15803d, var(--green)); }} .util-mid {{ background:linear-gradient(135deg, #b45309, var(--amber)); color:#111827; }} .util-low {{ background:linear-gradient(135deg, #b91c1c, var(--red)); }} .util-none {{ background:#334155; }}
-        .main-status {{ margin-top:18px; padding:17px; border-radius:20px; background:rgba(0,0,0,.20); border:1px solid var(--line); }}
-        .main-label {{ color:var(--muted); font-size:11px; font-weight:950; text-transform:uppercase; letter-spacing:.13em; }} .main-value {{ margin-top:5px; font-size:34px; font-weight:950; letter-spacing:-.05em; }}
-        .job-block {{ margin-top:16px; padding:14px; border-radius:18px; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.08); min-height:76px; }}
-        .job {{ font-size:18px; font-weight:950; letter-spacing:-.02em; }} .site {{ margin-top:5px; color:#cbd5e1; font-weight:800; }} .detail {{ margin-top:8px; color:var(--muted); font-size:13px; line-height:1.42; }} .since {{ color:var(--muted); font-size:13px; margin-top:10px; font-weight:700; }}
-        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }} .metrics div {{ background:rgba(0,0,0,.18); border:1px solid var(--line); padding:11px; border-radius:16px; }} .metrics span {{ display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:.09em; }} .metrics strong {{ display:block; margin-top:5px; font-size:17px; }} .last {{ margin-top:14px; color:var(--muted); font-size:12px; border-top:1px solid var(--line); padding-top:13px; }}
-        .feed {{ display:grid; gap:10px; }}
-        .feed-item {{ display:grid; grid-template-columns:13px 1fr; gap:10px; align-items:start; padding:12px; border-radius:16px; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.08); }}
-        .feed-dot {{ width:10px; height:10px; margin-top:4px; border-radius:50%; background:var(--blue); box-shadow:0 0 18px currentColor; }} .feed-dot.danger {{ background:var(--red); }} .feed-dot.amber {{ background:var(--amber); }} .feed-dot.blue {{ background:var(--blue); }}
-        .feed-item strong {{ display:block; font-size:13px; }} .feed-item small {{ display:block; margin-top:4px; color:var(--muted); line-height:1.35; }}
-        .table-wrap {{ overflow:auto; border-radius:18px; border:1px solid var(--line); }} table {{ width:100%; border-collapse:separate; border-spacing:0; min-width:820px; }} th {{ text-align:left; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.12em; background:rgba(255,255,255,.055); padding:13px; }} td {{ border-top:1px solid var(--line); padding:14px 13px; vertical-align:top; background:rgba(0,0,0,.10); }} td span {{ color:var(--muted); font-size:13px; }} .pill {{ display:inline-block; padding:7px 10px; border-radius:999px; color:white; background:#334155; font-weight:950; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }} .pill.good {{ background:var(--green); color:#052e16; }} .pill.blue {{ background:var(--blue); color:#082f49; }} .pill.amber {{ background:var(--amber); color:#111827; }} .pill.danger {{ background:var(--red); }} .pill.muted {{ background:var(--grey); }}
-        .empty {{ color:var(--muted); background:rgba(255,255,255,.045); border:1px dashed var(--line); border-radius:18px; padding:18px; }}
-        .footer {{ color:var(--muted-2); font-size:12px; margin-top:22px; text-align:center; }}
-        @media (max-width:1180px) {{ .premium-summary {{ grid-template-columns:repeat(3,1fr); }} .dashboard-split, .ops-layout {{ grid-template-columns:1fr; }} .live-panel {{ order:-1; }} }}
-        @media (max-width:760px) {{ .topbar {{ flex-direction:column; align-items:flex-start; }} nav {{ width:100%; justify-content:flex-start; overflow-x:auto; flex-wrap:nowrap; border-radius:20px; }} nav a {{ white-space:nowrap; }} .build-pill {{ display:none; }} .control-room {{ flex-direction:column; align-items:flex-start; padding:22px; }} .control-right {{ width:100%; }} .control-chip {{ flex:1; }} .premium-summary {{ grid-template-columns:repeat(2,1fr); }} .grid {{ grid-template-columns:1fr; }} .wrap, .topbar {{ width:min(100% - 24px, 1500px); }} }}
-        @media (max-width:480px) {{ .premium-summary {{ grid-template-columns:1fr; }} .metrics {{ grid-template-columns:1fr; }} .card {{ min-height:auto; }} }}
-    </style>
+        body {{ margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--dark); }}
+        header {{ background:#0b1220; color:white; padding:18px 28px; box-shadow:0 3px 18px rgba(0,0,0,.20); }}
+        .header-row {{ display:flex; justify-content:space-between; gap:18px; align-items:center; flex-wrap:wrap; }}
+        header h1 {{ margin:0; font-size:29px; letter-spacing:-.5px; }}
+        header .sub {{ color:#cbd5e1; font-size:14px; margin-top:5px; }}
+        .logo {{ font-weight:900; color:var(--orange); font-size:31px; letter-spacing:2px; }}
+        nav {{ margin-top:16px; display:flex; gap:8px; flex-wrap:wrap; }}
+        nav a {{ color:#e5e7eb; text-decoration:none; padding:9px 13px; border-radius:999px; background:#1f2937; font-weight:800; font-size:13px; }}
+        nav a.active {{ background:var(--orange); color:#111827; }}
+        .wrap {{ padding:22px; }}
+        .summary {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:12px; margin-bottom:18px; }}
+        .summary-card {{ background:#fff; border-radius:16px; padding:14px 16px; box-shadow:0 6px 18px rgba(15,23,42,.08); border-top:5px solid #334155; }}
+        .summary-card.good {{ border-top-color:var(--green); }} .summary-card.blue {{ border-top-color:var(--blue); }} .summary-card.amber {{ border-top-color:var(--amber); }} .summary-card.danger {{ border-top-color:var(--red); }}
+        .summary-card span {{ display:block; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }}
+        .summary-card strong {{ display:block; margin-top:6px; font-size:24px; }}
+        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap:18px; align-items:stretch; }}
+        .mini-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:14px; }}
+        .panel-grid {{ display:grid; grid-template-columns: 1.35fr .9fr; gap:18px; align-items:start; }}
+        .panel {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); }}
+        .panel h2 {{ margin:0 0 14px 0; }}
+        .card {{ background:var(--card); border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(15,23,42,.10); border-left:9px solid #9ca3af; min-height:265px; }}
+        .card.on-site {{ border-left-color:var(--green); }} .card.travelling {{ border-left-color:var(--blue); }} .card.active {{ border-left-color:var(--purple); }} .card.idle {{ border-left-color:var(--amber); }} .card.ended {{ border-left-color:var(--grey); opacity:.88; }} .card.not-started {{ border-left-color:var(--red); opacity:.82; }}
+        .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }} .identity {{ display:flex; gap:12px; align-items:center; }}
+        .avatar {{ width:42px; height:42px; border-radius:14px; display:flex; align-items:center; justify-content:center; background:#111827; color:#fff; font-weight:900; }}
+        h2 {{ margin:0; font-size:21px; }} .status {{ display:inline-block; margin-top:7px; padding:6px 10px; background:#f1f5f9; border-radius:999px; font-size:13px; font-weight:800; }}
+        .util {{ min-width:72px; text-align:center; background:#334155; color:white; border-radius:15px; padding:9px 10px; font-weight:900; font-size:16px; }} .util-good {{ background:var(--green); }} .util-mid {{ background:var(--amber); color:#111827; }} .util-low {{ background:var(--red); }} .util-none {{ background:#374151; }}
+        .main-status {{ margin-top:18px; padding:15px; border-radius:16px; background:#f8fafc; border:1px solid var(--line); text-align:center; }} .main-label {{ color:var(--muted); font-size:13px; font-weight:800; text-transform:uppercase; letter-spacing:.5px; }} .main-value {{ margin-top:5px; font-size:28px; font-weight:900; letter-spacing:-.5px; }}
+        .job-block {{ margin-top:16px; min-height:54px; }} .job {{ font-size:17px; font-weight:900; }} .site {{ margin-top:3px; color:#334155; font-weight:700; }} .detail {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.35; }} .since {{ color:var(--muted); font-size:14px; margin-top:7px; }}
+        .metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }} .metrics div {{ background:#f9fafb; border:1px solid var(--line); padding:10px; border-radius:13px; }} .metrics span {{ display:block; color:var(--muted); font-size:12px; }} .metrics strong {{ display:block; margin-top:3px; font-size:16px; }} .last {{ margin-top:14px; color:var(--muted); font-size:13px; border-top:1px solid var(--line); padding-top:12px; }}
+        .table-wrap {{ overflow:auto; }} table {{ width:100%; border-collapse:collapse; min-width:760px; }} th {{ text-align:left; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.5px; border-bottom:1px solid var(--line); padding:10px; }} td {{ border-bottom:1px solid var(--line); padding:12px 10px; vertical-align:top; }} td span {{ color:var(--muted); font-size:13px; }} .pill {{ display:inline-block; padding:6px 10px; border-radius:999px; color:white; background:#334155; font-weight:900; font-size:12px; }} .pill.good {{ background:var(--green); }} .pill.blue {{ background:var(--blue); }} .pill.amber {{ background:var(--amber); color:#111827; }} .pill.danger {{ background:var(--red); }} .pill.muted {{ background:var(--grey); }}
+        .empty {{ color:var(--muted); background:#f8fafc; border:1px dashed var(--line); border-radius:16px; padding:18px; }} .footer {{ color:var(--muted); font-size:13px; margin-top:22px; }}
+        @media (prefers-color-scheme: dark) {{ :root {{ --bg:#0b1220; --card:#111827; --dark:#e5e7eb; --muted:#94a3b8; --line:#273244; }} .summary-card, .card, .panel {{ background:#111827; box-shadow:0 8px 24px rgba(0,0,0,.28); }} .status, .main-status, .metrics div, .empty {{ background:#172033; }} .site {{ color:#cbd5e1; }} }}
+        @media (max-width:960px) {{ .panel-grid {{ grid-template-columns:1fr; }} }}
+        @media (max-width:640px) {{ header {{ padding:18px; }} .wrap {{ padding:14px; }} .grid {{ grid-template-columns:1fr; }} .summary {{ grid-template-columns:repeat(2,1fr); }} }}
+    
+
+
+
+.force-end-btn {{
+    display: inline-flex;
+    margin-top: 12px;
+    padding: 9px 12px;
+    border-radius: 12px;
+    background: rgba(239,68,68,.14);
+    color: #fecaca;
+    text-decoration: none;
+    border: 1px solid rgba(239,68,68,.28);
+    font-weight: 800;
+    font-size: 12px;
+}}
+.force-end-btn:hover {{ background: rgba(239,68,68,.22); }}
+</style>
 </head>
 <body>
-    <header>
-        <div class='topbar'>
-            <div class='brand-lockup'><div class='logo-frame'><img src='/logo.png' alt='CDR M&E Services Ltd'></div><div class='brand-text'><strong>CDR M&amp;E</strong><span>Operations Centre</span></div></div>
-            <nav>{nav}</nav>
-            <div class='build-pill'>{html_safe(BUILD_VERSION)}</div>
-        </div>
-    </header>
-    <main class='wrap'>{control_room}{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
+    <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><img src='/logo.png' alt='CDR M&E Services Ltd' style='height:46px;width:auto;max-width:220px;object-fit:contain;display:block;'></div><nav>{nav}</nav></header>
+    <main class='wrap'>{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
 </body>
 </html>
     """)
+
+
+
+@web_app.get("/dashboard/force-end-day", response_class=HTMLResponse)
+def dashboard_force_end_day(token: str = "", telegram_id: str = ""):
+    if DASHBOARD_TOKEN and token != DASHBOARD_TOKEN:
+        return HTMLResponse("Dashboard access denied.", status_code=403)
+
+    if not telegram_id:
+        return HTMLResponse("Missing engineer Telegram ID.", status_code=400)
+
+    try:
+        site_id = get_site_id()
+        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+
+        day_logs = get_list_items(site_id, day_logs_list_id)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        engineers = get_list_items(site_id, engineers_list_id)
+
+        active_day = find_active_day_log(day_logs, telegram_id)
+        if not active_day:
+            return HTMLResponse("No active day found for that engineer. <a href='/dashboard?token=" + html_safe(token) + "'>Back</a>", status_code=404)
+
+        engineer_name = "Engineer"
+        for engineer in engineers:
+            fields = engineer.get("fields", {})
+            if str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip() == str(telegram_id).strip():
+                engineer_name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "Engineer")
+                break
+
+        fields = active_day.get("fields", {})
+        end_time = datetime.now(UK_TZ)
+        start_time = parse_sharepoint_datetime(get_field_value(fields, "StartTime", "Start Time"))
+        hours = calculate_day_pay_hours(start_time, end_time, jobs_data=jobs_data, engineer_name=engineer_name)
+        pay_summary = build_pay_summary(start_time, end_time, hours) + "\n\nForce ended by Helpdesk from dashboard."
+
+        update_payload = {
+            "End Time": end_time.isoformat(),
+            "EndTime": end_time.isoformat(),
+            "Status": DAY_CLOSED_STATUS,
+            "Pay Summary": pay_summary,
+            "PaySummary": pay_summary,
+        }
+
+        if hours:
+            update_payload.update({
+                "Total Hours": hours["total_hours"],
+                "TotalHours": hours["total_hours"],
+                "Normal Hours": hours["normal_hours"],
+                "NormalHours": hours["normal_hours"],
+                "OOH Hours": hours["ooh_hours"],
+                "OOHHours": hours["ooh_hours"],
+                "Payable OOH Hours": hours["payable_ooh_hours"],
+                "PayableOOHHours": hours["payable_ooh_hours"],
+                "Commute Deduction Hours": hours["commute_deduction_hours"],
+                "CommuteDeductionHours": hours["commute_deduction_hours"],
+                "Morning Commute Deduction Hours": hours["morning_commute_deduction_hours"],
+                "MorningCommuteDeductionHours": hours["morning_commute_deduction_hours"],
+                "Evening Commute Deduction Hours": hours["evening_commute_deduction_hours"],
+                "EveningCommuteDeductionHours": hours["evening_commute_deduction_hours"],
+                "Productive Hours": hours["productive_hours"],
+                "ProductiveHours": hours["productive_hours"],
+                "Inactive Hours": hours["inactive_hours"],
+                "InactiveHours": hours["inactive_hours"],
+                "Unproductive Hours": hours["inactive_hours"],
+                "UnproductiveHours": hours["inactive_hours"],
+                "Utilisation Percent": hours["utilisation_percent"],
+                "UtilisationPercent": hours["utilisation_percent"],
+                "Break Deducted": hours["break_deducted"],
+                "BreakDeducted": hours["break_deducted"],
+            })
+
+        update_list_item_fields(
+            site_id,
+            day_logs_list_id,
+            active_day.get("id"),
+            build_field_payload_for_list(site_id, day_logs_list_id, update_payload),
+        )
+
+        return HTMLResponse(
+            f"Day force-ended for {html_safe(engineer_name)}. <a href='/dashboard?token={html_safe(token)}'>Back to dashboard</a>"
+        )
+
+    except Exception as e:
+        print(f"ERROR force ending day from dashboard: {e}")
+        return HTMLResponse(f"Force End Day error: {html_safe(e)}", status_code=500)
+
 
 
 @web_app.get("/dashboard", response_class=HTMLResponse)
@@ -2929,6 +3021,7 @@ def live_engineer_dashboard(token: str = "", view: str = "engineers"):
                 <div class='since'>{html_safe(row['since'])}</div>
                 <div class='metrics'><div><span>Start</span><strong>{html_safe(row['start'])}</strong></div><div><span>Productive</span><strong>{html_safe(dashboard_number(row['productive'], 'h'))}</strong></div><div><span>Inactive</span><strong>{html_safe(dashboard_number(row['inactive'], 'h'))}</strong></div></div>
                 <div class='last'>Last: {html_safe(row['last'])}</div>
+                {f"<a class='force-end-btn' href='/dashboard/force-end-day?token={html_safe(token)}&telegram_id={html_safe(row.get('telegram_id',''))}' onclick=\"return confirm('Force end day for {html_safe(row['name'])}?');\">Force End Day</a>" if row.get('telegram_id') and row['css'] not in ['not-started', 'ended'] else ""}
             </div>
             """)
 
@@ -2963,78 +3056,351 @@ def signature_page(cdr_number: str, token: str):
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.6/dist/signature_pad.umd.min.js"></script>
         <style>
-            :root {{ color-scheme: light; }}
-            html, body {{
-                overscroll-behavior: none;
-                background: #f4f6f8 !important;
-                color: #151515 !important;
-            }}
-            body {{
-                font-family: Arial, sans-serif;
-                padding: 20px;
-                margin: 0;
-                -webkit-text-size-adjust: 100%;
-            }}
-            .container {{
-                max-width: 650px;
-                margin: auto;
-                background: #ffffff !important;
-                color: #151515 !important;
-                padding: 25px;
-                border-radius: 12px;
-                box-shadow: 0 2px 12px rgba(0,0,0,0.12);
-            }}
-            h1, h2, p, label, strong {{ color: #151515 !important; }}
-            h2 {{ margin: 4px 0 14px 0; }}
-            .job-box {{
-                background: #f7f7f7 !important;
-                color: #151515 !important;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 20px 0;
-                border: 1px solid #e1e1e1;
-            }}
+            html, body {{ overscroll-behavior: none; }}
+            body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; margin: 0; }}
+            .container {{ max-width: 650px; margin: auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.12); }}
+            h1 {{ color: #f58220; margin-bottom: 5px; }}
+            .job-box {{ background: #f7f7f7; padding: 15px; border-radius: 8px; margin: 20px 0; }}
             label {{ font-weight: bold; display: block; margin-top: 15px; }}
-            input[type="text"] {{
-                width: 100%;
-                padding: 12px;
-                font-size: 16px;
-                box-sizing: border-box;
-                background: #ffffff !important;
-                color: #111111 !important;
-                border: 1px solid #777;
-                border-radius: 2px;
-                -webkit-text-fill-color: #111111 !important;
-            }}
-            input[type="checkbox"] {{ accent-color: #f58220; }}
-            canvas {{
-                width: 100%;
-                height: 260px;
-                border: 2px solid #333;
-                border-radius: 8px;
-                background: #ffffff !important;
-                margin-top: 10px;
-                touch-action: none;
-                -ms-touch-action: none;
-                user-select: none;
-                -webkit-user-select: none;
-                -webkit-touch-callout: none;
-                display: block;
-                cursor: crosshair;
-            }}
+            input[type="text"] {{ width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; }}
+            canvas {{ width: 100%; height: 260px; border: 2px solid #333; border-radius: 8px; background: white; margin-top: 10px; touch-action: none; -ms-touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; display: block; }}
             button {{ width: 100%; padding: 14px; margin-top: 15px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }}
             .submit {{ background: #f58220; color: white; font-weight: bold; }}
             .clear {{ background: #555; color: white; }}
-            .small {{ font-size: 13px; color: #555 !important; margin-top: 15px; }}
-            @media (prefers-color-scheme: dark) {{
-                html, body {{ background: #f4f6f8 !important; color: #151515 !important; }}
-                .container, .job-box, input, canvas {{ background-color: #ffffff !important; color: #151515 !important; }}
-            }}
-        </style>
-        <meta name="color-scheme" content="light only">
-        <meta name="supported-color-schemes" content="light">
-        <meta name="theme-color" content="#ffffff">
-        <meta name="apple-mobile-web-app-capable" content="yes">
+            .small {{ font-size: 13px; color: #555; margin-top: 15px; }}
+        
+
+:root {{
+    --bg: #070b12;
+    --panel: rgba(17, 24, 39, 0.82);
+    --panel-solid: #111827;
+    --panel-soft: rgba(255,255,255,0.055);
+    --border: rgba(255,255,255,0.10);
+    --border-strong: rgba(245,130,32,0.34);
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --muted-2: #64748b;
+    --orange: #f58220;
+    --orange-soft: rgba(245,130,32,0.16);
+    --green: #22c55e;
+    --blue: #38bdf8;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --grey: #64748b;
+    --shadow: 0 24px 70px rgba(0,0,0,0.36);
+    --radius-xl: 24px;
+    --radius-lg: 18px;
+}}
+
+* {{ box-sizing: border-box; }}
+
+body {{
+    margin: 0;
+    min-height: 100vh;
+    color: var(--text);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    background:
+        radial-gradient(circle at top left, rgba(245,130,32,0.18), transparent 30%),
+        radial-gradient(circle at top right, rgba(56,189,248,0.10), transparent 26%),
+        linear-gradient(135deg, #05070b 0%, #0b1020 46%, #111827 100%);
+}}
+
+body::before {{
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+        linear-gradient(rgba(255,255,255,0.032) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.032) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: linear-gradient(to bottom, rgba(0,0,0,.6), transparent 70%);
+}}
+
+.container, .wrap, main {{
+    width: min(1480px, calc(100% - 32px));
+    margin: 0 auto;
+}}
+
+.header, .topbar {{
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    backdrop-filter: blur(18px);
+    background: rgba(7, 11, 18, 0.78);
+    border-bottom: 1px solid var(--border);
+}}
+
+.header-inner, .topbar-inner {{
+    width: min(1480px, calc(100% - 32px));
+    margin: 0 auto;
+    padding: 18px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+}}
+
+.brand, .brand-wrap, .title-wrap {{
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}}
+
+.brand img, .brand-logo, img[alt="CDR M&E Services Ltd"] {{
+    height: 54px !important;
+    width: auto !important;
+    max-width: 230px !important;
+    object-fit: contain !important;
+    display: block !important;
+    background: rgba(255,255,255,0.96);
+    padding: 7px 10px;
+    border-radius: 14px;
+    box-shadow: 0 16px 35px rgba(0,0,0,0.28);
+}}
+
+h1 {{
+    margin: 0;
+    font-size: clamp(24px, 2.8vw, 38px);
+    letter-spacing: -0.04em;
+    line-height: 1.05;
+}}
+
+.subtitle, .small, .muted {{
+    color: var(--muted);
+}}
+
+.nav, .tabs, .dashboard-nav {{
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 18px 0 24px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    background: rgba(255,255,255,0.055);
+    border-radius: 18px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+}}
+
+.nav a, .tabs a, .dashboard-nav a {{
+    color: var(--muted);
+    text-decoration: none;
+    padding: 11px 15px;
+    border-radius: 13px;
+    border: 1px solid transparent;
+    transition: all .18s ease;
+    font-weight: 700;
+    font-size: 14px;
+}}
+
+.nav a:hover, .tabs a:hover, .dashboard-nav a:hover {{
+    color: var(--text);
+    background: rgba(255,255,255,0.08);
+    border-color: var(--border);
+    transform: translateY(-1px);
+}}
+
+.nav a.active, .tabs a.active, .dashboard-nav a.active {{
+    color: #fff;
+    background: linear-gradient(135deg, rgba(245,130,32,0.95), rgba(255,168,76,0.78));
+    border-color: rgba(255,255,255,0.18);
+    box-shadow: 0 12px 28px rgba(245,130,32,0.22);
+}}
+
+.metrics, .stats, .summary-grid {{
+    display: grid;
+    grid-template-columns: repeat(6, minmax(130px, 1fr));
+    gap: 14px;
+    margin: 18px 0 24px;
+}}
+
+.metric, .stat, .summary-card {{
+    background: linear-gradient(180deg, rgba(255,255,255,0.085), rgba(255,255,255,0.04));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+    box-shadow: 0 14px 40px rgba(0,0,0,0.18);
+}}
+
+.metric .label, .stat .label, .summary-card .label {{
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    font-weight: 800;
+}}
+
+.metric .value, .stat .value, .summary-card .value {{
+    font-size: clamp(24px, 2.4vw, 36px);
+    line-height: 1;
+    font-weight: 900;
+    margin-top: 9px;
+    letter-spacing: -0.04em;
+}}
+
+.grid, .cards, .engineer-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(305px, 1fr));
+    gap: 18px;
+}}
+
+.card, .engineer-card, .job-card, .panel {{
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(180deg, rgba(17,24,39,0.92), rgba(15,23,42,0.72));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xl);
+    padding: 20px;
+    box-shadow: var(--shadow);
+}}
+
+.card::before, .engineer-card::before, .job-card::before, .panel::before {{
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--orange), rgba(56,189,248,.75), transparent);
+    opacity: .85;
+}}
+
+.card:hover, .engineer-card:hover, .job-card:hover {{
+    transform: translateY(-2px);
+    transition: transform .18s ease, border-color .18s ease;
+    border-color: rgba(255,255,255,0.18);
+}}
+
+.avatar, .initials {{
+    display: inline-grid;
+    place-items: center;
+    width: 46px;
+    height: 46px;
+    border-radius: 16px;
+    background: linear-gradient(135deg, var(--orange), #ffb15e);
+    color: #111827;
+    font-weight: 950;
+    box-shadow: 0 14px 30px rgba(245,130,32,.24);
+}}
+
+.status, .pill, .badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: .01em;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.065);
+}}
+
+.status.on-site, .pill.green, .badge.green {{ color: #86efac; background: rgba(34,197,94,.13); border-color: rgba(34,197,94,.24); }}
+.status.travelling, .pill.blue, .badge.blue {{ color: #7dd3fc; background: rgba(56,189,248,.12); border-color: rgba(56,189,248,.24); }}
+.status.idle, .pill.amber, .badge.amber {{ color: #fcd34d; background: rgba(245,158,11,.13); border-color: rgba(245,158,11,.26); }}
+.status.offline, .pill.grey, .badge.grey {{ color: #cbd5e1; background: rgba(100,116,139,.16); border-color: rgba(100,116,139,.25); }}
+.status.alert, .pill.red, .badge.red {{ color: #fca5a5; background: rgba(239,68,68,.13); border-color: rgba(239,68,68,.27); }}
+
+.card-title, .engineer-name, h2, h3 {{
+    letter-spacing: -0.03em;
+}}
+
+.card-title, .engineer-name {{
+    font-size: 20px;
+    font-weight: 950;
+    margin: 0;
+}}
+
+.meta-row, .row, .line {{
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 9px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+}}
+
+.meta-row:last-child, .row:last-child, .line:last-child {{
+    border-bottom: none;
+}}
+
+.meta-row span:first-child, .row span:first-child, .line span:first-child {{
+    color: var(--muted);
+}}
+
+.meta-row span:last-child, .row span:last-child, .line span:last-child {{
+    text-align: right;
+    font-weight: 800;
+}}
+
+.progress, .util-bar {{
+    height: 9px;
+    width: 100%;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.085);
+    overflow: hidden;
+    margin-top: 10px;
+}}
+
+.progress > div, .util-fill {{
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--orange), #ffd19a);
+}}
+
+table {{
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0 8px;
+}}
+
+th {{
+    color: var(--muted);
+    text-align: left;
+    padding: 10px 12px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+}}
+
+td {{
+    padding: 13px 12px;
+    background: rgba(255,255,255,0.055);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+}}
+
+td:first-child {{
+    border-left: 1px solid var(--border);
+    border-radius: 14px 0 0 14px;
+}}
+
+td:last-child {{
+    border-right: 1px solid var(--border);
+    border-radius: 0 14px 14px 0;
+}}
+
+.footer, .refresh {{
+    color: var(--muted-2);
+    font-size: 12px;
+    margin: 26px 0;
+}}
+
+@media (max-width: 960px) {{
+    .metrics, .stats, .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .header-inner, .topbar-inner {{ flex-direction: column; align-items: flex-start; }}
+}}
+
+@media (max-width: 620px) {{
+    .container, .wrap, main, .header-inner, .topbar-inner {{ width: min(100% - 20px, 1480px); }}
+    .metrics, .stats, .summary-grid {{ grid-template-columns: 1fr; }}
+    .grid, .cards, .engineer-grid {{ grid-template-columns: 1fr; }}
+    .nav, .tabs, .dashboard-nav {{ overflow-x: auto; flex-wrap: nowrap; }}
+    .nav a, .tabs a, .dashboard-nav a {{ white-space: nowrap; }}
+}}
+
+</style>
+    
+<meta name="theme-color" content="#070b12">
+<meta name="apple-mobile-web-app-capable" content="yes">
 </head>
     <body>
         <div class="container">
@@ -3072,28 +3438,16 @@ def signature_page(cdr_number: str, token: str):
                 minWidth: 1,
                 maxWidth: 2.5,
                 throttle: 0,
-                velocityFilterWeight: 0.7,
-                penColor: "#111111",
-                backgroundColor: "#ffffff"
+                velocityFilterWeight: 0.7
             }});
 
-            // Keep the signature pad usable on both light and dark phones/desktops.
-            // Pointer capture also fixes desktop mouse drawing continuing after mouse-up.
-            canvas.addEventListener("pointerdown", function(event) {{
-                try {{ canvas.setPointerCapture(event.pointerId); }} catch (e) {{}}
-                event.preventDefault();
-            }}, {{ passive: false }});
-
-            ["pointermove", "touchstart", "touchmove"].forEach(function(eventName) {{
+            // Stop mobile browsers treating signature movement as page scroll/swipe.
+            // The passive:false option is important on iPhone/Android.
+            ["touchstart", "touchmove", "touchend", "pointerdown", "pointermove", "pointerup"].forEach(function(eventName) {{
                 canvas.addEventListener(eventName, function(event) {{
                     event.preventDefault();
+                    event.stopPropagation();
                 }}, {{ passive: false }});
-            }});
-
-            ["pointerup", "pointercancel", "pointerleave"].forEach(function(eventName) {{
-                canvas.addEventListener(eventName, function(event) {{
-                    try {{ canvas.releasePointerCapture(event.pointerId); }} catch (e) {{}}
-                }}, {{ passive: true }});
             }});
 
             let savedSignature = null;
@@ -3107,10 +3461,7 @@ def signature_page(cdr_number: str, token: str):
 
                 canvas.width = rect.width * ratio;
                 canvas.height = rect.height * ratio;
-                const ctx = canvas.getContext("2d");
-                ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-                ctx.fillStyle = "#ffffff";
-                ctx.fillRect(0, 0, rect.width, rect.height);
+                canvas.getContext("2d").scale(ratio, ratio);
                 signaturePad.clear();
 
                 if (savedSignature) {{
@@ -4141,7 +4492,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ENGINEER_MENU]:
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4198,6 +4549,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_REASSIGN_JOB:
         return await reassign_start(update, context)
 
+    if text == MENU_REOPEN_JOB:
+        return await reopenjob_start(update, context)
+
     if text == MENU_FIND_JOB:
         return await findjob_start(update, context)
 
@@ -4222,6 +4576,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
+        MENU_REOPEN_JOB: "Reopen Job",
         MENU_OPEN_JOBS: "Open Jobs",
         MENU_FIND_JOB: "Find Job",
         MENU_CANCEL_JOB: "Cancel Job",
@@ -4654,6 +5009,179 @@ async def logjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+
+async def reopenjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    role = await get_role_for_update(update)
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text("You do not have permission to reopen jobs.", reply_markup=get_main_menu(role))
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        engineers = get_list_items(site_id, engineers_list_id)
+        assignable_engineers = get_active_assignable_engineers(engineers)
+        context.user_data["reopen_job"] = {
+            "site_id": site_id,
+            "jobs_list_id": jobs_list_id,
+            "engineers": engineers,
+            "assignable_engineers": assignable_engineers,
+            "role": role,
+        }
+        await update.message.reply_text("Enter the CDR number to reopen.\n\nExample: CDR01012")
+        return REOPENJOB_CDR_NUMBER
+    except Exception as e:
+        print(f"ERROR opening Reopen Job: {e}")
+        await update.message.reply_text("There was an error opening Reopen Job. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def reopenjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+    data = context.user_data.get("reopen_job")
+    if not data:
+        return ConversationHandler.END
+    cdr_number = update.message.text.strip()
+    try:
+        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        job = find_job_by_cdr(jobs_data, cdr_number)
+        if not job:
+            await update.message.reply_text("I could not find that CDR number. Please check it and try again.")
+            return REOPENJOB_CDR_NUMBER
+        fields = job.get("fields", {})
+        data.update({"job": job, "item_id": job.get("id"), "job_fields": fields, "cdr_number": get_field_value(fields, "CDRNumber", "CDR Number", "Title") or cdr_number})
+        await update.message.reply_text("What date should the reopened job be attended? Example: Today, Tomorrow, 15/05/2026")
+        return REOPENJOB_DATE
+    except Exception as e:
+        print(f"ERROR finding job to reopen: {e}")
+        await update.message.reply_text("There was an error finding the job. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def reopenjob_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+    data = context.user_data.get("reopen_job")
+    if not data:
+        return ConversationHandler.END
+    parsed_date = parse_helpdesk_job_date(update.message.text.strip())
+    if not parsed_date:
+        await update.message.reply_text("Please enter a valid date. Example: Today, Tomorrow, 15/05/2026")
+        return REOPENJOB_DATE
+    data["new_date"] = parsed_date
+    data["new_date_display"] = format_sharepoint_date(parsed_date) or parsed_date
+    await update.message.reply_text("Assign engineer(s) for the reopened job. Reply with number(s):\n\n" + format_engineer_selection_list(data.get("assignable_engineers", [])))
+    return REOPENJOB_ASSIGN_ENGINEERS
+
+
+async def reopenjob_assign_engineers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+    data = context.user_data.get("reopen_job")
+    if not data:
+        return ConversationHandler.END
+    selected, error = parse_engineer_selection(update.message.text, data.get("assignable_engineers", []))
+    if error:
+        await update.message.reply_text(error + "\n\n" + format_engineer_selection_list(data.get("assignable_engineers", [])))
+        return REOPENJOB_ASSIGN_ENGINEERS
+    data["assign_engineers"] = selected
+    await update.message.reply_text("Reason for reopening? Example: Completed in error / revisit actually required / worksheet correction.")
+    return REOPENJOB_REASON
+
+
+async def reopenjob_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+    data = context.user_data.get("reopen_job")
+    if not data:
+        return ConversationHandler.END
+    data["reason"] = update.message.text.strip()
+    engineers_text = ", ".join(e["name"] for e in data.get("assign_engineers", []))
+    await update.message.reply_text(
+        "Review reopen job:\n\n"
+        f"CDR: {data.get('cdr_number')}\n"
+        f"Date: {data.get('new_date_display')}\n"
+        f"Assign to: {engineers_text}\n"
+        f"Reason: {data.get('reason')}\n\n"
+        "This will keep the old worksheet for audit, reset the job for a fresh worksheet, and resend it.\n\n"
+        "Reply YES to reopen, or NO to cancel.",
+        reply_markup=get_review_reply_keyboard(),
+    )
+    return REOPENJOB_REVIEW
+
+
+async def reopenjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+    data = context.user_data.get("reopen_job")
+    role = data.get("role", "Helpdesk") if data else "Helpdesk"
+    answer = update.message.text.strip().lower().replace("✅", "").replace("❌", "").strip()
+    if answer in ["no", "n", "cancel"]:
+        context.user_data.pop("reopen_job", None)
+        await update.message.reply_text("Reopen cancelled. Nothing has been changed.", reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")))
+        return ConversationHandler.END
+    if answer not in ["yes", "y"]:
+        await update.message.reply_text("Reply YES to reopen, or NO to cancel.")
+        return REOPENJOB_REVIEW
+    try:
+        site_id = data["site_id"]
+        jobs_list_id = data["jobs_list_id"]
+        fields = data.get("job_fields", {})
+        final_engineers = data.get("assign_engineers", [])
+        reason = data.get("reason", "Reopened by Helpdesk")
+        updated_log = append_engineer_log(fields, "Helpdesk", "Reopened", reason)
+        payload_fields = {
+            "Date": data.get("new_date"),
+            "Status": ASSIGNED_STATUS if final_engineers else AWAITING_DEPLOYMENT_STATUS,
+            "JobOutcome": "Revisit Required",
+            "Job Outcome": "Revisit Required",
+            "WorksheetGenerated": False,
+            "Worksheet Generated": False,
+            "WorksheetSubmitted": False,
+            "Worksheet Submitted": False,
+            "TelegramNotified": False,
+            "Telegram Notified": False,
+            "ClientSignatureRequired": False,
+            "ClientSignatureReceived": False,
+            "SignatureToken": "",
+            "EngineerVisitLog": updated_log,
+            "Engineer Visit Log": updated_log,
+        }
+        payload = build_field_payload_for_list(site_id, jobs_list_id, payload_fields)
+        payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
+        payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in final_engineers]
+        update_list_item_fields(site_id, jobs_list_id, data["item_id"], payload)
+
+        send_fields = dict(fields)
+        send_fields.update(payload_fields)
+        sent_to_any, failed = await send_created_job_to_engineers(context.bot, data["item_id"], send_fields, final_engineers)
+
+        final_payload = build_field_payload_for_list(site_id, jobs_list_id, {"TelegramNotified": bool(sent_to_any), "Telegram Notified": bool(sent_to_any)})
+        update_list_item_fields(site_id, jobs_list_id, data["item_id"], final_payload)
+
+        context.user_data.pop("reopen_job", None)
+        message = f"Job reopened and resent: {data.get('cdr_number')}\nAssigned to: {', '.join(e['name'] for e in final_engineers)}"
+        if failed:
+            message += "\n\nSend issues:\n" + "\n".join(failed[:5])
+        await update.message.reply_text(message, reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")))
+        return ConversationHandler.END
+    except Exception as e:
+        print(f"ERROR reopening job: {e}")
+        await update.message.reply_text("There was an error reopening the job. Please check Railway logs.", reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")))
+        return ConversationHandler.END
+
+
+async def reopenjob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    context.user_data.pop("reopen_job", None)
+    await update.message.reply_text("Reopen Job cancelled.", reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")) if user_can_use_helpdesk(role) else get_main_menu(role))
+    return ConversationHandler.END
+
 async def reassign_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -4815,6 +5343,31 @@ async def reassign_assign_engineers(update: Update, context: ContextTypes.DEFAUL
     return REASSIGN_REASON
 
 
+
+async def reassign_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    data = context.user_data.get("reassign_job")
+    if not data:
+        await update.message.reply_text("Please start again using 🔁 Reassign Job.")
+        return ConversationHandler.END
+
+    value = update.message.text.strip()
+    if value.lower() in ["keep", "same", "skip", "no change"]:
+        data["new_date"] = None
+        data["new_date_display"] = "Keep current date"
+    else:
+        parsed_date = parse_helpdesk_job_date(value)
+        if not parsed_date:
+            await update.message.reply_text("Please enter a valid date, or type KEEP. Example: Today, Tomorrow, 15/05/2026")
+            return REASSIGN_DATE
+        data["new_date"] = parsed_date
+        data["new_date_display"] = format_sharepoint_date(parsed_date) or parsed_date
+
+    await update.message.reply_text("Reason for reassignment?\n\nExample: revisit booked / no access rebooked / change of plan / emergency priority.")
+    return REASSIGN_REASON
+
 async def reassign_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -4875,16 +5428,19 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated_log = append_engineer_log(fields, "Helpdesk", "Reassigned", reassignment_note)
 
         # First place the job back into dispatch while the assignment is changed.
+        interim_fields = {
+            "Status": AWAITING_DEPLOYMENT_STATUS,
+            "TelegramNotified": False,
+            "Telegram Notified": False,
+            "EngineerVisitLog": updated_log,
+            "Engineer Visit Log": updated_log,
+        }
+        if data.get("new_date"):
+            interim_fields["Date"] = data.get("new_date")
         interim_payload = build_field_payload_for_list(
             site_id,
             jobs_list_id,
-            {
-                "Status": AWAITING_DEPLOYMENT_STATUS,
-                "TelegramNotified": False,
-                "Telegram Notified": False,
-                "EngineerVisitLog": updated_log,
-                "Engineer Visit Log": updated_log,
-            },
+            interim_fields,
         )
         interim_payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
         interim_payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in final_engineers]
@@ -4896,6 +5452,8 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Status": ASSIGNED_STATUS if final_engineers else AWAITING_DEPLOYMENT_STATUS,
             "EngineerVisitLog": updated_log,
         })
+        if data.get("new_date"):
+            send_fields["Date"] = data.get("new_date")
         sent_to_any, failed = await send_created_job_to_engineers(
             context.bot,
             item_id,
@@ -5744,6 +6302,7 @@ HELPDESK_MENU_TEXTS = {
     MENU_HELPDESK,
     MENU_LOG_JOB,
     MENU_REASSIGN_JOB,
+    MENU_REOPEN_JOB,
     MENU_OPEN_JOBS,
     MENU_FIND_JOB,
     MENU_UPLOAD_RECEIPTS,
@@ -6359,6 +6918,152 @@ async def abort_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("abort_job", None)
     await update.message.reply_text("Abort job cancelled. No changes made.", reply_markup=get_main_menu(await get_role_for_update(update)))
     return ConversationHandler.END
+
+
+
+async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        data = query.data.split("|")
+        item_id = data[1]
+        decision = data[2]
+
+        if HELPDESK_CHAT_ID and str(query.message.chat_id) != str(HELPDESK_CHAT_ID):
+            role = get_bot_user_role(get_site_id(), query.from_user.id)
+            if not user_can_use_helpdesk(role):
+                await query.message.reply_text("Only Helpdesk/Admin users can approve job reviews.")
+                return
+
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        engineers = get_list_items(site_id, engineers_list_id)
+        job = find_job_by_item_id(jobs_data, item_id)
+
+        if not job:
+            await query.message.reply_text("Could not find that job.")
+            return
+
+        fields = job.get("fields", {})
+        pending = bool_field(get_field_value(fields, "PendingHelpdeskReview", "Pending Helpdesk Review"))
+        if not pending and str(fields.get("Status", "")) != AWAITING_HELPDESK_REVIEW_STATUS:
+            await query.message.reply_text("This job is no longer awaiting Helpdesk review.")
+            return
+
+        pending_outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or ""
+        pending_engineer_lookup_id = str(get_field_value(fields, "PendingOutcomeEngineerLookupId", "Pending Outcome Engineer Lookup Id") or "")
+        pending_engineer_name = get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer"
+        cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+
+        reviewer_name = query.from_user.full_name or str(query.from_user.id)
+        updated_log = append_engineer_log(
+            fields,
+            "Helpdesk",
+            f"Review decision: {decision}",
+            f"Engineer submitted: {pending_outcome}; reviewed by {reviewer_name}",
+        )
+
+        if decision == "Reject":
+            engineer = get_engineer_by_lookup_id(engineers, pending_engineer_lookup_id)
+            update_payload = {
+                "Status": ASSIGNED_STATUS,
+                "JobOutcome": "",
+                "EngineerVisitLog": updated_log,
+                "TelegramNotified": False,
+                "WorksheetSubmitted": False,
+                "WorksheetGenerated": False,
+            }
+            update_payload.update(clear_pending_review_fields())
+            if pending_engineer_lookup_id:
+                update_payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
+                update_payload["EngineerLookupId"] = [int(pending_engineer_lookup_id)]
+
+            update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
+
+            if engineer and engineer.get("telegram_id"):
+                try:
+                    await context.bot.send_message(
+                        chat_id=engineer["telegram_id"],
+                        text=(
+                            f"Job sent back for correction:\n\n"
+                            f"{format_job(fields, engineer.get('name'))}\n\n"
+                            "The office rejected the submitted outcome. Please review and submit again."
+                        ),
+                        reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not resend rejected job to engineer: {e}")
+
+            await query.message.reply_text(f"Rejected and sent back to {pending_engineer_name}.")
+            return
+
+        final_outcome = decision
+        worksheet_link = ""
+        worksheet = build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id)
+
+        if final_outcome == "Completed":
+            worksheet["JobOutcome"] = "Completed"
+            worksheet_link = generate_and_upload_worksheet_pdf(
+                site_id,
+                jobs_list_id,
+                item_id,
+                worksheet,
+                fields,
+                updated_log,
+                "Completed",
+            )
+            update_payload = build_worksheet_update_fields(
+                worksheet,
+                fields,
+                updated_log,
+                "Completed",
+                True,
+                worksheet_link,
+            )
+            update_payload["HelpdeskReviewDecision"] = "Approved Complete"
+            update_payload["Helpdesk Review Decision"] = "Approved Complete"
+        else:
+            update_payload = {
+                "Status": AWAITING_DEPLOYMENT_STATUS,
+                "JobOutcome": final_outcome,
+                "EngineerVisitLog": updated_log,
+                "TelegramNotified": False,
+                "WorksheetSubmitted": False,
+                "WorksheetGenerated": False,
+                "HelpdeskReviewDecision": f"Approved {final_outcome}",
+                "Helpdesk Review Decision": f"Approved {final_outcome}",
+            }
+            update_payload.update(clear_engineer_assignment_payload())
+
+        update_payload.update({
+            "PendingHelpdeskReview": False,
+            "Pending Helpdesk Review": False,
+            "HelpdeskApprovedBy": reviewer_name,
+            "Helpdesk Approved By": reviewer_name,
+            "HelpdeskApprovedDateTime": graph_datetime_now(),
+            "Helpdesk Approved Date Time": graph_datetime_now(),
+        })
+
+        # Clear most pending fields after using them.
+        clear_payload = clear_pending_review_fields()
+        for key, value in clear_payload.items():
+            if key not in ["HelpdeskReviewDecision", "Helpdesk Review Decision", "HelpdeskApprovedBy", "Helpdesk Approved By", "HelpdeskApprovedDateTime", "Helpdesk Approved Date Time"]:
+                update_payload[key] = value
+
+        update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
+
+        await query.message.reply_text(
+            f"Helpdesk review approved:\n\n{cdr_number} → {final_outcome}"
+            + (f"\nWorksheet generated." if worksheet_link else "")
+        )
+
+    except Exception as e:
+        print(f"ERROR handling helpdesk review: {e}")
+        await query.message.reply_text("There was an error processing the Helpdesk review. Please check Railway logs.")
+
 
 
 async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7474,38 +8179,6 @@ def get_signature_image_bytes(site_id, cdr_number):
         return None
 
 
-
-
-def prepare_signature_image_for_export(image_bytes):
-    """Return a PNG signature image with a white background.
-
-    This avoids Word/Office dark mode making transparent signature canvases
-    difficult to see, and also gives PDF conversion a consistent white pad.
-    """
-    if not image_bytes:
-        return image_bytes
-
-    try:
-        from PIL import Image as PILImage
-        image = PILImage.open(BytesIO(image_bytes))
-
-        # Composite transparent signature lines onto solid white.
-        if image.mode in ["RGBA", "LA"] or (image.mode == "P" and "transparency" in image.info):
-            image = image.convert("RGBA")
-            background = PILImage.new("RGBA", image.size, (255, 255, 255, 255))
-            background.alpha_composite(image)
-            image = background.convert("RGB")
-        else:
-            image = image.convert("RGB")
-
-        # Keep the image as a simple PNG for Word/PDF conversion.
-        output = BytesIO()
-        image.save(output, format="PNG")
-        return output.getvalue()
-    except Exception as e:
-        print(f"WARNING: Could not normalise signature image for export: {e}")
-        return image_bytes
-
 def get_logo_for_pdf(max_width=48 * mm, max_height=20 * mm):
     for path in ["cdr-logo.png", "CDR-logo.png", "logo.png"]:
         if os.path.exists(path):
@@ -7756,43 +8429,13 @@ def docx_escape(value):
 DOCX_PAGE_WIDTH = 11906
 DOCX_CONTENT_WIDTH = 10320
 DOCX_ORANGE = "F58220"
-DOCX_DARK = "595959"
-DOCX_MID = "D9D9D9"
-DOCX_LIGHT = "F2F2F2"
-DOCX_GREY = "999999"
-DOCX_GRID = "BFBFBF"
-
-
-def mm_to_emu(mm_value):
-    return int(float(mm_value) * 36000)
-
-
-def get_docx_image_ext(file_name="image.png"):
-    lower = str(file_name or "").lower()
-    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
-        return "jpeg"
-    if lower.endswith(".gif"):
-        return "gif"
-    return "png"
-
-
-def get_docx_logo_bytes():
-    """Return the CDR logo image bytes for Word worksheets if the logo exists in the app folder."""
-    for path in [
-        "cdr-logo.png", "CDR-logo.png", "logo.png", "Logo.png",
-        "/app/cdr-logo.png", "/app/CDR-logo.png", "/app/logo.png", "/app/Logo.png",
-    ]:
-        try:
-            if os.path.exists(path):
-                with open(path, "rb") as handle:
-                    return handle.read(), get_docx_image_ext(path)
-        except Exception as e:
-            print(f"Could not load worksheet logo {path}: {e}")
-    return None, None
+DOCX_DARK = "333333"
+DOCX_LIGHT = "F7F7F7"
+DOCX_GREY = "D9D9D9"
 
 
 def docx_run(text, bold=False, size=18, color=None):
-    rpr = f"<w:sz w:val='{size}'/><w:szCs w:val='{size}'/>"
+    rpr = f"<w:sz w:val='{size}'/>"
     if bold:
         rpr += "<w:b/>"
     if color:
@@ -7816,47 +8459,17 @@ def docx_paragraph(value="", bold=False, size=18, align=None, spacing_after=80, 
     return f"<w:p><w:pPr>{ppr}</w:pPr>{''.join(runs)}</w:p>"
 
 
-def docx_image_paragraph(rid, name="Image", width_mm=45, height_mm=18, align="left", spacing_after=0):
-    cx = mm_to_emu(width_mm)
-    cy = mm_to_emu(height_mm)
-    docpr_id = abs(hash(str(rid))) % 100000 + 1
-    return f"""
-<w:p>
-  <w:pPr><w:spacing w:after='{spacing_after}'/><w:jc w:val='{align}'/></w:pPr>
-  <w:r>
-    <w:drawing>
-      <wp:inline distT='0' distB='0' distL='0' distR='0'>
-        <wp:extent cx='{cx}' cy='{cy}'/>
-        <wp:effectExtent l='0' t='0' r='0' b='0'/>
-        <wp:docPr id='{docpr_id}' name='{docx_escape(name)}'/>
-        <wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect='1'/></wp:cNvGraphicFramePr>
-        <a:graphic>
-          <a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>
-            <pic:pic>
-              <pic:nvPicPr><pic:cNvPr id='0' name='{docx_escape(name)}'/><pic:cNvPicPr/></pic:nvPicPr>
-              <pic:blipFill><a:blip r:embed='{rid}'/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
-              <pic:spPr><a:xfrm><a:off x='0' y='0'/><a:ext cx='{cx}' cy='{cy}'/></a:xfrm><a:prstGeom prst='rect'><a:avLst/></a:prstGeom></pic:spPr>
-            </pic:pic>
-          </a:graphicData>
-        </a:graphic>
-      </wp:inline>
-    </w:drawing>
-  </w:r>
-</w:p>"""
-
-
-def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18, align=None, raw_xml=None, bottom_pad=90, top_pad=90):
+def docx_cell(value="", bold=False, width=2500, shade=None, color=None, size=18, align=None):
     tcpr = f"<w:tcPr><w:tcW w:w='{width}' w:type='dxa'/>"
-    tcpr += f"<w:tcMar><w:top w:w='{top_pad}' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='{bottom_pad}' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tcMar>"
+    tcpr += "<w:tcMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tcMar>"
     tcpr += "<w:vAlign w:val='top'/>"
     if shade:
         tcpr += f"<w:shd w:val='clear' w:color='auto' w:fill='{shade}'/>"
     tcpr += "</w:tcPr>"
-    content = raw_xml if raw_xml is not None else docx_paragraph(value, bold=bold, size=size, spacing_after=0, color=color, align=align, clean=False)
-    return f"<w:tc>{tcpr}{content}</w:tc>"
+    return f"<w:tc>{tcpr}{docx_paragraph(value, bold=bold, size=size, spacing_after=0, color=color, align=align, clean=False)}</w:tc>"
 
 
-def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None, no_borders=False, header_dark=False):
+def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_WIDTH, header_orange=False, label_columns=None):
     if not rows:
         return ""
 
@@ -7865,30 +8478,20 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
         widths = [int(table_width / column_count)] * column_count
 
     grid = "".join(f"<w:gridCol w:w='{widths[min(i, len(widths)-1)]}'/>" for i in range(column_count))
-    if no_borders:
-        borders = """
-        <w:tblBorders>
-          <w:top w:val='nil'/><w:left w:val='nil'/><w:bottom w:val='nil'/><w:right w:val='nil'/>
-          <w:insideH w:val='nil'/><w:insideV w:val='nil'/>
-        </w:tblBorders>"""
-    else:
-        borders = f"""
-        <w:tblBorders>
-          <w:top w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
-          <w:left w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
-          <w:bottom w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
-          <w:right w:val='single' w:sz='8' w:space='0' w:color='{DOCX_GRID}'/>
-          <w:insideH w:val='single' w:sz='6' w:space='0' w:color='{DOCX_GRID}'/>
-          <w:insideV w:val='single' w:sz='6' w:space='0' w:color='{DOCX_GRID}'/>
-        </w:tblBorders>"""
-
     tbl = [
         "<w:tbl>",
         "<w:tblPr>",
         f"<w:tblW w:w='{table_width}' w:type='dxa'/>",
         "<w:tblLayout w:type='fixed'/>",
-        borders,
-        "<w:tblCellMar><w:top w:w='95' w:type='dxa'/><w:left w:w='130' w:type='dxa'/><w:bottom w:w='95' w:type='dxa'/><w:right w:w='130' w:type='dxa'/></w:tblCellMar>",
+        "<w:tblBorders>",
+        f"<w:top w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:left w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:bottom w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:right w:val='single' w:sz='6' w:space='0' w:color='{DOCX_DARK}'/>",
+        f"<w:insideH w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
+        f"<w:insideV w:val='single' w:sz='4' w:space='0' w:color='{DOCX_GREY}'/>",
+        "</w:tblBorders>",
+        "<w:tblCellMar><w:top w:w='90' w:type='dxa'/><w:left w:w='120' w:type='dxa'/><w:bottom w:w='90' w:type='dxa'/><w:right w:w='120' w:type='dxa'/></w:tblCellMar>",
         "</w:tblPr>",
         f"<w:tblGrid>{grid}</w:tblGrid>",
     ]
@@ -7899,21 +8502,14 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
         tbl.append("<w:tr>")
         for col_index in range(column_count):
             raw_value = row[col_index] if col_index < len(row) else ""
-            is_raw = isinstance(raw_value, dict) and "raw_xml" in raw_value
-            value = raw_value.get("text", "") if isinstance(raw_value, dict) else clean_docx_text(raw_value)
+            value = clean_docx_text(raw_value)
             is_label = col_index in label_columns and not is_header
             shade = None
             color = None
             bold = False
             if is_header:
-                if header_orange:
-                    shade = DOCX_ORANGE
-                    color = "FFFFFF"
-                elif header_dark:
-                    shade = DOCX_DARK
-                    color = "FFFFFF"
-                else:
-                    shade = DOCX_MID
+                shade = DOCX_ORANGE if header_orange else DOCX_LIGHT
+                color = "FFFFFF" if header_orange else None
                 bold = True
             elif is_label:
                 shade = DOCX_LIGHT
@@ -7925,28 +8521,26 @@ def docx_table(rows, header_first=False, widths=None, table_width=DOCX_CONTENT_W
                 shade=shade,
                 color=color,
                 size=17,
-                raw_xml=raw_value.get("raw_xml") if is_raw else None,
             ))
         tbl.append("</w:tr>")
 
     tbl.append("</w:tbl>")
     return "".join(tbl)
 
+
 def docx_spacer(height=90):
     return docx_paragraph("", spacing_after=height)
 
 
 def docx_section(title, value):
-    # Professional jobsheet section: dark grey header bar with bordered body.
     return (
-        docx_table([[title.upper()]], header_first=True, header_dark=True, widths=[DOCX_CONTENT_WIDTH])
-        + docx_table([[clean_docx_text(value)]], widths=[DOCX_CONTENT_WIDTH])
-        + docx_spacer(80)
+        docx_table([[title], [clean_docx_text(value)]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH])
+        + docx_spacer(100)
     )
 
 
 def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
-    # Build editable Word worksheet in the same simple style as the original PDF worksheet.
+    # Build an editable DOCX matching the previous professional PDF worksheet layout.
     cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "") or fields.get("Title", "")
     date_logged = format_sharepoint_date(fields.get("Date", ""))
     date_complete = datetime.now(UK_TZ).strftime("%d/%m/%Y")
@@ -7970,7 +8564,6 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
             "engineer": worksheet.get("engineer_name", ""),
             "status": outcome,
             "off_site": datetime.now(UK_TZ).strftime("%H:%M"),
-            "notes": build_visit_comment_extra(worksheet),
         }]
 
     visit_rows = [["Date", "Travel", "On-Site", "Engineer", "Status", "Off-Site"]]
@@ -7986,86 +8579,54 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 
     comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
 
-    image_parts = []
-    image_rels = []
-    logo_bytes, logo_ext = get_docx_logo_bytes()
-    if logo_bytes:
-        image_parts.append(("word/media/cdr-logo.%s" % logo_ext, logo_bytes))
-        image_rels.append(("rLogo", "media/cdr-logo.%s" % logo_ext))
-        logo_xml = docx_image_paragraph("rLogo", "CDR logo", width_mm=54, height_mm=20, align="center", spacing_after=0)
-    else:
-        logo_xml = docx_paragraph("CDR M&E Services Ltd", bold=True, size=24, align="center", spacing_after=0, color=DOCX_ORANGE)
-
-    signature_body = []
     if worksheet.get("ClientSignatureRequired"):
         if worksheet.get("ClientSignatureReceived"):
-            name = worksheet.get("ClientSignatureName", "")
-            signature_body.append([{"raw_xml": docx_paragraph(f"Client Name: {name}", bold=True, size=18, spacing_after=35)}])
-            signature_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
-            if signature_bytes:
-                signature_bytes = prepare_signature_image_for_export(signature_bytes)
-                sig_ext = "png"
-                image_parts.append(("word/media/client-signature.%s" % sig_ext, signature_bytes))
-                image_rels.append(("rSignature", "media/client-signature.%s" % sig_ext))
-                signature_body.append([{"raw_xml": docx_image_paragraph("rSignature", "Client signature", width_mm=70, height_mm=25, align="left", spacing_after=20)}])
-                signature_body.append([{"raw_xml": docx_paragraph("Signed Digitally: Yes", size=18, spacing_after=0)}])
-            else:
-                signature_body.append(["Signed Digitally: Yes"])
-                signature_body.append(["Signature image could not be embedded from SharePoint."])
+            signature_text = (
+                f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
+                "Signed Digitally: Yes\n"
+                "Signature image is saved against the job in SharePoint."
+            )
         else:
-            signature_body.append(["Client signature required but not received."])
+            signature_text = "Client signature required but not received."
     else:
-        signature_body.append(["Client signature not required."])
+        signature_text = "Client signature not required."
 
     body = []
-    body.append(logo_xml)
-    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=30, align="center", spacing_after=60))
+    body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="center", spacing_after=60))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd\n"
         "6 Mandale Park, Urlay Nook Road, Egglescliffe, Stockton-on-Tees, TS16 0TA\n"
-        "Telephone: 01642 057939    Email: helpdesk@cdrme.co.uk\n"
-        "VAT Number: 397715249    Company No.: 13744971",
-        size=16,
+        "Telephone: 01642 057939 | Email: helpdesk@cdrme.co.uk\n"
+        "VAT Number: 397715249 | Company No.: 13744971",
+        size=17,
         align="center",
-        spacing_after=130,
+        spacing_after=160,
     ))
 
     body.append(docx_table(
-        [["CUSTOMER DETAILS", "SITE DETAILS"], [customer_details, site_details]],
+        [["Customer Details", "Site Details"], [customer_details, site_details]],
         header_first=True,
-        header_dark=False,
+        header_orange=True,
         widths=[5160, 5160],
     ))
-    body.append(docx_spacer(90))
+    body.append(docx_spacer(110))
 
     body.append(docx_table(
         [
-            ["Job Number:", cdr_number, "Customer Order Number:", order_number],
-            ["Date Logged:", date_logged, "Job Category:", job_category],
-            ["Date Complete:", date_complete, "Status:", outcome],
+            ["Job Number", cdr_number, "Customer Order Number", order_number],
+            ["Date Logged", date_logged, "Job Category", job_category],
+            ["Date Complete", date_complete, "Status", outcome],
         ],
-        widths=[1650, 3510, 2350, 2810],
+        widths=[1950, 3210, 2450, 2710],
         label_columns={0, 2},
     ))
-    body.append(docx_spacer(90))
+    body.append(docx_spacer(110))
 
     body.append(docx_section("Description", task))
-
-    body.append(docx_table([["VISITS"]], header_first=True, header_dark=True, widths=[DOCX_CONTENT_WIDTH]))
-    body.append(docx_table(
-        visit_rows,
-        header_first=True,
-        header_dark=False,
-        widths=[1450, 1250, 1250, 2550, 2200, 1620],
-    ))
-    body.append(docx_spacer(100))
-
+    body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
+    body.append(docx_spacer(110))
     body.append(docx_section("Engineer Comment", comments))
-
-    body.append(docx_table([["CLIENT SIGNATURE"]], header_first=True, header_dark=True, widths=[DOCX_CONTENT_WIDTH]))
-    body.append(docx_table(signature_body, widths=[DOCX_CONTENT_WIDTH]))
-    body.append(docx_spacer(80))
-
+    body.append(docx_section("Client Signature", signature_text))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk",
         size=16,
@@ -8073,13 +8634,8 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         spacing_after=0,
     ))
 
-    document_xml = f"""<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-            xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-            xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
-            xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main'
-            xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>
-<w:background w:color='FFFFFF'/>
+    document_xml = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
 <w:body>
 {''.join(body)}
 <w:sectPr>
@@ -8087,48 +8643,41 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <w:pgMar w:top='680' w:right='793' w:bottom='680' w:left='793' w:header='720' w:footer='720' w:gutter='0'/>
 </w:sectPr>
 </w:body>
-</w:document>"""
+</w:document>'''
 
-    content_types = """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    content_types = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
 <Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
 <Default Extension='xml' ContentType='application/xml'/>
-<Default Extension='png' ContentType='image/png'/>
-<Default Extension='jpeg' ContentType='image/jpeg'/>
-<Default Extension='jpg' ContentType='image/jpeg'/>
-<Default Extension='gif' ContentType='image/gif'/>
 <Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
 <Override PartName='/docProps/core.xml' ContentType='application/vnd.openxmlformats-package.core-properties+xml'/>
 <Override PartName='/docProps/app.xml' ContentType='application/vnd.openxmlformats-officedocument.extended-properties+xml'/>
-</Types>"""
+</Types>'''
 
-    root_rels = """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    root_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>
 <Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='word/document.xml'/>
 <Relationship Id='rId2' Type='http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties' Target='docProps/core.xml'/>
 <Relationship Id='rId3' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties' Target='docProps/app.xml'/>
-</Relationships>"""
+</Relationships>'''
 
-    rel_lines = ["<?xml version='1.0' encoding='UTF-8' standalone='yes'?><Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"]
-    for rel_id, target in image_rels:
-        rel_lines.append(f"<Relationship Id='{rel_id}' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='{target}'/>")
-    rel_lines.append("</Relationships>")
-    doc_rels = "".join(rel_lines)
+    doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>'''
 
     now_iso = datetime.now(UK_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    core = f"""<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    core = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <cp:coreProperties xmlns:cp='http://schemas.openxmlformats.org/package/2006/metadata/core-properties' xmlns:dc='http://purl.org/dc/elements/1.1/' xmlns:dcterms='http://purl.org/dc/terms/' xmlns:dcmitype='http://purl.org/dc/dcmitype/' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'>
 <dc:title>{docx_escape(cdr_number)} Worksheet</dc:title>
 <dc:creator>CDR Engineer Bot</dc:creator>
 <cp:lastModifiedBy>CDR Engineer Bot</cp:lastModifiedBy>
 <dcterms:created xsi:type='dcterms:W3CDTF'>{now_iso}</dcterms:created>
 <dcterms:modified xsi:type='dcterms:W3CDTF'>{now_iso}</dcterms:modified>
-</cp:coreProperties>"""
+</cp:coreProperties>'''
 
-    app_props = """<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+    app_props = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <Properties xmlns='http://schemas.openxmlformats.org/officeDocument/2006/extended-properties' xmlns:vt='http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'>
 <Application>CDR Engineer Bot</Application>
-</Properties>"""
+</Properties>'''
 
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as docx:
@@ -8138,10 +8687,9 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         docx.writestr("word/document.xml", document_xml)
         docx.writestr("docProps/core.xml", core)
         docx.writestr("docProps/app.xml", app_props)
-        for part_name, data in image_parts:
-            docx.writestr(part_name, data)
 
     return buffer.getvalue()
+
 
 
 def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet, fields, updated_log, outcome):
@@ -8165,6 +8713,160 @@ def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet,
     except Exception as e:
         print(f"ERROR generating worksheet Word document: {e}")
         return ""
+
+
+
+def get_engineer_by_lookup_id(engineers, lookup_id):
+    lookup_id = str(lookup_id or "")
+    for engineer in engineers or []:
+        fields = engineer.get("fields", {})
+        item_lookup_id = str(fields.get("id", "") or engineer.get("id", ""))
+        if item_lookup_id == lookup_id:
+            return {
+                "lookup_id": item_lookup_id,
+                "name": str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or f"Engineer {lookup_id}"),
+                "telegram_id": str(get_field_value(fields, "TelegramID", "Telegram ID") or "").strip(),
+            }
+    return None
+
+
+def build_pending_review_update_fields(worksheet, fields, updated_log, outcome):
+    """Store engineer submission for Helpdesk review and remove current engineer.
+
+    This deliberately does not generate a worksheet and does not final-close the job.
+    """
+    payload = {
+        "Status": AWAITING_HELPDESK_REVIEW_STATUS,
+        "PendingHelpdeskReview": True,
+        "Pending Helpdesk Review": True,
+        "PendingOutcome": outcome,
+        "Pending Outcome": outcome,
+        "PendingOutcomeEngineer": worksheet.get("engineer_name", ""),
+        "Pending Outcome Engineer": worksheet.get("engineer_name", ""),
+        "PendingOutcomeEngineerLookupId": str(worksheet.get("engineer_lookup_id", "")),
+        "Pending Outcome Engineer Lookup Id": str(worksheet.get("engineer_lookup_id", "")),
+        "PendingOutcomeDateTime": graph_datetime_now(),
+        "Pending Outcome Date Time": graph_datetime_now(),
+        "PendingWorkCompleted": worksheet.get("WorkCompleted", ""),
+        "Pending Work Completed": worksheet.get("WorkCompleted", ""),
+        "PendingMaterialsUsed": worksheet.get("MaterialsUsed", ""),
+        "Pending Materials Used": worksheet.get("MaterialsUsed", ""),
+        "PendingFollowOnRequired": worksheet.get("FollowOnRequired", False),
+        "Pending Follow On Required": worksheet.get("FollowOnRequired", False),
+        "PendingFollowOnNotes": worksheet.get("FollowOnNotes", ""),
+        "Pending Follow On Notes": worksheet.get("FollowOnNotes", ""),
+        "PendingNoAccessReason": worksheet.get("NoAccessReason", ""),
+        "Pending No Access Reason": worksheet.get("NoAccessReason", ""),
+        "PendingClientSignatureRequired": worksheet.get("ClientSignatureRequired", False),
+        "Pending Client Signature Required": worksheet.get("ClientSignatureRequired", False),
+        "PendingPhotoCount": len(worksheet.get("photo_links", [])),
+        "Pending Photo Count": len(worksheet.get("photo_links", [])),
+        "EngineerVisitLog": updated_log,
+        "WorksheetSubmitted": False,
+        "WorksheetGenerated": False,
+        "TelegramNotified": False,
+    }
+    payload.update(
+        remove_current_engineer_assignment_payload(
+            fields,
+            worksheet.get("engineer_lookup_id", ""),
+        )
+    )
+    return payload
+
+
+def build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id):
+    cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+    outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or "Completed"
+    return {
+        "site_id": site_id,
+        "jobs_list_id": jobs_list_id,
+        "item_id": item_id,
+        "cdr_number": cdr_number,
+        "engineer_name": get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer",
+        "engineer_lookup_id": str(get_field_value(fields, "PendingOutcomeEngineerLookupId", "Pending Outcome Engineer Lookup Id") or ""),
+        "JobOutcome": outcome,
+        "WorkCompleted": get_field_value(fields, "PendingWorkCompleted", "Pending Work Completed") or "",
+        "MaterialsUsed": get_field_value(fields, "PendingMaterialsUsed", "Pending Materials Used") or "",
+        "FollowOnRequired": bool_field(get_field_value(fields, "PendingFollowOnRequired", "Pending Follow On Required")),
+        "FollowOnNotes": get_field_value(fields, "PendingFollowOnNotes", "Pending Follow On Notes") or "",
+        "NoAccessReason": get_field_value(fields, "PendingNoAccessReason", "Pending No Access Reason") or "",
+        "ClientSignatureRequired": bool_field(get_field_value(fields, "PendingClientSignatureRequired", "Pending Client Signature Required")),
+        "ClientSignatureReceived": bool_field(get_field_value(fields, "ClientSignatureReceived")),
+        "photo_links": [],
+        "photo_files_for_group": [],
+        "fields": fields,
+    }
+
+
+def clear_pending_review_fields():
+    return {
+        "PendingHelpdeskReview": False,
+        "Pending Helpdesk Review": False,
+        "PendingOutcome": "",
+        "Pending Outcome": "",
+        "PendingOutcomeEngineer": "",
+        "Pending Outcome Engineer": "",
+        "PendingOutcomeEngineerLookupId": "",
+        "Pending Outcome Engineer Lookup Id": "",
+        "PendingOutcomeDateTime": "",
+        "Pending Outcome Date Time": "",
+        "PendingWorkCompleted": "",
+        "Pending Work Completed": "",
+        "PendingMaterialsUsed": "",
+        "Pending Materials Used": "",
+        "PendingFollowOnRequired": False,
+        "Pending Follow On Required": False,
+        "PendingFollowOnNotes": "",
+        "Pending Follow On Notes": "",
+        "PendingNoAccessReason": "",
+        "Pending No Access Reason": "",
+        "PendingClientSignatureRequired": False,
+        "Pending Client Signature Required": False,
+        "PendingPhotoCount": "",
+        "Pending Photo Count": "",
+        "HelpdeskReviewDecision": "",
+        "Helpdesk Review Decision": "",
+        "HelpdeskApprovedBy": "",
+        "Helpdesk Approved By": "",
+        "HelpdeskApprovedDateTime": "",
+        "Helpdesk Approved Date Time": "",
+    }
+
+
+def get_helpdesk_review_keyboard(item_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Approve Complete / Generate Worksheet", callback_data=f"helpdesk_review|{item_id}|Completed")],
+        [InlineKeyboardButton("🔁 Approve Revisit Required", callback_data=f"helpdesk_review|{item_id}|Revisit Required")],
+        [InlineKeyboardButton("🚫 Approve No Access", callback_data=f"helpdesk_review|{item_id}|No Access")],
+        [InlineKeyboardButton("⏹ Approve Abandoned", callback_data=f"helpdesk_review|{item_id}|Abandoned")],
+        [InlineKeyboardButton("❌ Reject / Send Back to Engineer", callback_data=f"helpdesk_review|{item_id}|Reject")],
+    ])
+
+
+async def notify_helpdesk_review_required(context, worksheet, fields, outcome):
+    if not HELPDESK_CHAT_ID:
+        return
+
+    await context.bot.send_message(
+        chat_id=HELPDESK_CHAT_ID,
+        text=(
+            "🧾 Job Awaiting Helpdesk Review\n\n"
+            f"CDR Number: {worksheet.get('cdr_number', '')}\n"
+            f"Site: {fields.get('SiteName', '')}\n"
+            f"Engineer: {worksheet.get('engineer_name', '')}\n"
+            f"Engineer selected: {outcome}\n\n"
+            f"Work completed / notes:\n{worksheet.get('WorkCompleted', '')}\n\n"
+            f"Materials used:\n{worksheet.get('MaterialsUsed', '') or 'None'}\n\n"
+            f"Follow-on required: {'Yes' if worksheet.get('FollowOnRequired') else 'No'}\n"
+            f"Follow-on notes: {worksheet.get('FollowOnNotes', '') or 'None'}\n"
+            f"No Access reason: {worksheet.get('NoAccessReason', 'N/A') if outcome == 'No Access' else 'N/A'}\n"
+            f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
+            f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n\n"
+            "Please approve or change the outcome below."
+        ),
+        reply_markup=get_helpdesk_review_keyboard(worksheet.get("item_id")),
+    )
 
 
 def build_worksheet_update_fields(worksheet, fields, updated_log, outcome, is_final_engineer, worksheet_pdf_link=""):
@@ -8271,69 +8973,33 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated_log = append_engineer_log(
             fields,
             worksheet["engineer_name"],
-            outcome,
+            f"Submitted for Helpdesk Review - {outcome}",
             build_visit_comment_extra(worksheet),
         )
 
-        assigned_ids = get_assigned_engineer_ids(fields)
-        is_final_engineer = len(assigned_ids) <= 1
-
-        worksheet_pdf_link = ""
-        if is_final_engineer and outcome == "Completed":
-            worksheet_pdf_link = generate_and_upload_worksheet_pdf(
-                site_id,
-                jobs_list_id,
-                item_id,
-                worksheet,
-                fields,
-                updated_log,
-                outcome,
-            )
-
-        fields_to_update = build_worksheet_update_fields(
+        pending_update = build_pending_review_update_fields(
             worksheet,
             fields,
             updated_log,
             outcome,
-            is_final_engineer,
-            worksheet_pdf_link,
         )
 
-        update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
+        update_list_item_fields(site_id, jobs_list_id, item_id, pending_update)
 
         update_active_day_live_status(
             site_id,
             str(update.effective_user.id),
-            outcome,
+            "Awaiting Helpdesk Review",
             get_job_reference(fields),
         )
 
-        if outcome == "Completed":
-            final_pdf_text = "\n\nFinal PDF worksheet generated." if worksheet_pdf_link else "\n\nFinal PDF worksheet will generate when the last assigned engineer submits."
-        else:
-            final_pdf_text = ""
         await update.message.reply_text(
-            f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
+            f"Submitted for Helpdesk review:\n\n{worksheet['cdr_number']} → {outcome}\n\n"
+            "You have been removed from this job and can move on. The office will approve or change the outcome.",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
 
-        await notify_helpdesk(
-            context,
-            (
-                f"Worksheet submitted\n\n"
-                f"CDR Number: {worksheet['cdr_number']}\n"
-                f"Engineer: {worksheet['engineer_name']}\n"
-                f"Outcome: {outcome}\n"
-                f"No Access reason: {worksheet.get('NoAccessReason', 'N/A') if outcome == 'No Access' else 'N/A'}\n"
-                f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
-                f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
-                f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
-                f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
-            ),
-        )
-
-        if outcome in ["Completed", "No Access", "Revisit Required"]:
-            await notify_trade_group(context, worksheet, fields, updated_log, outcome)
+        await notify_helpdesk_review_required(context, worksheet, fields, outcome)
 
         context.user_data.pop("worksheet", None)
         return ConversationHandler.END
@@ -8576,7 +9242,7 @@ async def remind_engineers_to_start_day(app):
             if active_value not in [None, ""] and not bool_field(active_value):
                 continue
 
-            if role not in ["engineer", "admin"]:
+            if role not in ["engineer", "admin", "apprentice"]:
                 continue
 
             if not telegram_id:
@@ -8699,6 +9365,441 @@ async def check_engineer_idle_alerts(app):
         print(f"ERROR checking engineer idle alerts: {e}")
 
 
+
+MESSAGE_TEMPLATES = {
+    "start_day": "Please remember to start your day on the bot.",
+    "log_job": "Please remember to log onto your current job on the bot.",
+    "end_day": "Please remember to end your day on the bot when finished.",
+    "call_office": "Please call the office when you are free.",
+    "upload_photos": "Please upload the missing job photos when you have signal.",
+    "complete_worksheet": "Please complete your worksheet for the job before leaving site.",
+    "custom": "",
+}
+
+
+def get_message_template_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["Start Day", "Log Job"],
+            ["End Day", "Call Office"],
+            ["Upload Photos", "Complete Worksheet"],
+            ["Custom"],
+            ["/cancel"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def normalise_message_template(value):
+    return {
+        "start day": "start_day",
+        "log job": "log_job",
+        "end day": "end_day",
+        "call office": "call_office",
+        "upload photos": "upload_photos",
+        "complete worksheet": "complete_worksheet",
+        "custom": "custom",
+    }.get(str(value or "").strip().lower())
+
+
+async def start_message_engineer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text("This option is only available to Helpdesk/Admin users.")
+        return ConversationHandler.END
+
+    site_id = get_site_id()
+    engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
+    engineers = get_list_items(site_id, engineers_list_id)
+    assignable = get_active_assignable_engineers(engineers)
+    context.user_data["message_engineers"] = assignable
+
+    await update.message.reply_text(
+        "Who do you want to message? Reply with engineer number(s), for example 1 or 1,3.\n\n"
+        + format_engineer_selection_list(assignable),
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+    )
+    return MESSAGE_ENGINEER_SELECT
+
+
+async def message_engineer_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    engineers = context.user_data.get("message_engineers", [])
+    selected, error = parse_engineer_selection(update.message.text, engineers)
+    if error:
+        await update.message.reply_text(error)
+        return MESSAGE_ENGINEER_SELECT
+
+    context.user_data["message_engineer_selected"] = selected
+    await update.message.reply_text("Choose a template or select Custom.", reply_markup=get_message_template_keyboard())
+    return MESSAGE_ENGINEER_TEMPLATE
+
+
+async def message_engineer_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    template_key = normalise_message_template(update.message.text)
+    if not template_key:
+        await update.message.reply_text("Please choose one of the template buttons.")
+        return MESSAGE_ENGINEER_TEMPLATE
+
+    if template_key == "custom":
+        await update.message.reply_text("Type the custom message you want to send.", reply_markup=ReplyKeyboardRemove())
+        return MESSAGE_ENGINEER_TEXT
+
+    context.user_data["message_engineer_text"] = MESSAGE_TEMPLATES[template_key]
+    selected = context.user_data.get("message_engineer_selected", [])
+    names = ", ".join(e["name"] for e in selected)
+    await update.message.reply_text(
+        f"Review message to: {names}\n\n{MESSAGE_TEMPLATES[template_key]}\n\nReply YES to send or NO to cancel.",
+        reply_markup=get_review_reply_keyboard(),
+    )
+    return MESSAGE_ENGINEER_REVIEW
+
+
+async def message_engineer_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = str(update.message.text or "").strip()
+    if not message:
+        await update.message.reply_text("Please type a message.")
+        return MESSAGE_ENGINEER_TEXT
+
+    context.user_data["message_engineer_text"] = message
+    selected = context.user_data.get("message_engineer_selected", [])
+    names = ", ".join(e["name"] for e in selected)
+    await update.message.reply_text(
+        f"Review message to: {names}\n\n{message}\n\nReply YES to send or NO to cancel.",
+        reply_markup=get_review_reply_keyboard(),
+    )
+    return MESSAGE_ENGINEER_REVIEW
+
+
+async def message_engineer_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = str(update.message.text or "").strip().lower()
+    if answer in ["❌ no", "no", "n", "cancel"]:
+        await update.message.reply_text("Message cancelled.", reply_markup=get_helpdesk_menu(include_engineer_menu=True))
+        return ConversationHandler.END
+
+    if answer not in ["✅ yes", "yes", "y"]:
+        await update.message.reply_text("Reply YES to send or NO to cancel.")
+        return MESSAGE_ENGINEER_REVIEW
+
+    selected = context.user_data.get("message_engineer_selected", [])
+    message = context.user_data.get("message_engineer_text", "")
+    sent = []
+    failed = []
+
+    for engineer in selected:
+        try:
+            await context.bot.send_message(
+                chat_id=engineer["telegram_id"],
+                text=f"📢 Message from CDR Helpdesk\n\n{message}",
+            )
+            sent.append(engineer["name"])
+        except Exception as e:
+            failed.append(f"{engineer['name']}: {e}")
+
+    if HELPDESK_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=HELPDESK_CHAT_ID,
+                text=f"📢 Bot message sent to: {', '.join(sent) or 'None'}\n\nMessage:\n{message}",
+            )
+        except Exception:
+            pass
+
+    reply = f"Message sent to: {', '.join(sent) or 'None'}"
+    if failed:
+        reply += "\n\nFailed:\n" + "\n".join(failed)
+
+    await update.message.reply_text(reply, reply_markup=get_helpdesk_menu(include_engineer_menu=True))
+    return ConversationHandler.END
+
+
+async def send_due_task_activity_reminders(app):
+    """Send 08:00 reminders for stored Task / Activity items due today.
+
+    Requires SharePoint list: Task Activities.
+    Safe: only reads Task Activities and marks ReminderSent on that task record.
+    Does not touch jobs, worksheets, photos, signatures or day logs.
+    """
+    try:
+        site_id = get_site_id()
+        tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
+        tasks = get_list_items(site_id, tasks_list_id)
+        today = get_today_iso()
+
+        for task in tasks:
+            fields = task.get("fields", {})
+            status = str(get_field_value(fields, "Status") or "Active").strip().lower()
+            if status != "active":
+                continue
+
+            if bool_field(get_field_value(fields, "ReminderSent", "Reminder Sent")):
+                continue
+
+            raw_date = get_field_value(fields, "TaskDate", "Task Date", "Date")
+            parsed_date = sharepoint_date_to_uk_date(raw_date)
+            task_date = parsed_date.isoformat() if parsed_date else str(raw_date)[:10]
+            if task_date != today:
+                continue
+
+            telegram_ids_raw = str(get_field_value(fields, "AssignedTelegramIDs", "Assigned Telegram IDs") or "")
+            telegram_ids = [x.strip() for x in re.split(r"[\n,;]+", telegram_ids_raw) if x.strip()]
+            if not telegram_ids:
+                continue
+
+            title = str(get_field_value(fields, "Title") or "Task / Activity")
+            time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "")
+            details = str(get_field_value(fields, "TaskDetails", "Task Details") or "")
+
+            for telegram_id in telegram_ids:
+                try:
+                    await app.bot.send_message(
+                        chat_id=telegram_id,
+                        text=(
+                            "📋 Task / Activity Reminder - Today\n\n"
+                            f"{title}\n"
+                            f"Date: {format_sharepoint_date(raw_date) or task_date}\n"
+                            f"Time: {time_text or 'N/A'}\n\n"
+                            f"{details}"
+                        ),
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not send task/activity reminder to {telegram_id}: {e}")
+
+            update_list_item_fields(
+                site_id,
+                tasks_list_id,
+                task.get("id"),
+                build_field_payload_for_list(site_id, tasks_list_id, {"ReminderSent": True, "Reminder Sent": True}),
+            )
+
+    except Exception as e:
+        print(f"ERROR sending task/activity reminders: {e}")
+
+
+
+
+
+def task_date_iso_from_fields(fields):
+    raw_date = get_field_value(fields, "TaskDate", "Task Date", "Date")
+    parsed_date = sharepoint_date_to_uk_date(raw_date)
+    if parsed_date:
+        return parsed_date.isoformat()
+    return str(raw_date or "")[:10]
+
+
+def task_is_active_or_future(fields):
+    status = str(get_field_value(fields, "Status") or "Active").strip().lower()
+    if status != "active":
+        return False
+
+    task_date = task_date_iso_from_fields(fields)
+    today = get_today_iso()
+
+    # Show current and future active tasks for cancellation.
+    # Old tasks stay hidden even if their status was not manually completed.
+    return bool(task_date) and task_date >= today
+
+
+def format_task_activity_option(index, task):
+    fields = task.get("fields", {})
+    title = str(get_field_value(fields, "Title") or "Task / Activity")
+    task_date = task_date_iso_from_fields(fields)
+    time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "")
+    assigned = str(get_field_value(fields, "AssignedNames", "Assigned Names") or "").strip()
+    details = str(get_field_value(fields, "TaskDetails", "Task Details") or "").strip()
+
+    line = f"{index}. {title} | {task_date or 'No date'}"
+    if time_text:
+        line += f" | {time_text}"
+    if assigned:
+        line += f" | {assigned}"
+    if details:
+        short_details = details.replace("\\n", " ")
+        if len(short_details) > 70:
+            short_details = short_details[:67] + "..."
+        line += f"\\n   {short_details}"
+    return line
+
+
+def task_telegram_ids_from_fields(fields):
+    telegram_ids_raw = str(get_field_value(fields, "AssignedTelegramIDs", "Assigned Telegram IDs") or "")
+    return [x.strip() for x in re.split(r"[\\n,;]+", telegram_ids_raw) if x.strip()]
+
+
+async def start_cancel_task_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text("This option is only available to Helpdesk/Admin users.")
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
+        tasks = get_list_items(site_id, tasks_list_id)
+    except Exception as e:
+        await update.message.reply_text(
+            "I could not open the Task Activities list. Check the SharePoint list exists and is named exactly: Task Activities"
+        )
+        print(f"ERROR opening Task Activities list for cancellation: {e}")
+        return ConversationHandler.END
+
+    active_tasks = [task for task in tasks if task_is_active_or_future(task.get("fields", {}))]
+    active_tasks.sort(key=lambda t: (task_date_iso_from_fields(t.get("fields", {})), str(get_field_value(t.get("fields", {}), "TaskTime", "Task Time") or "")))
+
+    if not active_tasks:
+        await update.message.reply_text("There are no active current/future Task / Activity items to cancel.")
+        return ConversationHandler.END
+
+    context.user_data["cancel_task_site_id"] = site_id
+    context.user_data["cancel_task_list_id"] = tasks_list_id
+    context.user_data["cancel_task_items"] = active_tasks
+
+    options = "\\n\\n".join(format_task_activity_option(i, task) for i, task in enumerate(active_tasks, start=1))
+    await update.message.reply_text(
+        "Which Task / Activity do you want to cancel? Reply with the number.\\n\\n" + options,
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
+    )
+    return CANCEL_TASK_SELECT
+
+
+async def cancel_task_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_value = str(update.message.text or "").strip()
+    tasks = context.user_data.get("cancel_task_items", [])
+
+    if not text_value.isdigit():
+        await update.message.reply_text("Please reply with the task number.")
+        return CANCEL_TASK_SELECT
+
+    index = int(text_value)
+    if index < 1 or index > len(tasks):
+        await update.message.reply_text("That number is not in the list.")
+        return CANCEL_TASK_SELECT
+
+    selected = tasks[index - 1]
+    context.user_data["cancel_task_selected"] = selected
+
+    await update.message.reply_text(
+        "Please type the cancellation reason. This will be sent to the assigned person/people.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return CANCEL_TASK_REASON
+
+
+async def cancel_task_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reason = str(update.message.text or "").strip()
+    if not reason:
+        await update.message.reply_text("Please type a cancellation reason.")
+        return CANCEL_TASK_REASON
+
+    context.user_data["cancel_task_reason"] = reason
+    task = context.user_data.get("cancel_task_selected", {})
+    fields = task.get("fields", {})
+
+    title = str(get_field_value(fields, "Title") or "Task / Activity")
+    task_date = task_date_iso_from_fields(fields)
+    time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "")
+    assigned = str(get_field_value(fields, "AssignedNames", "Assigned Names") or "").strip()
+
+    await update.message.reply_text(
+        "Review cancellation:\\n\\n"
+        f"Task: {title}\\n"
+        f"Date: {task_date or 'N/A'}\\n"
+        f"Time: {time_text or 'N/A'}\\n"
+        f"Assigned: {assigned or 'N/A'}\\n\\n"
+        f"Reason:\\n{reason}\\n\\n"
+        "Reply YES to cancel and notify, or NO to stop.",
+        reply_markup=get_review_reply_keyboard(),
+    )
+    return CANCEL_TASK_REVIEW
+
+
+async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = str(update.message.text or "").strip().lower()
+    if answer in ["❌ no", "no", "n", "cancel"]:
+        await update.message.reply_text("Task / Activity cancellation stopped.", reply_markup=get_helpdesk_menu(include_engineer_menu=True))
+        return ConversationHandler.END
+
+    if answer not in ["✅ yes", "yes", "y"]:
+        await update.message.reply_text("Reply YES to cancel and notify, or NO to stop.")
+        return CANCEL_TASK_REVIEW
+
+    site_id = context.user_data.get("cancel_task_site_id")
+    tasks_list_id = context.user_data.get("cancel_task_list_id")
+    task = context.user_data.get("cancel_task_selected", {})
+    reason = context.user_data.get("cancel_task_reason", "")
+    fields = task.get("fields", {})
+    task_id = task.get("id")
+
+    title = str(get_field_value(fields, "Title") or "Task / Activity")
+    raw_date = get_field_value(fields, "TaskDate", "Task Date", "Date")
+    task_date = format_sharepoint_date(raw_date) or task_date_iso_from_fields(fields)
+    time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "")
+    details = str(get_field_value(fields, "TaskDetails", "Task Details") or "")
+    telegram_ids = task_telegram_ids_from_fields(fields)
+
+    try:
+        payload = build_field_payload_for_list(
+            site_id,
+            tasks_list_id,
+            {
+                "Status": "Cancelled",
+                "CancelReason": reason,
+                "Cancel Reason": reason,
+                "CancelledDateTime": graph_datetime_now(),
+                "Cancelled Date Time": graph_datetime_now(),
+            },
+        )
+        update_list_item_fields(site_id, tasks_list_id, task_id, payload)
+    except Exception as e:
+        await update.message.reply_text(f"I could not update the task to Cancelled in SharePoint: {e}")
+        return ConversationHandler.END
+
+    sent = []
+    failed = []
+    for telegram_id in telegram_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    "❌ Task / Activity Cancelled\\n\\n"
+                    "Please do not attend the following:\\n\\n"
+                    f"{title}\\n"
+                    f"Date: {task_date or 'N/A'}\\n"
+                    f"Time: {time_text or 'N/A'}\\n\\n"
+                    f"{details}\\n\\n"
+                    f"Reason: {reason}"
+                ),
+            )
+            sent.append(telegram_id)
+        except Exception as e:
+            failed.append(f"{telegram_id}: {e}")
+
+    if HELPDESK_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=HELPDESK_CHAT_ID,
+                text=(
+                    "❌ Task / Activity cancelled\\n\\n"
+                    f"Task: {title}\\n"
+                    f"Date: {task_date or 'N/A'}\\n"
+                    f"Time: {time_text or 'N/A'}\\n"
+                    f"Reason: {reason}\\n"
+                    f"Notified: {len(sent)}"
+                ),
+            )
+        except Exception:
+            pass
+
+    reply = f"Task / Activity cancelled and notification sent to {len(sent)} recipient(s)."
+    if failed:
+        reply += "\\n\\nFailed to notify:\\n" + "\\n".join(failed)
+
+    await update.message.reply_text(reply, reply_markup=get_helpdesk_menu(include_engineer_menu=True))
+    return ConversationHandler.END
+
+
+
+
 GLOBAL_SCHEDULER = None
 
 
@@ -8736,9 +9837,10 @@ async def post_init(app):
     )
 
     scheduler.add_job(
-        check_engineer_idle_alerts,
-        trigger="interval",
-        minutes=IDLE_ALERT_CHECK_MINUTES,
+        send_due_task_activity_reminders,
+        trigger="cron",
+        hour=8,
+        minute=0,
         args=[app],
     )
 
@@ -8844,6 +9946,22 @@ bugidea_handler = ConversationHandler(
 
 
 
+reopenjob_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("reopenjob", reopenjob_start),
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_REOPEN_JOB)}$"), reopenjob_start),
+    ],
+    states={
+        REOPENJOB_CDR_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reopenjob_cdr_number)],
+        REOPENJOB_DATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reopenjob_date)],
+        REOPENJOB_ASSIGN_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reopenjob_assign_engineers)],
+        REOPENJOB_REASON: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reopenjob_reason)],
+        REOPENJOB_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reopenjob_review)],
+    },
+    fallbacks=[CommandHandler("cancel", reopenjob_cancel)],
+)
+
+
 reassign_handler = ConversationHandler(
     entry_points=[
         CommandHandler("reassign", reassign_start),
@@ -8853,6 +9971,7 @@ reassign_handler = ConversationHandler(
         REASSIGN_CDR_NUMBER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_cdr_number)],
         REASSIGN_REMOVE_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_remove_engineers)],
         REASSIGN_ASSIGN_ENGINEERS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_assign_engineers)],
+        REASSIGN_DATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_date)],
         REASSIGN_REASON: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_reason)],
         REASSIGN_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, reassign_review)],
     },
@@ -8987,35 +10106,6 @@ def parse_quote_recipient_selection(text, recipients):
     return selected, ""
 
 
-def get_quote_recipient_inline_keyboard(recipients):
-    rows = []
-    for index, recipient in enumerate(recipients, start=1):
-        rows.append([InlineKeyboardButton(
-            f"{index}. {recipient.get('name', 'Recipient')}",
-            callback_data=f"quote_recipient|{index}",
-        )])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="quote_recipient|cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def get_quote_time_inline_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ASAP", callback_data="quote_time|ASAP")],
-        [InlineKeyboardButton("08:00", callback_data="quote_time|08:00"), InlineKeyboardButton("11:00", callback_data="quote_time|11:00")],
-        [InlineKeyboardButton("14:00", callback_data="quote_time|14:00"), InlineKeyboardButton("✏️ Custom", callback_data="quote_time|custom")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="quote_time|cancel")],
-    ])
-
-
-def get_quote_review_inline_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Send task / activity", callback_data="quote_review|yes")],
-        [InlineKeyboardButton("🔄 Restart", callback_data="quote_review|restart")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="quote_review|no")],
-    ])
-
-
-
 async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -9024,7 +10114,7 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not user_can_use_helpdesk(role):
         await update.message.reply_text(
-            "You do not have permission to create tasks / activities.",
+            "You do not have permission to create task / activitys.",
             reply_markup=get_main_menu(role),
         )
         return ConversationHandler.END
@@ -9041,8 +10131,9 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
         context.user_data["quote_reminder"] = {"role": role, "recipients": recipients}
         await update.message.reply_text(
-            "Task / Activity.\n\nWho should this be sent to?",
-            reply_markup=get_quote_recipient_inline_keyboard(recipients),
+            "Quote reminder.\n\nWho should this be sent to? Reply with the number.\n\n" +
+            format_quote_recipient_list(recipients),
+            reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
         )
         return QUOTE_RECIPIENT
 
@@ -9053,40 +10144,6 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
-
-
-async def quote_reminder_recipient_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    reminder = context.user_data.get("quote_reminder")
-    if not reminder:
-        await query.message.reply_text("Task / Activity has expired. Please start again.")
-        return ConversationHandler.END
-
-    value = query.data.split("|", 1)[1]
-    role = reminder.get("role", "Helpdesk")
-
-    if value == "cancel":
-        context.user_data.pop("quote_reminder", None)
-        await query.message.reply_text(
-            "Task / Activity cancelled.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    recipients = reminder.get("recipients", [])
-    try:
-        index = int(value)
-        recipient = recipients[index - 1]
-    except Exception:
-        await query.message.reply_text("Please select a recipient from the buttons.")
-        return QUOTE_RECIPIENT
-
-    reminder["recipients_selected"] = [recipient]
-    reminder["recipient"] = recipient
-    await query.message.reply_text(f"Selected: {recipient.get('name', '')}\n\nEnter the client name.")
-    return QUOTE_CLIENT
 
 
 async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9104,9 +10161,34 @@ async def quote_reminder_recipient(update: Update, context: ContextTypes.DEFAULT
 
     reminder["recipients_selected"] = recipients
     reminder["recipient"] = recipients[0]
-    await update.message.reply_text("Enter the client name.")
-    return QUOTE_CLIENT
+    await update.message.reply_text("Enter the Task / Activity date. Example: Today, Tomorrow, 15/05/2026")
+    return QUOTE_DATE
 
+
+
+async def quote_reminder_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    reminder = context.user_data.get("quote_reminder")
+    if not reminder:
+        return await quote_reminder_start(update, context)
+
+    value = update.message.text.strip()
+    parsed_date, date_display, time_from_line = parse_task_activity_datetime(value)
+    if not parsed_date:
+        await update.message.reply_text("Please enter a valid date. Example: Today, Tomorrow, 15/05/2026")
+        return QUOTE_DATE
+
+    reminder["date"] = parsed_date
+    reminder["date_display"] = date_display or parsed_date
+    if time_from_line:
+        reminder["time"] = time_from_line
+        await update.message.reply_text("Enter the client / site name.")
+        return QUOTE_CLIENT
+
+    await update.message.reply_text("Enter the client / site name.")
+    return QUOTE_CLIENT
 
 async def quote_reminder_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
@@ -9119,7 +10201,7 @@ async def quote_reminder_client(update: Update, context: ContextTypes.DEFAULT_TY
         return QUOTE_CLIENT
 
     reminder["client"] = value
-    await update.message.reply_text("Enter the address / site to attend.")
+    await update.message.reply_text("Enter the address / site to attend, or type None if not needed.")
     return QUOTE_ADDRESS
 
 
@@ -9129,45 +10211,9 @@ async def quote_reminder_address(update: Update, context: ContextTypes.DEFAULT_T
 
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
-    if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the address / site to attend.")
-        return QUOTE_ADDRESS
-
-    reminder["address"] = value
-    await update.message.reply_text(
-        "Select the time for this task / activity.",
-        reply_markup=get_quote_time_inline_keyboard(),
-    )
+    reminder["address"] = "" if is_blank_or_skip(value) else value
+    await update.message.reply_text("Enter the time. Example: 08:00, 11:00, 14:00, ASAP")
     return QUOTE_TIME
-
-
-async def quote_reminder_time_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    reminder = context.user_data.get("quote_reminder")
-    if not reminder:
-        await query.message.reply_text("Task / Activity has expired. Please start again.")
-        return ConversationHandler.END
-
-    value = query.data.split("|", 1)[1]
-    role = reminder.get("role", "Helpdesk")
-
-    if value == "cancel":
-        context.user_data.pop("quote_reminder", None)
-        await query.message.reply_text(
-            "Task / Activity cancelled.",
-            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
-        )
-        return ConversationHandler.END
-
-    if value == "custom":
-        await query.message.reply_text("Enter the custom time/date. Example: Today 14:00 or 15/05/2026 10:00.")
-        return QUOTE_TIME
-
-    reminder["time"] = value
-    await query.message.reply_text("What is the job/task/activity?")
-    return QUOTE_SCOPE
 
 
 async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9177,11 +10223,12 @@ async def quote_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please select a time or enter the custom time/date.")
+        await update.message.reply_text("Please enter the time. Example: 08:00, 11:00, 14:00, ASAP")
         return QUOTE_TIME
 
-    reminder["time"] = value
-    await update.message.reply_text("What is the job/task/activity?")
+    normalised_time = normalise_helpdesk_time(value) or value
+    reminder["time"] = normalised_time
+    await update.message.reply_text("What is the task / activity details?")
     return QUOTE_SCOPE
 
 
@@ -9192,13 +10239,13 @@ async def quote_reminder_scope(update: Update, context: ContextTypes.DEFAULT_TYP
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter the job/task/activity details.")
+        await update.message.reply_text("Please enter what needs to be scoped / quoted.")
         return QUOTE_SCOPE
 
     reminder["scope"] = value
     await update.message.reply_text(
         build_quote_reminder_review(reminder),
-        reply_markup=get_quote_review_inline_keyboard(),
+        reply_markup=get_review_reply_keyboard(),
     )
     return QUOTE_REVIEW
 
@@ -9212,7 +10259,7 @@ def build_quote_reminder_review(reminder):
         f"Address: {reminder.get('address', '')}\n"
         f"Time: {reminder.get('time', '')}\n"
         f"Scope: {reminder.get('scope', '')}\n\n"
-        "Use the buttons below to send, cancel, or restart."
+        "Reply YES to send it now, NO to cancel, or RESTART to start again."
     )
 
 
@@ -9220,7 +10267,7 @@ async def send_quote_reminder(bot, chat_id, reminder):
     await bot.send_message(
         chat_id=chat_id,
         text=(
-            "📌 Task / Activity\n\n"
+            "📌 Quote reminder\n\n"
             f"Client: {reminder.get('client', '')}\n"
             f"Address: {reminder.get('address', '')}\n"
             f"Time: {reminder.get('time', '')}\n"
@@ -9228,28 +10275,6 @@ async def send_quote_reminder(bot, chat_id, reminder):
             f"Sent by: {reminder.get('set_by', 'Helpdesk')}"
         ),
     )
-
-
-async def quote_reminder_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    class _MessageProxy:
-        def __init__(self, message, text):
-            self._message = message
-            self.text = text
-        async def reply_text(self, *args, **kwargs):
-            return await self._message.reply_text(*args, **kwargs)
-
-    class _UpdateProxy:
-        def __init__(self, original_update, text):
-            self.effective_chat = original_update.effective_chat
-            self.effective_user = original_update.effective_user
-            self.message = _MessageProxy(query.message, text)
-
-    value = query.data.split("|", 1)[1]
-    mapped = {"yes": "yes", "no": "no", "restart": "restart"}.get(value, "")
-    return await quote_reminder_review(_UpdateProxy(update, mapped), context)
 
 
 async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9264,7 +10289,7 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
     if answer in ["no", "n", "cancel"]:
         context.user_data.pop("quote_reminder", None)
         await update.message.reply_text(
-            "Task / Activity cancelled.",
+            "Quote reminder cancelled.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
@@ -9274,12 +10299,18 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
         return await quote_reminder_start(update, context)
 
     if answer not in ["yes", "y"]:
-        await update.message.reply_text("Use the buttons to send it, cancel, or restart.")
+        await update.message.reply_text("Reply YES to send it, NO to cancel, or RESTART to start again.")
         return QUOTE_REVIEW
 
     try:
         recipients_to_send = reminder.get("recipients_selected") or [reminder.get("recipient", {})]
         reminder["set_by"] = update.effective_user.full_name or "Helpdesk"
+
+        try:
+            site_id = get_site_id()
+            create_task_activity_record(site_id, reminder)
+        except Exception as store_error:
+            print(f"WARNING: Task / Activity was sent but could not be stored for reminder/cancellation: {store_error}")
 
         sent_names = []
         failed_names = []
@@ -9297,10 +10328,10 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
                 failed_names.append(f"{recipient.get('name', 'Unknown')}: {send_error}")
 
         if not sent_names:
-            raise Exception("No tasks / activities were sent. " + "; ".join(failed_names))
+            raise Exception("No task / activitys were sent. " + "; ".join(failed_names))
 
         context.user_data.pop("quote_reminder", None)
-        message = f"Task / Activity sent to {', '.join(sent_names)}."
+        message = f"Quote reminder sent to {', '.join(sent_names)}."
         if failed_names:
             message += f"\n\nFailed: {'; '.join(failed_names)}"
 
@@ -9326,7 +10357,7 @@ async def quote_reminder_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     role = await get_role_for_update(update)
     context.user_data.pop("quote_reminder", None)
     await update.message.reply_text(
-        "Task / Activity cancelled.",
+        "Quote reminder cancelled.",
         reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
     )
     return ConversationHandler.END
@@ -9354,27 +10385,46 @@ logjob_handler = ConversationHandler(
     fallbacks=[CommandHandler("cancel", logjob_cancel)],
 )
 
+cancel_task_activity_handler = ConversationHandler(
+    entry_points=[
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_CANCEL_TASK_ACTIVITY)}$"), start_cancel_task_activity),
+    ],
+    states={
+        CANCEL_TASK_SELECT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, cancel_task_select)],
+        CANCEL_TASK_REASON: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, cancel_task_reason)],
+        CANCEL_TASK_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, cancel_task_review)],
+    },
+    fallbacks=[CommandHandler("cancel", quote_reminder_cancel)],
+)
+
+
+message_engineer_handler = ConversationHandler(
+    entry_points=[
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_MESSAGE_ENGINEER)}$"), start_message_engineer),
+    ],
+    states={
+        MESSAGE_ENGINEER_SELECT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, message_engineer_select)],
+        MESSAGE_ENGINEER_TEMPLATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, message_engineer_template)],
+        MESSAGE_ENGINEER_TEXT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, message_engineer_text)],
+        MESSAGE_ENGINEER_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, message_engineer_review)],
+    },
+    fallbacks=[CommandHandler("cancel", quote_reminder_cancel)],
+)
+
+
 quote_reminder_handler = ConversationHandler(
     entry_points=[
         CommandHandler("quotereminder", quote_reminder_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_QUOTE_REMINDER)}$"), quote_reminder_start),
     ],
     states={
-        QUOTE_RECIPIENT: [
-            CallbackQueryHandler(quote_reminder_recipient_button, pattern=r"^quote_recipient\|"),
-            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_recipient),
-        ],
+        QUOTE_RECIPIENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_recipient)],
+        QUOTE_DATE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_date)],
         QUOTE_CLIENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_client)],
         QUOTE_ADDRESS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_address)],
-        QUOTE_TIME: [
-            CallbackQueryHandler(quote_reminder_time_button, pattern=r"^quote_time\|"),
-            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_time),
-        ],
+        QUOTE_TIME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_time)],
         QUOTE_SCOPE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_scope)],
-        QUOTE_REVIEW: [
-            CallbackQueryHandler(quote_reminder_review_button, pattern=r"^quote_review\|"),
-            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_review),
-        ],
+        QUOTE_REVIEW: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, quote_reminder_review)],
     },
     fallbacks=[CommandHandler("cancel", quote_reminder_cancel)],
 )
@@ -9395,7 +10445,7 @@ abortjob_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|👷 Engineer Menu|📌 Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -9413,14 +10463,18 @@ telegram_app.add_handler(worksheet_handler)
 telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(receipt_handler)
 telegram_app.add_handler(logjob_handler)
+telegram_app.add_handler(message_engineer_handler)
+telegram_app.add_handler(cancel_task_activity_handler)
 telegram_app.add_handler(quote_reminder_handler)
+telegram_app.add_handler(reopenjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(CallbackQueryHandler(helpdesk_review_button, pattern="^helpdesk_review\\|"))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
