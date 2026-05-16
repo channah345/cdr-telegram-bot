@@ -3502,13 +3502,54 @@ td:last-child {{
     .nav a, .tabs a, .dashboard-nav a {{ white-space: nowrap; }}
 }}
 
+/* Signature page hard overrides. Dashboard CSS is shared in this file,
+   so these rules must be last to stop dark dashboard text colours leaking
+   into the white client signature form. */
+body.signature-page {{
+    background: #f4f4f4 !important;
+    color: #111827 !important;
+    font-family: Arial, sans-serif !important;
+    padding: 20px !important;
+}}
+body.signature-page .signature-container {{
+    max-width: 650px !important;
+    width: min(650px, calc(100% - 24px)) !important;
+    margin: auto !important;
+    background: #ffffff !important;
+    color: #111827 !important;
+    padding: 25px !important;
+    border-radius: 12px !important;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.12) !important;
+}}
+body.signature-page h2,
+body.signature-page p,
+body.signature-page label,
+body.signature-page strong,
+body.signature-page .small {{
+    color: #111827 !important;
+}}
+body.signature-page .job-box {{
+    background: #f3f4f6 !important;
+    color: #111827 !important;
+    border: 1px solid #e5e7eb !important;
+}}
+body.signature-page input[type="text"] {{
+    background: #ffffff !important;
+    color: #111827 !important;
+    border: 1px solid #6b7280 !important;
+}}
+body.signature-page canvas {{
+    background: #ffffff !important;
+    border: 2px solid #111827 !important;
+}}
+
 </style>
     
 <meta name="theme-color" content="#070b12">
 <meta name="apple-mobile-web-app-capable" content="yes">
 </head>
-    <body>
-        <div class="container">
+    <body class="signature-page">
+        <div class="container signature-container">
             <img src="/logo.png" alt="CDR M&E Services Ltd" style="display:block; max-width:320px; width:80%; margin:0 auto 20px auto;">
             <h2 style="text-align:center;">Client Signature</h2>
             <div class="job-box">
@@ -3543,7 +3584,9 @@ td:last-child {{
                 minWidth: 1,
                 maxWidth: 2.5,
                 throttle: 0,
-                velocityFilterWeight: 0.7
+                velocityFilterWeight: 0.7,
+                penColor: "#111827",
+                backgroundColor: "#ffffff"
             }});
 
             // Stop mobile browsers treating signature movement as page scroll/swipe.
@@ -3554,6 +3597,35 @@ td:last-child {{
                     event.stopPropagation();
                 }}, {{ passive: false }});
             }});
+
+            // Desktop reliability: make sure a mouse/pointer release is always
+            // received, even if the cursor moves outside the canvas. Without
+            // this, some desktop browsers can leave the pad in drawing mode.
+            canvas.addEventListener("pointerdown", function(event) {{
+                try {{ canvas.setPointerCapture(event.pointerId); }} catch (e) {{}}
+            }}, {{ passive: false }});
+
+            function stopSignatureDrawing(event) {{
+                try {{
+                    if (event && event.pointerId !== undefined) {{
+                        try {{ canvas.releasePointerCapture(event.pointerId); }} catch (e) {{}}
+                    }}
+                    if (signaturePad && signaturePad._isDrawing) {{
+                        if (typeof signaturePad._strokeEnd === "function") {{
+                            signaturePad._strokeEnd(event || new Event("pointerup"));
+                        }}
+                        signaturePad._isDrawing = false;
+                    }}
+                }} catch (e) {{
+                    try {{ signaturePad._isDrawing = false; }} catch (ignored) {{}}
+                }}
+            }}
+
+            canvas.addEventListener("pointerup", stopSignatureDrawing, {{ passive: false }});
+            canvas.addEventListener("pointercancel", stopSignatureDrawing, {{ passive: false }});
+            canvas.addEventListener("mouseleave", stopSignatureDrawing, {{ passive: false }});
+            window.addEventListener("pointerup", stopSignatureDrawing, {{ passive: false }});
+            window.addEventListener("mouseup", stopSignatureDrawing, {{ passive: false }});
 
             let savedSignature = null;
 
@@ -8568,7 +8640,7 @@ def docx_escape(value):
 
 DOCX_PAGE_WIDTH = 11906
 DOCX_CONTENT_WIDTH = 10320
-DOCX_ORANGE = "F58220"
+DOCX_ORANGE = "595959"  # worksheet section/header grey
 DOCX_DARK = "333333"
 DOCX_LIGHT = "F7F7F7"
 DOCX_GREY = "D9D9D9"
@@ -8678,6 +8750,57 @@ def docx_section(title, value):
         + docx_spacer(100)
     )
 
+def get_local_logo_image_bytes_for_docx():
+    """Return the local CDR logo bytes for the worksheet DOCX, if available."""
+    for path in ["cdr-logo.png", "CDR-logo.png", "logo.png", "/app/logo.png", "/mnt/data/logo.png"]:
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as logo_file:
+                    return logo_file.read()
+        except Exception as e:
+            print(f"Could not load worksheet logo {path}: {e}")
+    return None
+
+
+def docx_image_paragraph(relationship_id, width_emu=3024000, height_emu=1058400, name="Image", align="left"):
+    """Return WordprocessingML for an embedded image.
+
+    width_emu/height_emu control the displayed image size in Word.
+    """
+    return f"""
+<w:p>
+<w:pPr><w:spacing w:after='100'/><w:jc w:val='{align}'/></w:pPr>
+<w:r>
+<w:drawing>
+<wp:inline distT='0' distB='0' distL='0' distR='0'>
+<wp:extent cx='{width_emu}' cy='{height_emu}'/>
+<wp:effectExtent l='0' t='0' r='0' b='0'/>
+<wp:docPr id='1' name='{docx_escape(name)}'/>
+<wp:cNvGraphicFramePr/>
+<a:graphic>
+<a:graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/picture'>
+<pic:pic>
+<pic:nvPicPr>
+<pic:cNvPr id='0' name='{docx_escape(name)}.png'/>
+<pic:cNvPicPr/>
+</pic:nvPicPr>
+<pic:blipFill>
+<a:blip r:embed='{relationship_id}'/>
+<a:stretch><a:fillRect/></a:stretch>
+</pic:blipFill>
+<pic:spPr>
+<a:xfrm><a:off x='0' y='0'/><a:ext cx='{width_emu}' cy='{height_emu}'/></a:xfrm>
+<a:prstGeom prst='rect'><a:avLst/></a:prstGeom>
+</pic:spPr>
+</pic:pic>
+</a:graphicData>
+</a:graphic>
+</wp:inline>
+</w:drawing>
+</w:r>
+</w:p>"""
+
+
 
 def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=None):
     # Build an editable DOCX matching the previous professional PDF worksheet layout.
@@ -8719,19 +8842,25 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 
     comments = build_engineer_comments_for_pdf(visits, worksheet, fields)
 
+    signature_image_bytes = None
     if worksheet.get("ClientSignatureRequired"):
         if worksheet.get("ClientSignatureReceived"):
+            signature_image_bytes = get_signature_image_bytes(site_id, cdr_number) if site_id else None
             signature_text = (
                 f"Client Name: {worksheet.get('ClientSignatureName', '')}\n"
-                "Signed Digitally: Yes\n"
-                "Signature image is saved against the job in SharePoint."
+                "Signed Digitally: Yes"
+                + ("\nSignature embedded below." if signature_image_bytes else "\nSignature image saved in SharePoint but could not be embedded.")
             )
         else:
             signature_text = "Client signature required but not received."
     else:
         signature_text = "Client signature not required."
 
+    logo_image_bytes = get_local_logo_image_bytes_for_docx()
+
     body = []
+    if logo_image_bytes:
+        body.append(docx_image_paragraph("rIdLogo1", width_emu=2250000, height_emu=900000, name="CDR Logo", align="center"))
     body.append(docx_paragraph("JOB WORKSHEET", bold=True, size=32, align="center", spacing_after=60))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd\n"
@@ -8766,7 +8895,10 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     body.append(docx_table(visit_rows, header_first=True, header_orange=True, widths=[1450, 1250, 1250, 2550, 2200, 1620]))
     body.append(docx_spacer(110))
     body.append(docx_section("Engineer Comment", comments))
-    body.append(docx_section("Client Signature", signature_text))
+    body.append(docx_table([["Client Signature"], [signature_text]], header_first=True, header_orange=True, widths=[DOCX_CONTENT_WIDTH]))
+    if signature_image_bytes:
+        body.append(docx_image_paragraph("rIdSignature1", width_emu=3024000, height_emu=1058400, name="Client Signature", align="left"))
+    body.append(docx_spacer(100))
     body.append(docx_paragraph(
         "CDR M&E Services Ltd | 01642 057939 | helpdesk@cdrme.co.uk",
         size=16,
@@ -8775,7 +8907,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
     ))
 
     document_xml = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>
+<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main' xmlns:r='http://schemas.openxmlformats.org/officeDocument/2006/relationships' xmlns:wp='http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing' xmlns:a='http://schemas.openxmlformats.org/drawingml/2006/main' xmlns:pic='http://schemas.openxmlformats.org/drawingml/2006/picture'>
 <w:body>
 {''.join(body)}
 <w:sectPr>
@@ -8789,6 +8921,7 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>
 <Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/>
 <Default Extension='xml' ContentType='application/xml'/>
+<Default Extension='png' ContentType='image/png'/>
 <Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>
 <Override PartName='/docProps/core.xml' ContentType='application/vnd.openxmlformats-package.core-properties+xml'/>
 <Override PartName='/docProps/app.xml' ContentType='application/vnd.openxmlformats-officedocument.extended-properties+xml'/>
@@ -8801,8 +8934,18 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
 <Relationship Id='rId3' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties' Target='docProps/app.xml'/>
 </Relationships>'''
 
-    doc_rels = '''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
-<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>'''
+    doc_relationships = []
+    if logo_image_bytes:
+        doc_relationships.append("<Relationship Id='rIdLogo1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/cdr_logo.png'/>")
+    if signature_image_bytes:
+        doc_relationships.append("<Relationship Id='rIdSignature1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/image' Target='media/client_signature.png'/>")
+
+    doc_rels = (
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n"
+        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>"
+        + "".join(doc_relationships)
+        + "</Relationships>"
+    )
 
     now_iso = datetime.now(UK_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
     core = f'''<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
@@ -8825,6 +8968,10 @@ def build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id=
         docx.writestr("_rels/.rels", root_rels)
         docx.writestr("word/_rels/document.xml.rels", doc_rels)
         docx.writestr("word/document.xml", document_xml)
+        if logo_image_bytes:
+            docx.writestr("word/media/cdr_logo.png", logo_image_bytes)
+        if signature_image_bytes:
+            docx.writestr("word/media/client_signature.png", signature_image_bytes)
         docx.writestr("docProps/core.xml", core)
         docx.writestr("docProps/app.xml", app_props)
 
