@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-deploy-first-v30-helpdesk-safe-task-cancel-menu"
+BUILD_VERSION = "phase1-recovery-v45-stable-editable-no-pending-review"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -363,9 +363,8 @@ def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
 
     # SharePoint Graph rejects the entire update if even one optional column name
-    # is not present in the list.  The pending-review flow must not get stuck
-    # because one helper/audit field has not been created yet, so remove only the
-    # rejected field and retry. Core fields that do exist will still be saved.
+    # is not present in the list. Remove only the rejected field and retry so
+    # core fields that do exist will still be saved.
     payload = dict(fields_to_update or {})
     ignored_fields = []
 
@@ -7244,6 +7243,354 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
 
+async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        data = query.data.split("|")
+        action = data[0]
+        item_id = data[1]
+
+        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        engineers_by_telegram, _ = build_engineer_maps(engineers)
+
+        user_id = str(query.from_user.id)
+        current_engineer = engineers_by_telegram.get(user_id)
+
+        if not current_engineer:
+            await query.message.reply_text("You are not set up as an engineer.")
+            return
+
+        if not engineer_has_active_day(site_id, user_id):
+            await query.message.reply_text(
+                "Please start your day first using 🟢 Start Day or /startday. Job buttons are locked until your day has started."
+            )
+            return
+
+        job = find_job_by_item_id(jobs_data, item_id)
+
+        if not job:
+            await query.message.reply_text("Could not find this job.")
+            return
+
+        fields = job["fields"]
+
+        if is_closed_job(fields):
+            await query.message.reply_text(
+                "This job has already been closed or returned to the office. No further action is required."
+            )
+            return
+
+        assigned_ids = get_assigned_engineer_ids(fields)
+
+        if current_engineer["lookup_id"] not in assigned_ids:
+            await query.message.reply_text("You are not assigned to this job.")
+            return
+
+        if action == "abort_job":
+            await query.message.reply_text("Opening abort job flow. If nothing happens, tap the Abort Attendance button again.")
+            return
+
+        if action == "complete_help":
+            cdr_number = fields.get("CDRNumber", "")
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                "Completed",
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            await query.message.reply_text(
+                f"To complete this job and submit the worksheet, type:\n\n/complete {cdr_number}"
+            )
+            return
+
+        if action == "noaccess":
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                "No Access",
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            await query.message.reply_text(
+                "Why was there no access?",
+                reply_markup=get_no_access_reason_keyboard(item_id),
+            )
+            return
+
+        if action == "noaccess_reason":
+            reason_key = data[2] if len(data) > 2 else "other"
+            no_access_reason = NO_ACCESS_REASONS.get(reason_key, "Other / see notes")
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                "No Access",
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            return await begin_worksheet_for_job(
+                update,
+                context,
+                item_id=item_id,
+                outcome="No Access",
+                no_access_reason=no_access_reason,
+            )
+
+        if action == "confirm_outcome":
+            selected_outcome = data[2]
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                selected_outcome,
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            confirm_buttons = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "Yes, confirm",
+                        callback_data=f"start_worksheet|{item_id}|{selected_outcome}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Cancel",
+                        callback_data=f"cancel_outcome|{item_id}",
+                    ),
+                ],
+            ])
+
+            await query.message.reply_text(
+                f"Are you sure you want to mark this job as:\n\n{selected_outcome}?",
+                reply_markup=confirm_buttons,
+            )
+            return
+
+        if action == "cancel_outcome":
+            await query.message.reply_text("Cancelled. No changes made.")
+            return
+
+        if action == "undo_travelling":
+            has_travelled = has_engineer_action(fields, current_engineer["name"], "Travelling")
+            has_on_site = has_engineer_action(fields, current_engineer["name"], "On Site")
+            current_status = str(fields.get("Status", "") or "").strip()
+
+            if not has_travelled:
+                await query.message.reply_text("Travelling has not been logged on this job, so there is nothing to undo.")
+                return
+
+            if has_on_site or current_status == ON_SITE_STATUS:
+                await query.message.reply_text("Travelling cannot be undone after Arrived On Site has been logged.")
+                return
+
+            updated_log = append_engineer_log(
+                fields,
+                current_engineer["name"],
+                "Travelling Reverted",
+                "Accidental travelling click reversed by engineer",
+            )
+
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {
+                    "Status": ASSIGNED_STATUS,
+                    "EngineerVisitLog": updated_log,
+                    "WorksheetSubmitted": False,
+                },
+            )
+
+            update_active_day_live_status(
+                site_id,
+                user_id,
+                ASSIGNED_STATUS,
+                get_job_reference(fields),
+            )
+
+            await query.message.reply_text(
+                f"Travelling reversed:\n\n{fields.get('CDRNumber', '')} → Assigned\n\nThe job is still assigned to you. You can press Start Travelling again when needed."
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job travelling reversed\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Site: {fields.get('SiteName', '')}\n"
+                    "The job has been put back to Assigned and remains with the engineer."
+                ),
+            )
+
+            return
+
+        if action == "status":
+            selected_status = data[2]
+
+            if selected_status not in ["Travelling", "On Site"]:
+                await query.message.reply_text("Unknown status selected.")
+                return
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                selected_status,
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            updated_log = append_engineer_log(
+                fields,
+                current_engineer["name"],
+                selected_status,
+            )
+
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {
+                    "Status": selected_status,
+                    "EngineerVisitLog": updated_log,
+                    "WorksheetSubmitted": False,
+                },
+            )
+
+            update_active_day_live_status(
+                site_id,
+                user_id,
+                selected_status,
+                get_job_reference(fields),
+            )
+
+            reply_markup = None
+            if selected_status == "Travelling":
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("↩️ Undo Travelling", callback_data=f"undo_travelling|{item_id}")]
+                ])
+
+            await query.message.reply_text(
+                f"Status updated:\n\n{fields.get('CDRNumber', '')} → {selected_status}",
+                reply_markup=reply_markup,
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job update\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Update: {selected_status}\n"
+                    f"Site: {fields.get('SiteName', '')}"
+                ),
+            )
+
+            return
+
+        if action == "outcome":
+            selected_outcome = data[2]
+
+            if selected_outcome not in ["No Access", "Revisit Required"]:
+                await query.message.reply_text("Unknown outcome selected.")
+                return
+
+            allowed, reason = can_click_action(
+                fields,
+                current_engineer["name"],
+                selected_outcome,
+            )
+
+            if not allowed:
+                await query.message.reply_text(reason)
+                return
+
+            updated_log = append_engineer_log(
+                fields,
+                current_engineer["name"],
+                selected_outcome,
+            )
+
+            assigned_ids = get_assigned_engineer_ids(fields)
+            is_final_engineer = len(assigned_ids) <= 1
+
+            update_fields = {
+                "JobOutcome": selected_outcome,
+                "EngineerVisitLog": updated_log,
+            }
+
+            if is_final_engineer:
+                update_fields["Status"] = AWAITING_DEPLOYMENT_STATUS
+                update_fields["TelegramNotified"] = False
+                update_fields["WorksheetSubmitted"] = False
+                update_fields.update(clear_engineer_assignment_payload())
+            else:
+                update_fields.update(
+                    remove_current_engineer_assignment_payload(
+                        fields,
+                        current_engineer["lookup_id"],
+                    )
+                )
+
+            update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+
+            update_active_day_live_status(
+                site_id,
+                user_id,
+                selected_outcome,
+                get_job_reference(fields),
+            )
+
+            await query.message.reply_text(
+                f"Updated:\n\n"
+                f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
+                f"You have been removed from this job."
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job outcome selected\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Outcome: {selected_outcome}\n"
+                    f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
+                    f"Site: {fields.get('SiteName', '')}"
+                ),
+            )
+
+            return
+
+    except Exception as e:
+        print(f"ERROR updating status/outcome: {e}")
+        await query.message.reply_text("There was an error updating the job status.")
+
+
+
+
+
 async def complete_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -8546,7 +8893,7 @@ def apply_manual_visit_times_to_log(fields, worksheet, outcome):
 
     If the engineer edits times, add a Travelling Reverted marker and then clean
     Travelling / On Site / final outcome lines using the approved times. This lets
-    the worksheet and timesheet parse the corrected attendance without Helpdesk review.
+    the worksheet and timesheet parse the corrected attendance without office review.
     """
     existing_log = get_field_value(fields, "EngineerVisitLog", "Engineer Visit Log") or ""
     engineer_name = worksheet.get("engineer_name", "Engineer")
@@ -8617,7 +8964,7 @@ async def finalise_worksheet_direct(context, worksheet, fields, item_id, site_id
     """Finalise an engineer worksheet without Helpdesk approval.
 
     This is deliberately small and keeps the existing shared worksheet/update helpers.
-    The key difference from the old Helpdesk-review flow is that EngineerVisitLog gets
+    The key difference from the old office-review flow is that EngineerVisitLog gets
     the actual final outcome (Completed / Revisit Required / No Access), so dashboard
     productivity can parse the visit as closed and keep the productive time.
     """
@@ -8742,8 +9089,8 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
         worksheet_link,
     )
 
-    # Helpdesk review has been removed from the engineer completion path. Do not
-    # write the large pending-review payload here; keeping the direct submission
+    # Office approval has been removed from the engineer completion path. Do not
+    # write the large approval payload here; keeping the direct submission
     # small avoids SharePoint Invalid request issues.
 
     update_list_item_fields_in_safe_chunks(
