@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-deploy-first-v28"
+BUILD_VERSION = "phase1-deploy-first-v29-undo-travelling"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -72,6 +72,10 @@ VAN_CHECK_PHOTO_BASE_FOLDER = "17 - VAN CHECK PHOTOS"
 WORKSHEET_BASE_FOLDER = "18 - JOB WORKSHEETS"
 RECEIPT_BASE_FOLDER = "19 - RECEIPTS"
 
+# Keeps submitted worksheet photos/signatures available until Helpdesk/Admin approves.
+# SharePoint remains the permanent record; this cache is best-effort and is cleared after approval/rejection.
+PENDING_REVIEW_CACHE = {}
+
 DAY_ACTIVE_STATUS = "Active"
 DAY_CLOSED_STATUS = "Closed"
 
@@ -84,6 +88,7 @@ MENU_REQUEST_JOB = "📣 Request Job"
 MENU_QUOTE_REMINDER = "📋 Task / Activity"
 MENU_MESSAGE_ENGINEER = "📢 Message Engineer"
 MENU_CANCEL_TASK_ACTIVITY = "❌ Cancel Task / Activity"
+MENU_PENDING_REVIEWS = "📄 Pending Reviews"
 MENU_HELPDESK = "🧰 Helpdesk"
 MENU_LOG_JOB = "➕ Log Job"
 MENU_REASSIGN_JOB = "🔁 Reassign Job"
@@ -447,7 +452,7 @@ def get_current_engineer_visit_log_lines(fields, engineer_name):
     log = fields.get("EngineerVisitLog", "") or ""
     lines = [line for line in log.splitlines() if line.strip()]
 
-    reset_actions = ["Completed", "No Access", "Revisit Required", "Aborted Attendance"]
+    reset_actions = ["Completed", "No Access", "Revisit Required", "Aborted Attendance", "Travelling Reverted"]
     last_reset_index = -1
 
     for index, line in enumerate(lines):
@@ -538,6 +543,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         [MENU_BUG_IDEA, MENU_UPLOAD_RECEIPTS],
         [MENU_QUOTE_REMINDER, MENU_MESSAGE_ENGINEER],
         [MENU_CANCEL_TASK_ACTIVITY],
+        [MENU_PENDING_REVIEWS],
     ]
 
     if include_engineer_menu:
@@ -1033,6 +1039,11 @@ async def get_role_for_update(update):
 
 def get_today_iso():
     return datetime.now(UK_TZ).date().isoformat()
+
+
+def is_weekend_today():
+    """Return True on Saturday/Sunday in UK time so scheduled reminders stay quiet at weekends."""
+    return datetime.now(UK_TZ).weekday() >= 5
 
 
 def safe_folder_name(value):
@@ -1557,6 +1568,9 @@ def get_job_buttons(item_id, maps_query=None):
     rows = [
         [
             InlineKeyboardButton("🚗 Start Travelling", callback_data=f"status|{item_id}|Travelling"),
+        ],
+        [
+            InlineKeyboardButton("↩️ Undo Travelling", callback_data=f"undo_travelling|{item_id}"),
         ],
         [
             InlineKeyboardButton("📍 Arrived On Site", callback_data=f"status|{item_id}|On Site"),
@@ -3692,7 +3706,10 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
+        role = get_bot_user_role(site_id, user_id)
+
         context.user_data["start_day"] = {
+            "role": role,
             "site_id": site_id,
             "day_logs_list_id": day_logs_list_id,
             "engineer_name": current_engineer["name"],
@@ -3738,6 +3755,16 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
+    start_day = context.user_data.get("start_day")
+    if start_day and is_apprentice_role(start_day.get("role")):
+        create_apprentice_start_day_log(start_day)
+        context.user_data.pop("start_day", None)
+        await update.message.reply_text(
+            "Apprentice day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text("Starting your day. Please enter the van registration.")
     return START_DAY_VAN_REG
 
@@ -3754,6 +3781,16 @@ async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_
     if answer == "no":
         context.user_data.pop("start_day", None)
         await query.message.reply_text("Start day cancelled. Your jobs are still locked.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    start_day = context.user_data.get("start_day")
+    if start_day and is_apprentice_role(start_day.get("role")):
+        create_apprentice_start_day_log(start_day)
+        context.user_data.pop("start_day", None)
+        await query.message.reply_text(
+            "Apprentice day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
         return ConversationHandler.END
 
     await query.message.reply_text("Starting your day. Please enter the van registration.")
@@ -3897,6 +3934,118 @@ def create_start_day_log(start_day, van_check_completed=False):
         day_log_fields,
     )
 
+
+def is_apprentice_role(role):
+    return str(role or "").strip().lower() == "apprentice"
+
+
+def create_apprentice_start_day_log(start_day):
+    """Start an apprentice day without van registration, mileage, van check or van photos."""
+    start_day["van_reg"] = ""
+    start_day["start_mileage"] = ""
+    start_day["van_check_answers"] = []
+    start_day["van_photo_links"] = []
+    create_start_day_log(start_day, van_check_completed=False)
+
+
+async def close_end_day_record(context, end_day, mileage=None, include_mileage=True):
+    """Close the active day log. Apprentices can close without mileage prompts."""
+    # Re-check assigned jobs before closing the day in case one was added during the end-day flow.
+    site_id, _, _, engineers, jobs_data = get_sharepoint_data()
+    open_jobs = get_open_jobs_for_engineer_today(jobs_data, end_day["engineer_lookup_id"])
+
+    if open_jobs:
+        return False, (
+            "Your day has not been ended because you still have job(s) assigned for today. "
+            "Complete them, mark No Access, or mark Revisit Required first.\n\n"
+            f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}"
+        ), None
+
+    end_time = datetime.now(UK_TZ)
+    start_time_value = get_field_value(
+        end_day.get("day_log_fields", {}),
+        "StartTime",
+        "Start Time",
+    )
+    start_time = parse_sharepoint_datetime(start_time_value)
+    hours = calculate_day_pay_hours(
+        start_time,
+        end_time,
+        jobs_data=jobs_data,
+        engineer_name=end_day.get("engineer_name", ""),
+    )
+    pay_summary = build_pay_summary(start_time, end_time, hours)
+
+    update_payload = {
+        "End Time": end_time.isoformat(),
+        "EndTime": end_time.isoformat(),
+        "Status": DAY_CLOSED_STATUS,
+        "Pay Summary": pay_summary,
+        "PaySummary": pay_summary,
+    }
+
+    if include_mileage:
+        start_mileage_value = get_field_value(
+            end_day.get("day_log_fields", {}),
+            "StartMileage",
+            "Start Mileage",
+        )
+        total_mileage = None
+        try:
+            total_mileage = round(float(mileage) - float(start_mileage_value or 0), 2)
+        except Exception:
+            total_mileage = None
+
+        update_payload.update({
+            "End Mileage": mileage,
+            "EndMileage": mileage,
+            "Total Mileage": total_mileage if total_mileage is not None else "",
+            "TotalMileage": total_mileage if total_mileage is not None else "",
+        })
+
+    if hours:
+        update_payload.update({
+            "Total Hours": hours["total_hours"],
+            "TotalHours": hours["total_hours"],
+            "Normal Hours": hours["normal_hours"],
+            "NormalHours": hours["normal_hours"],
+            "OOH Hours": hours["ooh_hours"],
+            "OOHHours": hours["ooh_hours"],
+            "Payable OOH Hours": hours["payable_ooh_hours"],
+            "PayableOOHHours": hours["payable_ooh_hours"],
+            "Commute Deduction Hours": hours["commute_deduction_hours"],
+            "CommuteDeductionHours": hours["commute_deduction_hours"],
+            "Morning Commute Deduction Hours": hours["morning_commute_deduction_hours"],
+            "MorningCommuteDeductionHours": hours["morning_commute_deduction_hours"],
+            "Evening Commute Deduction Hours": hours["evening_commute_deduction_hours"],
+            "EveningCommuteDeductionHours": hours["evening_commute_deduction_hours"],
+            "Productive Hours": hours["productive_hours"],
+            "ProductiveHours": hours["productive_hours"],
+            "Inactive Hours": hours["inactive_hours"],
+            "InactiveHours": hours["inactive_hours"],
+            "Unproductive Hours": hours["inactive_hours"],
+            "UnproductiveHours": hours["inactive_hours"],
+            "Utilisation Percent": hours["utilisation_percent"],
+            "UtilisationPercent": hours["utilisation_percent"],
+            "Break Deducted": hours["break_deducted"],
+            "BreakDeducted": hours["break_deducted"],
+        })
+
+    end_day_fields = build_field_payload_for_list(
+        end_day["site_id"],
+        end_day["day_logs_list_id"],
+        update_payload,
+    )
+
+    update_list_item_fields(
+        end_day["site_id"],
+        end_day["day_logs_list_id"],
+        end_day["day_log_item_id"],
+        end_day_fields,
+    )
+
+    context.user_data.pop("end_day", None)
+    return True, "Day ended. Your job buttons are now locked until you start your next day.", pay_summary
 
 
 async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4104,7 +4253,10 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
+        role = get_bot_user_role(site_id, user_id)
+
         context.user_data["end_day"] = {
+            "role": role,
             "site_id": site_id,
             "day_logs_list_id": day_logs_list_id,
             "day_log_item_id": active_day["id"],
@@ -4147,6 +4299,15 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
+    end_day = context.user_data.get("end_day")
+    if end_day and is_apprentice_role(end_day.get("role")):
+        ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
+        await update.message.reply_text(
+            message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "Please enter your end mileage as a number.\n\n"
         "If you do not need to record mileage, type 0."
@@ -4166,6 +4327,15 @@ async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TY
     if answer == "no":
         context.user_data.pop("end_day", None)
         await query.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
+        return ConversationHandler.END
+
+    end_day = context.user_data.get("end_day")
+    if end_day and is_apprentice_role(end_day.get("role")):
+        ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
+        await query.message.reply_text(
+            message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
         return ConversationHandler.END
 
     await query.message.reply_text(
@@ -4198,106 +4368,15 @@ async def endday_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please try /endday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
             return ConversationHandler.END
 
-        # Re-check assigned jobs before closing the day in case one was added while the engineer was in the end-day flow.
-        site_id, _, _, engineers, jobs_data = get_sharepoint_data()
-        open_jobs = get_open_jobs_for_engineer_today(jobs_data, end_day["engineer_lookup_id"])
-
-        if open_jobs:
-            context.user_data.pop("end_day", None)
-            await update.message.reply_text(
-                "Your day has not been ended because you still have job(s) assigned for today. "
-                "Complete them, mark No Access, or mark Revisit Required first.\n\n"
-                f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}",
-                reply_markup=get_main_menu(await get_role_for_update(update)),
-            )
-            return ConversationHandler.END
-
-        end_time = datetime.now(UK_TZ)
-        start_time_value = get_field_value(
-            end_day.get("day_log_fields", {}),
-            "StartTime",
-            "Start Time",
+        ok, message, pay_summary = await close_end_day_record(
+            context,
+            end_day,
+            mileage=mileage,
+            include_mileage=True,
         )
-        start_time = parse_sharepoint_datetime(start_time_value)
-        hours = calculate_day_pay_hours(
-            start_time,
-            end_time,
-            jobs_data=jobs_data,
-            engineer_name=end_day.get("engineer_name", ""),
-        )
-        pay_summary = build_pay_summary(start_time, end_time, hours)
-
-        start_mileage_value = get_field_value(
-            end_day.get("day_log_fields", {}),
-            "StartMileage",
-            "Start Mileage",
-        )
-
-        total_mileage = None
-
-        try:
-            total_mileage = round(float(mileage) - float(start_mileage_value or 0), 2)
-        except Exception:
-            total_mileage = None
-
-        update_payload = {
-            "End Time": end_time.isoformat(),
-            "EndTime": end_time.isoformat(),
-            "End Mileage": mileage,
-            "EndMileage": mileage,
-            "Total Mileage": total_mileage if total_mileage is not None else "",
-            "TotalMileage": total_mileage if total_mileage is not None else "",
-            "Status": DAY_CLOSED_STATUS,
-            "Pay Summary": pay_summary,
-            "PaySummary": pay_summary,
-        }
-
-        if hours:
-            update_payload.update({
-                "Total Hours": hours["total_hours"],
-                "TotalHours": hours["total_hours"],
-                "Normal Hours": hours["normal_hours"],
-                "NormalHours": hours["normal_hours"],
-                "OOH Hours": hours["ooh_hours"],
-                "OOHHours": hours["ooh_hours"],
-                "Payable OOH Hours": hours["payable_ooh_hours"],
-                "PayableOOHHours": hours["payable_ooh_hours"],
-                "Commute Deduction Hours": hours["commute_deduction_hours"],
-                "CommuteDeductionHours": hours["commute_deduction_hours"],
-                "Morning Commute Deduction Hours": hours["morning_commute_deduction_hours"],
-                "MorningCommuteDeductionHours": hours["morning_commute_deduction_hours"],
-                "Evening Commute Deduction Hours": hours["evening_commute_deduction_hours"],
-                "EveningCommuteDeductionHours": hours["evening_commute_deduction_hours"],
-                "Productive Hours": hours["productive_hours"],
-                "ProductiveHours": hours["productive_hours"],
-                "Inactive Hours": hours["inactive_hours"],
-                "InactiveHours": hours["inactive_hours"],
-                "Unproductive Hours": hours["inactive_hours"],
-                "UnproductiveHours": hours["inactive_hours"],
-                "Utilisation Percent": hours["utilisation_percent"],
-                "UtilisationPercent": hours["utilisation_percent"],
-                "Break Deducted": hours["break_deducted"],
-                "BreakDeducted": hours["break_deducted"],
-            })
-
-        end_day_fields = build_field_payload_for_list(
-            end_day["site_id"],
-            end_day["day_logs_list_id"],
-            update_payload,
-        )
-
-        update_list_item_fields(
-            end_day["site_id"],
-            end_day["day_logs_list_id"],
-            end_day["day_log_item_id"],
-            end_day_fields,
-        )
-
-        context.user_data.pop("end_day", None)
 
         await update.message.reply_text(
-            "Day ended. Your job buttons are now locked until you start your next day.\n\n"
-            f"{pay_summary}",
+            message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
@@ -4492,7 +4571,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ENGINEER_MENU]:
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_PENDING_REVIEWS, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4564,6 +4643,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_DELETE_JOB:
         return await deletejob_start(update, context)
 
+    if text == MENU_PENDING_REVIEWS:
+        return await pending_reviews_start(update, context)
+
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
 
@@ -4582,6 +4664,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_CANCEL_JOB: "Cancel Job",
         MENU_DELETE_JOB: "Delete Job",
         MENU_QUOTE_REMINDER: "Task / Activity",
+        MENU_PENDING_REVIEWS: "Pending Reviews",
         MENU_HELPDESK: "Helpdesk",
     }
 
@@ -6672,6 +6755,47 @@ async def id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Telegram ID is: {update.effective_user.id}")
 
 
+def task_activity_matches_user_today(fields, telegram_id):
+    status = str(get_field_value(fields, "Status") or "Active").strip().lower()
+    if status != "active":
+        return False
+
+    task_date = task_date_iso_from_fields(fields)
+    if task_date != get_today_iso():
+        return False
+
+    return str(telegram_id) in task_telegram_ids_from_fields(fields)
+
+
+def format_task_activity_for_my_jobs(fields):
+    title = str(get_field_value(fields, "Title") or "Task / Activity").strip()
+    task_date = task_date_iso_from_fields(fields)
+    time_text = str(get_field_value(fields, "TaskTime", "Task Time") or "").strip()
+    details = str(get_field_value(fields, "TaskDetails", "Task Details") or "").strip()
+
+    return (
+        "📋 Task / Activity:\n\n"
+        f"Title: {title}\n"
+        f"Date: {format_sharepoint_date(task_date) or task_date or 'N/A'}\n"
+        f"Time: {time_text or 'N/A'}\n"
+        f"Details:\n{details or 'N/A'}"
+    )
+
+
+def get_today_task_activities_for_user(site_id, telegram_id):
+    try:
+        tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
+        tasks = get_list_items(site_id, tasks_list_id)
+    except Exception as e:
+        print(f"WARNING: Could not load Task Activities for My Jobs: {e}")
+        return []
+
+    return [
+        task for task in tasks
+        if task_activity_matches_user_today(task.get("fields", {}), telegram_id)
+    ]
+
+
 async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -6692,8 +6816,17 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        role = await get_role_for_update(update)
+        today_tasks = get_today_task_activities_for_user(site_id, user_id)
+
         if not engineer_has_active_day(site_id, user_id):
-            role = await get_role_for_update(update)
+            if today_tasks:
+                for task in today_tasks:
+                    await update.message.reply_text(
+                        format_task_activity_for_my_jobs(task.get("fields", {})),
+                        reply_markup=get_main_menu(role),
+                    )
+
             if user_can_use_helpdesk(role):
                 await update.message.reply_text(
                     "You are logged in as helpdesk/admin. Engineer jobs are locked until you start your engineer day. Use the Helpdesk menu for office actions.",
@@ -6701,7 +6834,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await update.message.reply_text(
-                    "Please start your day first using 🟢 Start Day or /startday. Your jobs are locked until your day has started.",
+                    "Please start your day first using 🟢 Start Day or /startday. Your engineer jobs are locked until your day has started.",
                     reply_markup=get_main_menu(role),
                 )
             return
@@ -6722,8 +6855,15 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
                 )
 
+        for task in today_tasks:
+            found_any = True
+            await update.message.reply_text(
+                format_task_activity_for_my_jobs(task.get("fields", {})),
+                reply_markup=get_main_menu(role),
+            )
+
         if not found_any:
-            await update.message.reply_text("No jobs assigned today.")
+            await update.message.reply_text("No jobs or task / activity items assigned today.")
 
     except Exception as e:
         print(f"ERROR in /jobs: {e}")
@@ -6921,6 +7061,95 @@ async def abort_job_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+def format_pending_review_card(job):
+    fields = job.get("fields", {})
+    cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
+    site = get_field_value(fields, "SiteName", "Site Name") or ""
+    engineer = get_field_value(fields, "PendingOutcomeEngineer", "Pending Outcome Engineer") or "Engineer"
+    outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or ""
+    work = get_field_value(fields, "PendingWorkCompleted", "Pending Work Completed") or ""
+    materials = get_field_value(fields, "PendingMaterialsUsed", "Pending Materials Used") or "None"
+    follow_on = "Yes" if bool_field(get_field_value(fields, "PendingFollowOnRequired", "Pending Follow On Required")) else "No"
+    follow_notes = get_field_value(fields, "PendingFollowOnNotes", "Pending Follow On Notes") or "None"
+    photo_count = get_field_value(fields, "PendingPhotoCount", "Pending Photo Count") or "0"
+
+    return (
+        "🧾 Pending Helpdesk/Admin Review\n\n"
+        f"CDR Number: {cdr_number}\n"
+        f"Site: {site}\n"
+        f"Engineer: {engineer}\n"
+        f"Engineer selected: {outcome}\n\n"
+        f"Work completed / notes:\n{work}\n\n"
+        f"Materials used:\n{materials}\n\n"
+        f"Follow-on required: {follow_on}\n"
+        f"Follow-on notes: {follow_notes}\n"
+        f"Photos uploaded: {photo_count}\n\n"
+        "Approve, change the outcome, or reject below."
+    )
+
+
+async def pending_reviews_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    role = await get_role_for_update(update)
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text(
+            "Only Helpdesk/Admin users can view pending reviews.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    try:
+        site_id = get_site_id()
+        jobs_list_id = get_list_id(site_id, JOBS_LIST)
+        jobs_data = get_list_items(site_id, jobs_list_id)
+        pending_jobs = []
+
+        for job in jobs_data:
+            fields = job.get("fields", {})
+            pending = bool_field(get_field_value(fields, "PendingHelpdeskReview", "Pending Helpdesk Review"))
+            status = str(get_field_value(fields, "Status") or "").strip()
+            if pending or status == AWAITING_HELPDESK_REVIEW_STATUS:
+                pending_jobs.append(job)
+
+        if not pending_jobs:
+            await update.message.reply_text(
+                "There are no jobs currently awaiting Helpdesk/Admin review.",
+                reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+            )
+            return ConversationHandler.END
+
+        pending_jobs.sort(
+            key=lambda job: str(get_field_value(job.get("fields", {}), "PendingOutcomeDateTime", "Pending Outcome Date Time") or ""),
+            reverse=True,
+        )
+
+        await update.message.reply_text(
+            f"Found {len(pending_jobs)} pending review(s).",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+
+        for job in pending_jobs[:10]:
+            await update.message.reply_text(
+                format_pending_review_card(job),
+                reply_markup=get_helpdesk_review_keyboard(job.get("id")),
+            )
+
+        if len(pending_jobs) > 10:
+            await update.message.reply_text(f"Showing the latest 10 of {len(pending_jobs)} pending reviews.")
+
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"ERROR loading pending reviews: {e}")
+        await update.message.reply_text(
+            "There was an error loading pending reviews. Please check Railway logs.",
+            reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
+        )
+        return ConversationHandler.END
+
+
 async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6930,11 +7159,10 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
         item_id = data[1]
         decision = data[2]
 
-        if HELPDESK_CHAT_ID and str(query.message.chat_id) != str(HELPDESK_CHAT_ID):
-            role = get_bot_user_role(get_site_id(), query.from_user.id)
-            if not user_can_use_helpdesk(role):
-                await query.message.reply_text("Only Helpdesk/Admin users can approve job reviews.")
-                return
+        role = get_bot_user_role(get_site_id(), query.from_user.id)
+        if not user_can_use_helpdesk(role):
+            await query.message.reply_text("Only Helpdesk/Admin users can approve job reviews.")
+            return
 
         site_id = get_site_id()
         jobs_list_id = get_list_id(site_id, JOBS_LIST)
@@ -6982,6 +7210,7 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
                 update_payload["EngineerLookupId"] = [int(pending_engineer_lookup_id)]
 
             update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
+            PENDING_REVIEW_CACHE.pop(str(item_id), None)
 
             if engineer and engineer.get("telegram_id"):
                 try:
@@ -7054,6 +7283,11 @@ async def helpdesk_review_button(update: Update, context: ContextTypes.DEFAULT_T
                 update_payload[key] = value
 
         update_list_item_fields(site_id, jobs_list_id, item_id, update_payload)
+
+        if final_outcome in ["Completed", "No Access", "Revisit Required"]:
+            await notify_trade_group(context, worksheet, fields, updated_log, final_outcome)
+
+        PENDING_REVIEW_CACHE.pop(str(item_id), None)
 
         await query.message.reply_text(
             f"Helpdesk review approved:\n\n{cdr_number} → {final_outcome}"
@@ -7211,6 +7445,61 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "cancel_outcome":
             await query.message.reply_text("Cancelled. No changes made.")
+            return
+
+        if action == "undo_travelling":
+            has_travelled = has_engineer_action(fields, current_engineer["name"], "Travelling")
+            has_on_site = has_engineer_action(fields, current_engineer["name"], "On Site")
+            current_status = str(fields.get("Status", "") or "").strip()
+
+            if not has_travelled:
+                await query.message.reply_text("Travelling has not been logged on this job, so there is nothing to undo.")
+                return
+
+            if has_on_site or current_status == ON_SITE_STATUS:
+                await query.message.reply_text("Travelling cannot be undone after Arrived On Site has been logged.")
+                return
+
+            updated_log = append_engineer_log(
+                fields,
+                current_engineer["name"],
+                "Travelling Reverted",
+                "Accidental travelling click reversed by engineer",
+            )
+
+            update_list_item_fields(
+                site_id,
+                jobs_list_id,
+                item_id,
+                {
+                    "Status": ASSIGNED_STATUS,
+                    "EngineerVisitLog": updated_log,
+                    "WorksheetSubmitted": False,
+                },
+            )
+
+            update_active_day_live_status(
+                site_id,
+                user_id,
+                ASSIGNED_STATUS,
+                get_job_reference(fields),
+            )
+
+            await query.message.reply_text(
+                f"Travelling reversed:\n\n{fields.get('CDRNumber', '')} → Assigned\n\nThe job is still assigned to you."
+            )
+
+            await notify_helpdesk(
+                context,
+                (
+                    f"Job travelling reversed\n\n"
+                    f"CDR Number: {fields.get('CDRNumber', '')}\n"
+                    f"Engineer: {current_engineer['name']}\n"
+                    f"Site: {fields.get('SiteName', '')}\n"
+                    "The job has been put back to Assigned and remains with the engineer."
+                ),
+            )
+
             return
 
         if action == "status":
@@ -8778,7 +9067,9 @@ def build_pending_review_update_fields(worksheet, fields, updated_log, outcome):
 def build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id):
     cdr_number = get_field_value(fields, "CDRNumber", "CDR Number", "Title") or ""
     outcome = get_field_value(fields, "PendingOutcome", "Pending Outcome") or "Completed"
-    return {
+    cached = PENDING_REVIEW_CACHE.get(str(item_id), {}) or {}
+
+    worksheet = {
         "site_id": site_id,
         "jobs_list_id": jobs_list_id,
         "item_id": item_id,
@@ -8793,10 +9084,17 @@ def build_worksheet_from_pending(fields, item_id, site_id, jobs_list_id):
         "NoAccessReason": get_field_value(fields, "PendingNoAccessReason", "Pending No Access Reason") or "",
         "ClientSignatureRequired": bool_field(get_field_value(fields, "PendingClientSignatureRequired", "Pending Client Signature Required")),
         "ClientSignatureReceived": bool_field(get_field_value(fields, "ClientSignatureReceived")),
-        "photo_links": [],
-        "photo_files_for_group": [],
+        "photo_links": cached.get("photo_links", []),
+        "photo_files_for_group": cached.get("photo_files_for_group", []),
         "fields": fields,
     }
+
+    # Keep any live worksheet values that are not safely persisted into the SharePoint pending fields.
+    for key in ["ClientSignatureName", "ClientSignatureDateTime", "ClientSignatureLink"]:
+        if cached.get(key):
+            worksheet[key] = cached.get(key)
+
+    return worksheet
 
 
 def clear_pending_review_fields():
@@ -8985,6 +9283,7 @@ async def worksheet_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         update_list_item_fields(site_id, jobs_list_id, item_id, pending_update)
+        PENDING_REVIEW_CACHE[str(item_id)] = worksheet.copy()
 
         update_active_day_live_status(
             site_id,
@@ -9083,69 +9382,34 @@ async def worksheet_review_button(update: Update, context: ContextTypes.DEFAULT_
     updated_log = append_engineer_log(
         fields,
         worksheet["engineer_name"],
-        outcome,
+        f"Submitted for Helpdesk Review - {outcome}",
         build_visit_comment_extra(worksheet),
     )
 
-    assigned_ids = get_assigned_engineer_ids(fields)
-    is_final_engineer = len(assigned_ids) <= 1
-
-    worksheet_pdf_link = ""
-    if is_final_engineer and outcome == "Completed":
-        worksheet_pdf_link = generate_and_upload_worksheet_pdf(
-            site_id,
-            jobs_list_id,
-            item_id,
-            worksheet,
-            fields,
-            updated_log,
-            outcome,
-        )
-
-    fields_to_update = build_worksheet_update_fields(
+    pending_update = build_pending_review_update_fields(
         worksheet,
         fields,
         updated_log,
         outcome,
-        is_final_engineer,
-        worksheet_pdf_link,
     )
 
-    update_list_item_fields(site_id, jobs_list_id, item_id, fields_to_update)
+    update_list_item_fields(site_id, jobs_list_id, item_id, pending_update)
+    PENDING_REVIEW_CACHE[str(item_id)] = worksheet.copy()
 
     update_active_day_live_status(
         site_id,
         str(query.from_user.id),
-        outcome,
+        "Awaiting Helpdesk Review",
         get_job_reference(fields),
     )
 
-    if outcome == "Completed":
-        final_pdf_text = "\n\nFinal PDF worksheet generated." if worksheet_pdf_link else "\n\nFinal PDF worksheet will generate when the last assigned engineer submits."
-    else:
-        final_pdf_text = ""
     await query.message.reply_text(
-        f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}" + final_pdf_text,
+        f"Submitted for Helpdesk review:\n\n{worksheet['cdr_number']} → {outcome}\n\n"
+        "You have been removed from this job and can move on. The office will approve or change the outcome.",
         reply_markup=get_main_menu(await get_role_for_update(update)),
     )
 
-    await notify_helpdesk(
-        context,
-        (
-            f"Worksheet submitted\n\n"
-            f"CDR Number: {worksheet['cdr_number']}\n"
-            f"Engineer: {worksheet['engineer_name']}\n"
-            f"Outcome: {outcome}\n"
-            f"No Access reason: {worksheet.get('NoAccessReason', 'N/A') if outcome == 'No Access' else 'N/A'}\n"
-            f"Final engineer: {'Yes' if is_final_engineer else 'No'}\n"
-            f"Photos uploaded: {len(worksheet.get('photo_links', []))}\n"
-            f"Client signature required: {'Yes' if worksheet.get('ClientSignatureRequired') else 'No'}\n"
-            f"Client signature received: {'Yes' if worksheet.get('ClientSignatureReceived') else 'No'}"
-        ),
-    )
-
-    if outcome in ["Completed", "No Access", "Revisit Required"]:
-        await notify_trade_group(context, worksheet, fields, updated_log, outcome)
+    await notify_helpdesk_review_required(context, worksheet, fields, outcome)
 
     context.user_data.pop("worksheet", None)
     return ConversationHandler.END
@@ -9227,6 +9491,10 @@ async def send_new_jobs(app):
 
 async def remind_engineers_to_start_day(app):
     """Daily 07:40 reminder to active engineers/admin engineers to start their day."""
+    if is_weekend_today():
+        print("Start-day reminders skipped because today is Saturday/Sunday.")
+        return
+
     try:
         site_id = get_site_id()
         engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
@@ -9265,6 +9533,10 @@ async def remind_engineers_to_start_day(app):
 
 async def remind_active_engineers_to_end_day(app):
     """Daily reminder so engineers do not forget to close their day."""
+    if is_weekend_today():
+        print("End-day reminders skipped because today is Saturday/Sunday.")
+        return
+
     try:
         site_id = get_site_id()
         day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
@@ -9520,6 +9792,10 @@ async def send_due_task_activity_reminders(app):
     Safe: only reads Task Activities and marks ReminderSent on that task record.
     Does not touch jobs, worksheets, photos, signatures or day logs.
     """
+    if is_weekend_today():
+        print("Task/activity reminders skipped because today is Saturday/Sunday.")
+        return
+
     try:
         site_id = get_site_id()
         tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
@@ -9823,6 +10099,7 @@ async def post_init(app):
     scheduler.add_job(
         remind_engineers_to_start_day,
         trigger="cron",
+        day_of_week="mon-fri",
         hour=7,
         minute=40,
         args=[app],
@@ -9831,6 +10108,7 @@ async def post_init(app):
     scheduler.add_job(
         remind_active_engineers_to_end_day,
         trigger="cron",
+        day_of_week="mon-fri",
         hour=16,
         minute=45,
         args=[app],
@@ -9839,6 +10117,7 @@ async def post_init(app):
     scheduler.add_job(
         send_due_task_activity_reminders,
         trigger="cron",
+        day_of_week="mon-fri",
         hour=8,
         minute=0,
         args=[app],
@@ -10473,7 +10752,7 @@ telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_PENDING_REVIEWS}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(helpdesk_review_button, pattern="^helpdesk_review\\|"))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
