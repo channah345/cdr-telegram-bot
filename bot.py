@@ -54,10 +54,8 @@ HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-v50-clean-base-admin-bypass-cdr-assistant"
+BUILD_VERSION = "phase1-recovery-v45-stable-editable-no-pending-review"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -84,7 +82,6 @@ MENU_END_DAY = "🏁 End Day"
 MENU_BUG_IDEA = "🐞 Bug / Ideas"
 MENU_UPLOAD_RECEIPTS = "🧾 Receipts / Returns"
 MENU_REQUEST_JOB = "📣 Request Job"
-MENU_CDR_ASSISTANT = "🤖 Ask CDR Assistant"
 MENU_QUOTE_REMINDER = "📋 Task / Activity"
 MENU_MESSAGE_ENGINEER = "📢 Message Engineer"
 MENU_CANCEL_TASK_ACTIVITY = "❌ Cancel Task / Activity"
@@ -182,7 +179,6 @@ REOPENJOB_DATE = 80
 REOPENJOB_ASSIGN_ENGINEERS = 81
 REOPENJOB_REASON = 82
 REOPENJOB_REVIEW = 83
-ASK_CDR_ASSISTANT = 84
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -591,7 +587,7 @@ def get_engineer_menu(include_helpdesk_menu=False):
         [MENU_START_DAY, MENU_MY_JOBS],
         [MENU_END_DAY, MENU_BUG_IDEA],
         [MENU_UPLOAD_RECEIPTS],
-        [MENU_REQUEST_JOB, MENU_CDR_ASSISTANT],
+        [MENU_REQUEST_JOB],
     ]
 
     # Only Admin users should be able to switch from the Engineer menu
@@ -625,7 +621,6 @@ def get_helpdesk_menu(include_engineer_menu=False):
         MENU_MESSAGE_ENGINEER,
         MENU_CANCEL_TASK_ACTIVITY,
         MENU_UPLOAD_RECEIPTS,
-        MENU_CDR_ASSISTANT,
         MENU_BUG_IDEA,
     ])
 
@@ -3924,12 +3919,11 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     start_day = context.user_data.get("start_day")
-    if start_day and is_vehicle_check_exempt_role(start_day.get("role")):
-        create_vehicle_exempt_start_day_log(start_day)
+    if start_day and is_apprentice_role(start_day.get("role")):
+        create_apprentice_start_day_log(start_day)
         context.user_data.pop("start_day", None)
-        label = "Admin" if is_admin_role(start_day.get("role")) else "Apprentice"
         await update.message.reply_text(
-            f"{label} day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
+            "Apprentice day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
@@ -3953,12 +3947,11 @@ async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     start_day = context.user_data.get("start_day")
-    if start_day and is_vehicle_check_exempt_role(start_day.get("role")):
-        create_vehicle_exempt_start_day_log(start_day)
+    if start_day and is_apprentice_role(start_day.get("role")):
+        create_apprentice_start_day_log(start_day)
         context.user_data.pop("start_day", None)
-        label = "Admin" if is_admin_role(start_day.get("role")) else "Apprentice"
         await query.message.reply_text(
-            f"{label} day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
+            "Apprentice day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
@@ -3979,15 +3972,6 @@ async def startday_van_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not start_day:
         await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
-        return ConversationHandler.END
-
-    if is_vehicle_check_exempt_role(start_day.get("role")):
-        create_vehicle_exempt_start_day_log(start_day)
-        context.user_data.pop("start_day", None)
-        await update.message.reply_text(
-            "Day started. No van check, van registration or mileage is required for your role. Your jobs are now unlocked.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
         return ConversationHandler.END
 
     van_reg = update.message.text.strip().upper()
@@ -4118,25 +4102,6 @@ def is_apprentice_role(role):
     return str(role or "").strip().lower() == "apprentice"
 
 
-def is_admin_role(role):
-    return str(role or "").strip().lower() == "admin"
-
-
-def is_vehicle_check_exempt_role(role):
-    # Admin users do not need van registration, mileage or van-check prompts.
-    # Apprentice users already skipped this flow; keeping them here keeps behaviour unchanged.
-    return is_admin_role(role) or is_apprentice_role(role)
-
-
-def create_vehicle_exempt_start_day_log(start_day, van_check_completed=False):
-    """Start a day without van registration, mileage, van check or van photos."""
-    start_day["van_reg"] = ""
-    start_day["start_mileage"] = ""
-    start_day["van_check_answers"] = []
-    start_day["van_photo_links"] = []
-    create_start_day_log(start_day, van_check_completed=van_check_completed)
-
-
 def create_apprentice_start_day_log(start_day):
     """Start an apprentice day without van registration, mileage, van check or van photos."""
     start_day["van_reg"] = ""
@@ -4258,15 +4223,6 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
 
     if not start_day:
         await update.message.reply_text("Please try /startday again.", reply_markup=get_main_menu(await get_role_for_update(update)))
-        return ConversationHandler.END
-
-    if is_vehicle_check_exempt_role(start_day.get("role")):
-        create_vehicle_exempt_start_day_log(start_day)
-        context.user_data.pop("start_day", None)
-        await update.message.reply_text(
-            "Day started. No van check, van registration or mileage is required for your role. Your jobs are now unlocked.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
         return ConversationHandler.END
 
     mileage = normalise_mileage(update.message.text)
@@ -4507,7 +4463,7 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     end_day = context.user_data.get("end_day")
-    if end_day and is_vehicle_check_exempt_role(end_day.get("role")):
+    if end_day and is_apprentice_role(end_day.get("role")):
         ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
         await update.message.reply_text(
             message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
@@ -4537,7 +4493,7 @@ async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     end_day = context.user_data.get("end_day")
-    if end_day and is_vehicle_check_exempt_role(end_day.get("role")):
+    if end_day and is_apprentice_role(end_day.get("role")):
         ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
         await query.message.reply_text(
             message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
@@ -4775,9 +4731,6 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
 
-    if text == MENU_CDR_ASSISTANT:
-        return await cdr_assistant_start(update, context)
-
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
@@ -4858,9 +4811,6 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
-
-    if text == MENU_CDR_ASSISTANT:
-        return await cdr_assistant_start(update, context)
 
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
@@ -6598,196 +6548,8 @@ HELPDESK_MENU_TEXTS = {
     MENU_OPEN_JOBS,
     MENU_FIND_JOB,
     MENU_UPLOAD_RECEIPTS,
-    MENU_CDR_ASSISTANT,
     MENU_ENGINEER_MENU,
 }
-
-
-
-def is_cdr_number_in_text(text):
-    return re.search(r"\bCDR\s*[-_ ]?\d{3,}\b", str(text or ""), re.IGNORECASE)
-
-
-def extract_cdr_number(text):
-    match = re.search(r"\bCDR\s*[-_ ]?(\d{3,})\b", str(text or ""), re.IGNORECASE)
-    if not match:
-        return ""
-    return "CDR" + match.group(1)
-
-
-def summarise_job_for_assistant(job):
-    fields = job.get("fields", {})
-    assigned = []
-    engineer_values = fields.get("Engineer", [])
-    if isinstance(engineer_values, list):
-        assigned = [str(e.get("LookupValue", "")).strip() for e in engineer_values if str(e.get("LookupValue", "")).strip()]
-
-    return (
-        f"CDR Number: {fields.get('CDRNumber', '')}\n"
-        f"Date: {format_sharepoint_date(fields.get('Date', ''))}\n"
-        f"Time: {fields.get('StartTime', '')}\n"
-        f"Status: {fields.get('Status', '')}\n"
-        f"Outcome: {fields.get('JobOutcome', '') or 'N/A'}\n"
-        f"Site: {fields.get('SiteName', '')}\n"
-        f"Task: {fields.get('Task', '')}\n"
-        f"Assigned engineer(s): {', '.join(assigned) or 'None'}"
-    )
-
-
-def answer_cdr_internal_question(question, role="Engineer"):
-    """Answer safe internal CDR questions directly from SharePoint.
-
-    This function does not send SharePoint/customer/job data to OpenAI.
-    """
-    text = str(question or "").strip()
-    lower = text.lower()
-
-    site_id, engineers_list_id, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
-
-    if is_cdr_number_in_text(text):
-        cdr_number = extract_cdr_number(text)
-        job = find_job_by_cdr(jobs_data, cdr_number)
-        if not job:
-            return f"I could not find {cdr_number} in SharePoint."
-        return summarise_job_for_assistant(job)
-
-    if "open job" in lower or "open jobs" in lower:
-        open_jobs = []
-        for job in jobs_data:
-            fields = job.get("fields", {})
-            if not is_closed_job(fields):
-                open_jobs.append(job)
-        if not open_jobs:
-            return "There are no open jobs showing at the moment."
-        lines = ["Open jobs:"]
-        for job in open_jobs[:15]:
-            fields = job.get("fields", {})
-            lines.append(f"- {fields.get('CDRNumber', '')} | {fields.get('SiteName', '')} | {fields.get('Status', '')}")
-        if len(open_jobs) > 15:
-            lines.append(f"...and {len(open_jobs) - 15} more.")
-        return "\n".join(lines)
-
-    if "who is on site" in lower or "onsite" in lower or "on site" in lower:
-        on_site = []
-        for job in jobs_data:
-            fields = job.get("fields", {})
-            if str(fields.get("Status", "")).strip().lower() == "on site":
-                on_site.append(job)
-        if not on_site:
-            return "No jobs are currently showing as On Site."
-        lines = ["Currently on site:"]
-        for job in on_site[:15]:
-            fields = job.get("fields", {})
-            lines.append(f"- {fields.get('CDRNumber', '')} | {fields.get('SiteName', '')}")
-        return "\n".join(lines)
-
-    return ""
-
-
-def ask_openai_general_question(question):
-    """Ask OpenAI a general/technical question only.
-
-    Do not pass SharePoint job records, customer addresses, photos, signatures,
-    resident names or other GDPR-sensitive operational data into this function.
-    """
-    if not OPENAI_API_KEY:
-        return "OpenAI is not enabled yet. Add OPENAI_API_KEY in Railway if you want general/technical AI answers."
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {
-                "role": "system",
-                "content": (
-                    "You are CDR Assistant for a UK building services contractor. "
-                    "Give concise, practical help. Do not request or process personal data. "
-                    "For live CDR job/customer data, tell the user to use a CDR number lookup in the bot."
-                ),
-            },
-            {"role": "user", "content": str(question or "")[:3000]},
-        ],
-    }
-
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-
-    if response.status_code not in [200, 201]:
-        print(f"OpenAI request failed: {response.status_code} {response.text}")
-        return "OpenAI could not answer that just now. Please check Railway logs/API key."
-
-    data = response.json()
-    if data.get("output_text"):
-        return data["output_text"].strip()
-
-    # Fallback for response shapes that do not include output_text.
-    chunks = []
-    for item in data.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") in ["output_text", "text"] and content.get("text"):
-                chunks.append(content.get("text"))
-    return "\n".join(chunks).strip() or "I could not read the AI response."
-
-
-async def cdr_assistant_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_group_chat(update):
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Ask me a question about CDR jobs, engineers, open jobs, or general technical help.\n\n"
-        "Examples:\n"
-        "- CDR03224\n"
-        "- What open jobs do we have?\n"
-        "- Who is on site?\n"
-        "- How does a volt-free relay work?\n\n"
-        "For GDPR safety, I will answer job lookups directly from SharePoint and will not send live job records to OpenAI.",
-        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True, one_time_keyboard=False),
-    )
-    return ASK_CDR_ASSISTANT
-
-
-async def answer_cdr_assistant_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text):
-    try:
-        role = await get_role_for_update(update)
-        answer = answer_cdr_internal_question(text, role=role)
-        if not answer:
-            answer = ask_openai_general_question(text)
-        await update.message.reply_text(answer[:3900], reply_markup=get_main_menu(role))
-    except Exception as e:
-        print(f"ERROR in CDR Assistant: {e}")
-        await update.message.reply_text(
-            "There was an error answering that. Please ask the office to check Railway logs.",
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
-    return ConversationHandler.END
-
-
-async def cdr_assistant_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_group_chat(update):
-        return ConversationHandler.END
-
-    text = update.message.text.strip()
-    if text.lower() in ["cancel", "❌ cancel", "/cancel"]:
-        await update.message.reply_text("CDR Assistant closed.", reply_markup=get_main_menu(await get_role_for_update(update)))
-        return ConversationHandler.END
-
-    return await answer_cdr_assistant_text(update, context, text)
-
-
-async def cdr_assistant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_group_chat(update):
-        return ConversationHandler.END
-
-    if context.args:
-        return await answer_cdr_assistant_text(update, context, " ".join(context.args))
-
-    return await cdr_assistant_start(update, context)
 
 ALL_MENU_TEXTS = {
     MENU_START_DAY,
@@ -6795,7 +6557,6 @@ ALL_MENU_TEXTS = {
     MENU_END_DAY,
     MENU_BUG_IDEA,
     MENU_UPLOAD_RECEIPTS,
-    MENU_CDR_ASSISTANT,
     *HELPDESK_MENU_TEXTS,
 }
 
@@ -11023,18 +10784,6 @@ telegram_app.add_handler(
     group=0,
 )
 
-cdr_assistant_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler("ask", cdr_assistant_command),
-        CommandHandler("assistant", cdr_assistant_command),
-        MessageHandler(filters.Regex(f"^{MENU_CDR_ASSISTANT}$"), cdr_assistant_start),
-    ],
-    states={
-        ASK_CDR_ASSISTANT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, cdr_assistant_question)],
-    },
-    fallbacks=[CommandHandler("cancel", cancel)],
-)
-
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("my_id", my_id))
 telegram_app.add_handler(CommandHandler("id", id))
@@ -11057,8 +10806,7 @@ telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(cdr_assistant_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CDR_ASSISTANT}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
