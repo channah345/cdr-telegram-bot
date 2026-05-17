@@ -54,8 +54,10 @@ HELPDESK_CHAT_ID = os.getenv("HELPDESK_CHAT_ID")
 CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-recovery-v46-admin-no-vehicle-checks"
+BUILD_VERSION = "phase1-recovery-v47-admin-openai-assistant"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -93,6 +95,7 @@ MENU_OPEN_JOBS = "📋 Open Jobs"
 MENU_FIND_JOB = "🔎 Find Job"
 MENU_CANCEL_JOB = "❌ Cancel Job"
 MENU_DELETE_JOB = "🗑 Delete Job"
+MENU_ASK_CHATBOT = "🤖 Ask ChatGPT"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
 
 
@@ -179,6 +182,7 @@ REOPENJOB_DATE = 80
 REOPENJOB_ASSIGN_ENGINEERS = 81
 REOPENJOB_REASON = 82
 REOPENJOB_REVIEW = 83
+ASK_CHATBOT_QUESTION = 84
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -594,7 +598,7 @@ def get_engineer_menu(include_helpdesk_menu=False):
     # into the Helpdesk menu. Helpdesk users stay in the Helpdesk menu,
     # and Engineer users stay in the Engineer menu.
     if include_helpdesk_menu:
-        rows.append([MENU_HELPDESK])
+        rows.append([MENU_HELPDESK, MENU_ASK_CHATBOT])
 
     return ReplyKeyboardMarkup(
         rows,
@@ -625,6 +629,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
     ])
 
     if include_engineer_menu:
+        buttons.append(MENU_ASK_CHATBOT)
         buttons.append(MENU_ENGINEER_MENU)
 
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
@@ -4746,7 +4751,10 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ENGINEER_MENU]:
+    if text == MENU_ASK_CHATBOT:
+        return await ask_chatbot_start(update, context)
+
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ASK_CHATBOT, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4797,6 +4805,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if text == MENU_ASK_CHATBOT:
+        return await ask_chatbot_start(update, context)
+
     if text == MENU_LOG_JOB:
         return await logjob_start(update, context)
 
@@ -4835,6 +4846,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_FIND_JOB: "Find Job",
         MENU_CANCEL_JOB: "Cancel Job",
         MENU_DELETE_JOB: "Delete Job",
+        MENU_ASK_CHATBOT: "Ask ChatGPT",
         MENU_QUOTE_REMINDER: "Task / Activity",
         MENU_HELPDESK: "Helpdesk",
     }
@@ -6560,6 +6572,12 @@ HELPDESK_MENU_TEXTS = {
     MENU_OPEN_JOBS,
     MENU_FIND_JOB,
     MENU_UPLOAD_RECEIPTS,
+    MENU_CANCEL_JOB,
+    MENU_DELETE_JOB,
+    MENU_QUOTE_REMINDER,
+    MENU_MESSAGE_ENGINEER,
+    MENU_CANCEL_TASK_ACTIVITY,
+    MENU_ASK_CHATBOT,
     MENU_ENGINEER_MENU,
 }
 
@@ -10140,6 +10158,141 @@ async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 
+# -----------------------------
+# Admin-only OpenAI assistant
+# -----------------------------
+def extract_openai_response_text(response_json):
+    """Extract plain text from the OpenAI Responses API response shape."""
+    if not isinstance(response_json, dict):
+        return ""
+
+    if response_json.get("output_text"):
+        return str(response_json.get("output_text") or "").strip()
+
+    texts = []
+    for item in response_json.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            if content.get("type") in ["output_text", "text"] and content.get("text"):
+                texts.append(str(content.get("text")))
+
+    return "\n".join(texts).strip()
+
+
+def call_openai_assistant(question):
+    """Call OpenAI using a simple server-side API key stored in Railway."""
+    if not OPENAI_API_KEY:
+        return "OPENAI_API_KEY is missing in Railway variables. Add it, redeploy, then try again."
+
+    question = str(question or "").strip()
+    if not question:
+        return "Please ask a question."
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": (
+            "You are an internal assistant for CDR M&E Services Ltd. "
+            "Give practical, concise answers for a UK building services / M&E contractor. "
+            "Do not claim you have checked SharePoint, Telegram, Railway, email or live company systems unless that information is included in the user's message. "
+            "If the user asks for legal, HR, financial, gas, electrical or compliance advice, give cautious general guidance and tell them to verify before acting. "
+            "Avoid asking for personal data or customer-sensitive information."
+        ),
+        "input": question,
+        "max_output_tokens": 700,
+        "store": False,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=45,
+        )
+
+        if response.status_code >= 400:
+            return f"OpenAI request failed ({response.status_code}): {response.text[:900]}"
+
+        answer = extract_openai_response_text(response.json())
+        return answer or "OpenAI returned an empty response."
+
+    except Exception as e:
+        return f"OpenAI request failed: {e}"
+
+
+async def ask_chatbot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    role = await get_role_for_update(update)
+    if str(role or "").lower() != "admin":
+        await update.message.reply_text(
+            "Only Admin users can use Ask ChatGPT.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    context.user_data["ask_chatbot_active"] = True
+    await update.message.reply_text(
+        "Ask ChatGPT is open for Admin testing.\n\n"
+        "Type your question now. Avoid sending customer names, tenant details, addresses or other GDPR-sensitive data while testing.\n\n"
+        "Type /cancel to close.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ASK_CHATBOT_QUESTION
+
+
+async def ask_chatbot_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    menu_result = await handle_menu_during_conversation(update, context, ASK_CHATBOT_QUESTION)
+    if menu_result is not None:
+        return menu_result
+
+    role = await get_role_for_update(update)
+    if str(role or "").lower() != "admin":
+        context.user_data.pop("ask_chatbot_active", None)
+        await update.message.reply_text(
+            "Only Admin users can use Ask ChatGPT.",
+            reply_markup=get_main_menu(role),
+        )
+        return ConversationHandler.END
+
+    question = str(update.message.text or "").strip()
+    if not question:
+        await update.message.reply_text("Please type a question, or /cancel to close.")
+        return ASK_CHATBOT_QUESTION
+
+    await update.message.reply_text("Thinking...")
+    answer = await asyncio.to_thread(call_openai_assistant, question)
+
+    # Telegram has a message length limit. Split long replies into safe chunks.
+    chunks = [answer[i:i + 3500] for i in range(0, len(answer), 3500)] or ["No answer returned."]
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
+
+    await update.message.reply_text(
+        "Ask another question, or type /cancel to close Ask ChatGPT.",
+    )
+    return ASK_CHATBOT_QUESTION
+
+
+async def ask_chatbot_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+
+    context.user_data.pop("ask_chatbot_active", None)
+    role = await get_role_for_update(update)
+    await update.message.reply_text(
+        "Ask ChatGPT closed.",
+        reply_markup=get_main_menu(role),
+    )
+    return ConversationHandler.END
+
+
 
 GLOBAL_SCHEDULER = None
 
@@ -10775,6 +10928,17 @@ quote_reminder_handler = ConversationHandler(
 )
 
 
+
+ask_chatbot_handler = ConversationHandler(
+    entry_points=[
+        MessageHandler(filters.Regex(f"^{re.escape(MENU_ASK_CHATBOT)}$"), ask_chatbot_start),
+    ],
+    states={
+        ASK_CHATBOT_QUESTION: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, ask_chatbot_question)],
+    },
+    fallbacks=[CommandHandler("cancel", ask_chatbot_cancel)],
+)
+
 abortjob_handler = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(abort_job_start, pattern="^abort_job\\|"),
@@ -10790,7 +10954,7 @@ abortjob_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|🤖 Ask ChatGPT|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -10811,6 +10975,7 @@ telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(message_engineer_handler)
 telegram_app.add_handler(cancel_task_activity_handler)
 telegram_app.add_handler(quote_reminder_handler)
+telegram_app.add_handler(ask_chatbot_handler)
 telegram_app.add_handler(reopenjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
@@ -10818,7 +10983,7 @@ telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ASK_CHATBOT}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
