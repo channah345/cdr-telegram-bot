@@ -55,7 +55,7 @@ CDR_ELECTRICAL_CHAT_ID = os.getenv("CDR_ELECTRICAL_CHAT_ID")
 CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-recovery-v45-stable-editable-no-pending-review"
+BUILD_VERSION = "phase1-recovery-v46-admin-no-vehicle-checks"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -3919,11 +3919,12 @@ async def startday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     start_day = context.user_data.get("start_day")
-    if start_day and is_apprentice_role(start_day.get("role")):
-        create_apprentice_start_day_log(start_day)
+    if start_day and is_vehicle_check_exempt_role(start_day.get("role")):
+        create_vehicle_exempt_start_day_log(start_day)
+        role_label = str(start_day.get("role") or "User").title()
         context.user_data.pop("start_day", None)
         await update.message.reply_text(
-            "Apprentice day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
+            f"{role_label} day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
@@ -3947,11 +3948,12 @@ async def startday_confirm_button(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     start_day = context.user_data.get("start_day")
-    if start_day and is_apprentice_role(start_day.get("role")):
-        create_apprentice_start_day_log(start_day)
+    if start_day and is_vehicle_check_exempt_role(start_day.get("role")):
+        create_vehicle_exempt_start_day_log(start_day)
+        role_label = str(start_day.get("role") or "User").title()
         context.user_data.pop("start_day", None)
         await query.message.reply_text(
-            "Apprentice day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
+            f"{role_label} day started. No van check, van registration or mileage is required. Your jobs are now unlocked.",
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
@@ -4102,13 +4104,23 @@ def is_apprentice_role(role):
     return str(role or "").strip().lower() == "apprentice"
 
 
-def create_apprentice_start_day_log(start_day):
-    """Start an apprentice day without van registration, mileage, van check or van photos."""
+def is_vehicle_check_exempt_role(role):
+    """Roles that do not need van registration, start mileage, van checks/photos or end mileage."""
+    return str(role or "").strip().lower() in ["admin", "apprentice"]
+
+
+def create_vehicle_exempt_start_day_log(start_day):
+    """Start a day without van registration, mileage, van check or van photos."""
     start_day["van_reg"] = ""
     start_day["start_mileage"] = ""
     start_day["van_check_answers"] = []
     start_day["van_photo_links"] = []
     create_start_day_log(start_day, van_check_completed=False)
+
+
+def create_apprentice_start_day_log(start_day):
+    """Backward-compatible wrapper for older apprentice start-day call sites."""
+    create_vehicle_exempt_start_day_log(start_day)
 
 
 async def close_end_day_record(context, end_day, mileage=None, include_mileage=True):
@@ -4463,7 +4475,7 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     end_day = context.user_data.get("end_day")
-    if end_day and is_apprentice_role(end_day.get("role")):
+    if end_day and is_vehicle_check_exempt_role(end_day.get("role")):
         ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
         await update.message.reply_text(
             message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
@@ -4493,7 +4505,7 @@ async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     end_day = context.user_data.get("end_day")
-    if end_day and is_apprentice_role(end_day.get("role")):
+    if end_day and is_vehicle_check_exempt_role(end_day.get("role")):
         ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
         await query.message.reply_text(
             message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
