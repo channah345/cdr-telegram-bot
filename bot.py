@@ -2,6 +2,9 @@ import os
 import re
 import base64
 import secrets
+import hmac
+import hashlib
+import time
 import threading
 import zipfile
 import asyncio
@@ -15,8 +18,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto, ReplyKeyboardRemove
 try:
     from telegram.warnings import PTBUserWarning
@@ -2413,6 +2416,144 @@ def logo():
 # Live Engineer Dashboard
 # =========================
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+DASHBOARD_SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET") or DASHBOARD_TOKEN or CLIENT_SECRET or secrets.token_urlsafe(48)
+DASHBOARD_SESSION_COOKIE = "cdr_dashboard_session"
+DASHBOARD_SESSION_MAX_AGE_SECONDS = int(os.getenv("DASHBOARD_SESSION_MAX_AGE_SECONDS", "43200"))  # 12 hours
+
+
+def dashboard_cookie_secure(request):
+    forwarded_proto = str(request.headers.get("x-forwarded-proto", "")).split(",")[0].strip().lower()
+    return request.url.scheme == "https" or forwarded_proto == "https"
+
+
+def create_dashboard_session_value():
+    issued_at = str(int(time.time()))
+    signature = hmac.new(
+        str(DASHBOARD_SESSION_SECRET).encode("utf-8"),
+        f"{issued_at}:{DASHBOARD_PASSWORD}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{issued_at}:{signature}"
+
+
+def valid_dashboard_session(request):
+    if not DASHBOARD_PASSWORD:
+        return False
+
+    raw_cookie = request.cookies.get(DASHBOARD_SESSION_COOKIE, "")
+    try:
+        issued_at_text, supplied_signature = raw_cookie.split(":", 1)
+        issued_at = int(issued_at_text)
+    except Exception:
+        return False
+
+    if issued_at <= 0 or time.time() - issued_at > DASHBOARD_SESSION_MAX_AGE_SECONDS:
+        return False
+
+    expected_signature = hmac.new(
+        str(DASHBOARD_SESSION_SECRET).encode("utf-8"),
+        f"{issued_at_text}:{DASHBOARD_PASSWORD}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(supplied_signature, expected_signature)
+
+
+def dashboard_authorised(request, token=""):
+    # New preferred method: sign-in page creates a short-lived HttpOnly cookie.
+    if valid_dashboard_session(request):
+        return True
+
+    # Backwards compatibility while you move over to the login page.
+    if DASHBOARD_TOKEN and token and hmac.compare_digest(str(token), str(DASHBOARD_TOKEN)):
+        return True
+
+    return False
+
+
+def dashboard_login_page(error="", next_url="/dashboard"):
+    error_html = f"<div class='error'>{html_safe(error)}</div>" if error else ""
+    return HTMLResponse(f"""
+    <!doctype html>
+    <html lang='en'>
+    <head>
+        <meta charset='utf-8'>
+        <meta name='viewport' content='width=device-width, initial-scale=1'>
+        <title>CDR Dashboard Sign In</title>
+        <style>
+            body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#111827; color:#f9fafb; font-family:Arial, sans-serif; }}
+            .login {{ width:min(420px, calc(100vw - 32px)); background:#ffffff; color:#111827; border-radius:22px; padding:28px; box-shadow:0 24px 70px rgba(0,0,0,.35); }}
+            .brand {{ display:flex; align-items:center; gap:14px; margin-bottom:18px; }}
+            .logo {{ width:64px; height:44px; object-fit:contain; }}
+            h1 {{ margin:0; font-size:24px; }}
+            p {{ margin:6px 0 22px; color:#6b7280; line-height:1.45; }}
+            label {{ display:block; font-weight:700; margin-bottom:8px; }}
+            input {{ width:100%; box-sizing:border-box; padding:14px 16px; border:1px solid #d1d5db; border-radius:14px; font-size:16px; }}
+            button {{ width:100%; margin-top:16px; padding:14px 16px; border:0; border-radius:14px; background:#f58220; color:white; font-weight:800; font-size:16px; cursor:pointer; }}
+            .error {{ background:#fee2e2; color:#991b1b; padding:12px 14px; border-radius:12px; margin-bottom:14px; }}
+            .hint {{ font-size:13px; margin-top:14px; color:#6b7280; }}
+        </style>
+    </head>
+    <body>
+        <form class='login' method='post' action='/dashboard/login'>
+            <div class='brand'><img class='logo' src='/logo.png' alt='CDR'><div><h1>Dashboard Sign In</h1><p>CDR M&amp;E Services Ltd</p></div></div>
+            {error_html}
+            <input type='hidden' name='next_url' value='{html_safe(next_url)}'>
+            <label for='password'>Dashboard password</label>
+            <input id='password' name='password' type='password' autocomplete='current-password' autofocus required>
+            <button type='submit'>Sign in</button>
+            <div class='hint'>Access is restricted to authorised CDR users only.</div>
+        </form>
+    </body>
+    </html>
+    """)
+
+
+@web_app.get("/dashboard/login", response_class=HTMLResponse)
+def dashboard_login_get(next_url: str = "/dashboard"):
+    return dashboard_login_page(next_url=next_url)
+
+
+@web_app.post("/dashboard/login")
+def dashboard_login_post(request: Request, password: str = Form(""), next_url: str = Form("/dashboard")):
+    if not DASHBOARD_PASSWORD:
+        return dashboard_login_page("Dashboard password is not configured. Set DASHBOARD_PASSWORD in Railway variables.", next_url)
+
+    if not hmac.compare_digest(str(password), str(DASHBOARD_PASSWORD)):
+        return dashboard_login_page("Incorrect dashboard password.", next_url)
+
+    # Only allow local dashboard paths as redirects.
+    if not str(next_url).startswith("/dashboard") or str(next_url).startswith("//"):
+        next_url = "/dashboard"
+
+    response = RedirectResponse(url=next_url, status_code=303)
+    response.set_cookie(
+        key=DASHBOARD_SESSION_COOKIE,
+        value=create_dashboard_session_value(),
+        max_age=DASHBOARD_SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        secure=dashboard_cookie_secure(request),
+        samesite="lax",
+    )
+    return response
+
+
+@web_app.get("/dashboard/logout")
+def dashboard_logout():
+    response = RedirectResponse(url="/dashboard/login", status_code=303)
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE)
+    return response
+
+
+def require_dashboard_access(request, token="", next_url="/dashboard"):
+    if dashboard_authorised(request, token):
+        return None
+
+    # If neither method is configured, keep the dashboard closed rather than exposed.
+    if not DASHBOARD_PASSWORD and not DASHBOARD_TOKEN:
+        return HTMLResponse("Dashboard access is not configured. Set DASHBOARD_PASSWORD in Railway variables.", status_code=503)
+
+    return RedirectResponse(url=f"/dashboard/login?next_url={quote_plus(next_url)}", status_code=303)
 
 # Idle alerts are OFF by default for safety.
 # Set IDLE_ALERTS_ENABLED=true in Railway to enable helpdesk idle notifications.
@@ -3038,7 +3179,7 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
 </head>
 <body>
     <header><div class='header-row'><div><h1>{html_safe(title)}</h1><div class='sub'>Live view refreshes every 30 seconds · Last updated {html_safe(generated)}</div></div><img src='/logo.png' alt='CDR M&E Services Ltd' style='height:46px;width:auto;max-width:220px;object-fit:contain;display:block;'></div><nav>{nav}</nav></header>
-    <main class='wrap'>{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day</div></main>
+    <main class='wrap'>{content}<div class='footer'>Read-only dashboard · Green = on site · Blue = travelling · Amber = active but idle/awaiting · Red = not started/overdue · Grey = ended day · <a href='/dashboard/logout'>Sign out</a></div></main>
 </body>
 </html>
     """)
@@ -3134,9 +3275,10 @@ def dashboard_force_end_day(token: str = "", telegram_id: str = ""):
 
 
 @web_app.get("/dashboard", response_class=HTMLResponse)
-def live_engineer_dashboard(token: str = "", view: str = "engineers"):
-    if DASHBOARD_TOKEN and token != DASHBOARD_TOKEN:
-        return HTMLResponse("Dashboard access denied.", status_code=403)
+def live_engineer_dashboard(request: Request, token: str = "", view: str = "engineers"):
+    auth_response = require_dashboard_access(request, token, next_url=f"/dashboard?view={quote_plus(str(view))}")
+    if auth_response:
+        return auth_response
 
     try:
         site_id = get_site_id()
