@@ -483,16 +483,32 @@ def clear_engineer_assignment_payload():
     }
 
 
+def get_remaining_assigned_engineer_ids(fields, current_lookup_id):
+    """Return assigned engineer lookup IDs excluding the current engineer.
+
+    SharePoint multi-person fields can come back in slightly different shapes
+    depending on Graph/List expansion. Older code only read the display lookup
+    field (Engineer), which meant one engineer submitting a worksheet could
+    accidentally overwrite the whole assignment list with an empty list.
+    This helper centralises the calculation so non-final submissions only remove
+    the submitting engineer and preserve every other assigned engineer.
+    """
+    current_lookup_id = str(current_lookup_id or "").strip()
+    remaining = []
+    seen = set()
+
+    for lookup_id in get_assigned_engineer_ids(fields):
+        lookup_id = str(lookup_id or "").strip()
+        if not lookup_id or lookup_id == current_lookup_id or lookup_id in seen:
+            continue
+        remaining.append(int(lookup_id))
+        seen.add(lookup_id)
+
+    return remaining
+
+
 def remove_current_engineer_assignment_payload(fields, current_lookup_id):
-    remaining_ids = []
-    engineer_values = fields.get("Engineer", [])
-
-    if isinstance(engineer_values, list):
-        for engineer in engineer_values:
-            lookup_id = str(engineer.get("LookupId"))
-
-            if lookup_id and lookup_id != str(current_lookup_id):
-                remaining_ids.append(int(lookup_id))
+    remaining_ids = get_remaining_assigned_engineer_ids(fields, current_lookup_id)
 
     return {
         "EngineerLookupId@odata.type": "Collection(Edm.Int32)",
@@ -1560,12 +1576,33 @@ def format_open_jobs_for_end_day(open_jobs):
 
 
 def get_assigned_engineer_ids(fields):
+    """Return assigned engineer lookup IDs from any SharePoint field shape available."""
     assigned = []
-    engineer_values = fields.get("Engineer", [])
+    seen = set()
 
+    def add_lookup_id(value):
+        value = str(value or "").strip()
+        if not value or value.lower() in ["none", "null"] or value in seen:
+            return
+        assigned.append(value)
+        seen.add(value)
+
+    engineer_values = fields.get("Engineer", [])
     if isinstance(engineer_values, list):
         for engineer in engineer_values:
-            assigned.append(str(engineer.get("LookupId")))
+            if isinstance(engineer, dict):
+                add_lookup_id(engineer.get("LookupId"))
+            else:
+                add_lookup_id(engineer)
+
+    # Depending on Graph expansion, the writable lookup ID field may also be present.
+    for key in ["EngineerLookupId", "Engineer Lookup Id", "EngineerId", "Engineer ID"]:
+        value = fields.get(key)
+        if isinstance(value, list):
+            for item in value:
+                add_lookup_id(item)
+        else:
+            add_lookup_id(value)
 
     return assigned
 
@@ -7192,8 +7229,8 @@ async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extra += f" | Notes: {notes}"
 
         updated_log = append_engineer_log(fields, engineer_name, "Aborted Attendance", extra)
-        assigned_ids = get_assigned_engineer_ids(fields)
-        is_final_engineer = len(assigned_ids) <= 1
+        remaining_ids = get_remaining_assigned_engineer_ids(fields, engineer_lookup_id)
+        is_final_engineer = len(remaining_ids) == 0
 
         update_fields = {
             "EngineerVisitLog": updated_log,
@@ -7635,15 +7672,15 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_outcome,
             )
 
-            assigned_ids = get_assigned_engineer_ids(fields)
-            is_final_engineer = len(assigned_ids) <= 1
+            remaining_ids = get_remaining_assigned_engineer_ids(fields, current_engineer["lookup_id"])
+            is_final_engineer = len(remaining_ids) == 0
 
             update_fields = {
-                "JobOutcome": selected_outcome,
                 "EngineerVisitLog": updated_log,
             }
 
             if is_final_engineer:
+                update_fields["JobOutcome"] = selected_outcome
                 update_fields["Status"] = AWAITING_DEPLOYMENT_STATUS
                 update_fields["TelegramNotified"] = False
                 update_fields["WorksheetSubmitted"] = False
@@ -7668,7 +7705,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"Updated:\n\n"
                 f"{fields.get('CDRNumber', '')} → {selected_outcome}\n"
-                f"You have been removed from this job."
+                f"Your attendance has been logged. Other assigned engineer(s) remain on the job until they submit their own worksheet."
             )
 
             await notify_helpdesk(
@@ -9152,7 +9189,7 @@ async def finalise_worksheet_direct(context, worksheet, fields, item_id, site_id
     if engineer_lookup_id not in assigned_ids_latest:
         return False, "You are no longer assigned to this job. Worksheet has not been submitted.", ""
 
-    is_final_engineer = len(assigned_ids_latest) <= 1
+    is_final_engineer = len(get_remaining_assigned_engineer_ids(fields, engineer_lookup_id)) == 0
     updated_log = append_engineer_log(
         fields,
         worksheet["engineer_name"],
@@ -9242,8 +9279,7 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
     outcome = worksheet.get("JobOutcome", "Completed")
     updated_log = apply_manual_visit_times_to_log(fields, worksheet, outcome)
 
-    assigned_ids = get_assigned_engineer_ids(fields)
-    is_final_engineer = len(assigned_ids) <= 1 or worksheet["engineer_lookup_id"] not in [x for x in assigned_ids if x != worksheet["engineer_lookup_id"]]
+    is_final_engineer = len(get_remaining_assigned_engineer_ids(fields, worksheet["engineer_lookup_id"])) == 0
 
     worksheet_link = ""
     if is_final_engineer and outcome == "Completed":
