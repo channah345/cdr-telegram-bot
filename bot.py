@@ -2380,7 +2380,145 @@ async def notify_helpdesk(context, text):
 
 @web_app.get("/", response_class=HTMLResponse)
 def home():
-    return HTMLResponse("CDR Engineer Bot signature portal is online.")
+    """Public CDR website landing page.
+
+    The dashboard remains hidden behind /dashboard and /dashboard/login.
+    This home page is safe for customers to view and does not expose job data.
+    """
+    return HTMLResponse("""
+    <!doctype html>
+    <html lang='en'>
+    <head>
+        <meta charset='utf-8'>
+        <meta name='viewport' content='width=device-width, initial-scale=1'>
+        <title>CDR M&amp;E Services Ltd | Multitrade Specialists</title>
+        <style>
+            :root { --orange:#f05a24; --dark:#0b0d0f; --panel:#151719; --line:#2b2f33; --muted:#a9b0b7; --white:#f8fafc; }
+            * { box-sizing:border-box; }
+            body { margin:0; background:var(--dark); color:var(--white); font-family:Arial, Helvetica, sans-serif; }
+            a { color:inherit; text-decoration:none; }
+            .nav { position:absolute; top:0; left:0; right:0; z-index:5; display:flex; align-items:center; justify-content:space-between; padding:22px 36px; }
+            .logo { height:42px; width:auto; object-fit:contain; }
+            .nav-links { display:flex; align-items:center; gap:28px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+            .nav-links a { color:#d7dce2; }
+            .nav-links a:hover { color:white; }
+            .btn { display:inline-flex; align-items:center; justify-content:center; padding:14px 22px; background:var(--orange); color:white; font-weight:800; text-transform:uppercase; letter-spacing:.06em; border-radius:0; border:1px solid var(--orange); font-size:12px; }
+            .btn.secondary { background:transparent; color:white; border-color:var(--orange); }
+            .hero { min-height:92vh; display:flex; align-items:center; justify-content:center; text-align:center; padding:110px 24px 70px; position:relative; overflow:hidden; background:linear-gradient(rgba(5,10,14,.62), rgba(5,10,14,.82)), radial-gradient(circle at 25% 25%, rgba(240,90,36,.18), transparent 32%), linear-gradient(135deg, #1f2933, #090b0d 70%); }
+            .hero::before { content:""; position:absolute; inset:0; background:linear-gradient(120deg, transparent 0 20%, rgba(255,255,255,.045) 20% 21%, transparent 21% 100%); opacity:.45; }
+            .hero-inner { position:relative; max-width:900px; }
+            h1 { margin:0; font-size:clamp(48px, 8vw, 94px); line-height:.98; font-weight:900; letter-spacing:.02em; text-transform:uppercase; }
+            .accent { width:86px; height:4px; background:var(--orange); margin:28px auto; }
+            .hero p { margin:0 auto 30px; max-width:680px; color:#e5e7eb; font-size:18px; line-height:1.6; }
+            .actions { display:flex; gap:14px; justify-content:center; flex-wrap:wrap; }
+            .stats { border-top:1px solid var(--line); border-bottom:1px solid var(--line); background:#151515; display:grid; grid-template-columns:repeat(4,1fr); gap:1px; }
+            .stat { padding:34px 20px; text-align:center; }
+            .stat strong { display:block; color:var(--orange); font-size:34px; font-weight:900; }
+            .stat span { display:block; margin-top:8px; color:#9aa3ad; font-size:12px; text-transform:uppercase; letter-spacing:.16em; }
+            .section { max-width:1120px; margin:0 auto; padding:82px 24px; }
+            .section h2 { margin:0; font-size:44px; line-height:1; text-transform:uppercase; font-weight:900; }
+            .section .accent { margin:18px 0 36px; }
+            .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:22px; }
+            .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:30px; min-height:178px; transition:.2s ease; }
+            .card:hover { border-color:rgba(240,90,36,.65); transform:translateY(-2px); }
+            .icon { color:var(--orange); font-size:26px; margin-bottom:18px; }
+            .card h3 { margin:0 0 12px; color:white; text-transform:uppercase; font-size:18px; }
+            .card p { margin:0; color:var(--muted); line-height:1.55; font-size:14px; }
+            .case-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:28px; }
+            .case { overflow:hidden; background:var(--panel); border:1px solid var(--line); border-radius:8px; }
+            .case-img { height:180px; background:linear-gradient(135deg, rgba(240,90,36,.35), rgba(30,41,59,.55)), radial-gradient(circle at 70% 20%, rgba(255,255,255,.24), transparent 34%); }
+            .case-body { padding:28px; }
+            .case h3 { margin:0 0 14px; color:var(--orange); text-transform:uppercase; font-size:18px; }
+            .case p { margin:0; color:var(--muted); line-height:1.55; }
+            .cta { background:#111; border-top:1px solid var(--line); text-align:center; padding:70px 24px; }
+            .cta h2 { margin:0 0 14px; font-size:42px; text-transform:uppercase; }
+            .cta p { margin:0 auto 24px; color:var(--muted); max-width:640px; line-height:1.6; }
+            footer { padding:24px 36px; border-top:1px solid var(--line); color:#7d8792; font-size:13px; display:flex; justify-content:space-between; gap:14px; flex-wrap:wrap; }
+            @media (max-width:860px) { .nav { position:relative; background:#0b0d0f; padding:18px 20px; } .nav-links { gap:14px; flex-wrap:wrap; justify-content:flex-end; } .stats, .grid, .case-grid { grid-template-columns:1fr; } .hero { min-height:72vh; padding-top:70px; } }
+        </style>
+    </head>
+    <body>
+        <header class='nav'>
+            <a href='/'><img class='logo' src='/logo.png' alt='CDR'></a>
+            <nav class='nav-links'>
+                <a href='#services'>Services</a>
+                <a href='#about'>About</a>
+                <a href='#case-studies'>Case Studies</a>
+                <a href='#careers'>Careers</a>
+                <a href='#contact'>Contact</a>
+                <a href='/dashboard/login'>Employee Login</a>
+                <a class='btn' href='#contact'>Make an enquiry</a>
+            </nav>
+        </header>
+
+        <section class='hero'>
+            <div class='hero-inner'>
+                <h1>North East's<br>Multitrade Specialists</h1>
+                <div class='accent'></div>
+                <p>Electrical, mechanical and building services for commercial, council and housing clients.</p>
+                <div class='actions'>
+                    <a class='btn' href='#contact'>Make an enquiry</a>
+                    <a class='btn secondary' href='#services'>View our services</a>
+                </div>
+            </div>
+        </section>
+
+        <section class='stats'>
+            <div class='stat'><strong>15+</strong><span>Skilled engineers</span></div>
+            <div class='stat'><strong>SHF → NCL</strong><span>Sheffield to Newcastle</span></div>
+            <div class='stat'><strong>6</strong><span>Trades under one roof</span></div>
+            <div class='stat'><strong>2021</strong><span>Established</span></div>
+        </section>
+
+        <section id='services' class='section'>
+            <h2>What we do</h2><div class='accent'></div>
+            <div class='grid'>
+                <div class='card'><div class='icon'>⚡</div><h3>Electrical</h3><p>Full installation, testing and certification for commercial and industrial clients.</p></div>
+                <div class='card'><div class='icon'>☀</div><h3>Plumbing</h3><p>Commercial and domestic plumbing, drainage and water systems.</p></div>
+                <div class='card'><div class='icon'>🔥</div><h3>Gas &amp; Oil</h3><p>Gas Safe registered boiler installation, servicing and gas safety certificates.</p></div>
+                <div class='card'><div class='icon'>❄</div><h3>HVAC</h3><p>Air conditioning, ventilation and refrigeration support.</p></div>
+                <div class='card'><div class='icon'>△</div><h3>Fire Systems</h3><p>Fire alarm installation, emergency lighting and compliance testing.</p></div>
+                <div class='card'><div class='icon'>▥</div><h3>Building Services</h3><p>Painting, joinery, roofing, groundworks and planned maintenance.</p></div>
+            </div>
+        </section>
+
+        <section id='case-studies' class='section'>
+            <h2>The work speaks for itself</h2><div class='accent'></div>
+            <div class='case-grid'>
+                <article class='case'><div class='case-img'></div><div class='case-body'><h3>Cleveland Fire Brigade</h3><p>Multi-site compliance and maintenance across fire stations in the North East.</p></div></article>
+                <article class='case'><div class='case-img'></div><div class='case-body'><h3>Middlesbrough Council</h3><p>Multi-trade social housing maintenance across council-managed properties.</p></div></article>
+                <article class='case'><div class='case-img'></div><div class='case-body'><h3>Housing Clients</h3><p>Consistent, compliant M&amp;E work across residential and housing association portfolios.</p></div></article>
+                <article class='case'><div class='case-img'></div><div class='case-body'><h3>Commercial Facilities</h3><p>Specialist facility work with strict compliance requirements.</p></div></article>
+            </div>
+        </section>
+
+        <section id='about' class='cta'>
+            <h2>Built for compliance, consistency and communication</h2>
+            <p>CDR M&amp;E Services Ltd supports planned and reactive works with clear reporting, engineer tracking and accountable delivery.</p>
+            <a class='btn' href='#contact'>Speak to CDR</a>
+        </section>
+
+        <section id='contact' class='section'>
+            <h2>Contact</h2><div class='accent'></div>
+            <div class='grid'>
+                <div class='card'><h3>Make an enquiry</h3><p>Email: info@cdrme.co.uk<br>Use this section for customer enquiries, tenders and service requests.</p></div>
+                <div class='card'><h3>Careers</h3><p id='careers'>Interested in joining CDR? Use this section for engineer and office roles.</p></div>
+                <div class='card'><h3>Employee access</h3><p>Authorised staff can access the operations dashboard through the secure sign-in page.</p><p style='margin-top:14px'><a class='btn' href='/dashboard/login'>Employee Login</a></p></div>
+            </div>
+        </section>
+
+        <footer>
+            <span>© CDR M&amp;E Services Ltd</span>
+            <span><a href='/dashboard/login'>Employee Login</a></span>
+        </footer>
+    </body>
+    </html>
+    """)
+
+
+@web_app.get("/employee-login")
+def employee_login_redirect():
+    return RedirectResponse(url="/dashboard/login", status_code=303)
 
 
 @web_app.get("/logo.png")
@@ -2460,15 +2598,11 @@ def valid_dashboard_session(request):
 
 
 def dashboard_authorised(request, token=""):
-    # New preferred method: sign-in page creates a short-lived HttpOnly cookie.
-    if valid_dashboard_session(request):
-        return True
-
-    # Backwards compatibility while you move over to the login page.
-    if DASHBOARD_TOKEN and token and hmac.compare_digest(str(token), str(DASHBOARD_TOKEN)):
-        return True
-
-    return False
+    # Strict method: dashboard access is only allowed after the sign-in page
+    # has created a valid, short-lived HttpOnly session cookie.
+    # URL tokens are deliberately not accepted here, because they can be copied,
+    # shared, saved in browser history, or leaked from screenshots.
+    return valid_dashboard_session(request)
 
 
 def dashboard_login_page(error="", next_url="/dashboard"):
@@ -2541,7 +2675,11 @@ def dashboard_login_post(request: Request, password: str = Form(""), next_url: s
 @web_app.get("/dashboard/logout")
 def dashboard_logout():
     response = RedirectResponse(url="/dashboard/login", status_code=303)
-    response.delete_cookie(DASHBOARD_SESSION_COOKIE)
+    # Delete the dashboard session cookie. Repeating the delete with explicit
+    # attributes helps browsers clear cookies created under Railway HTTPS/proxy.
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/")
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/", secure=True, samesite="lax")
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/", secure=False, samesite="lax")
     return response
 
 
@@ -2549,8 +2687,8 @@ def require_dashboard_access(request, token="", next_url="/dashboard"):
     if dashboard_authorised(request, token):
         return None
 
-    # If neither method is configured, keep the dashboard closed rather than exposed.
-    if not DASHBOARD_PASSWORD and not DASHBOARD_TOKEN:
+    # Keep the dashboard closed if the password is not configured.
+    if not DASHBOARD_PASSWORD:
         return HTMLResponse("Dashboard access is not configured. Set DASHBOARD_PASSWORD in Railway variables.", status_code=503)
 
     return RedirectResponse(url=f"/dashboard/login?next_url={quote_plus(next_url)}", status_code=303)
@@ -2997,8 +3135,7 @@ def dashboard_ops_summary(rows, job_rows):
     }
 
 
-def dashboard_nav(view, token):
-    token_part = f"&token={quote_plus(str(token))}" if token else ""
+def dashboard_nav(view, token=""):
     items = [
         ("engineers", "Engineer Board"),
         ("ops", "Ops Board"),
@@ -3008,7 +3145,7 @@ def dashboard_nav(view, token):
     ]
     links = []
     for key, label in items:
-        href = f"/dashboard?view={key}{token_part}"
+        href = f"/dashboard?view={key}"
         active = "active" if view == key else ""
         links.append(f"<a class='{active}' href='{html_safe(href)}'>{html_safe(label)}</a>")
     return "".join(links)
@@ -3187,9 +3324,10 @@ def render_dashboard_page(view, token, generated, summary, rows, job_rows, engin
 
 
 @web_app.get("/dashboard/force-end-day", response_class=HTMLResponse)
-def dashboard_force_end_day(token: str = "", telegram_id: str = ""):
-    if DASHBOARD_TOKEN and token != DASHBOARD_TOKEN:
-        return HTMLResponse("Dashboard access denied.", status_code=403)
+def dashboard_force_end_day(request: Request, telegram_id: str = ""):
+    auth_response = require_dashboard_access(request, next_url="/dashboard")
+    if auth_response:
+        return auth_response
 
     if not telegram_id:
         return HTMLResponse("Missing engineer Telegram ID.", status_code=400)
@@ -3206,7 +3344,7 @@ def dashboard_force_end_day(token: str = "", telegram_id: str = ""):
 
         active_day = find_active_day_log(day_logs, telegram_id)
         if not active_day:
-            return HTMLResponse("No active day found for that engineer. <a href='/dashboard?token=" + html_safe(token) + "'>Back</a>", status_code=404)
+            return HTMLResponse("No active day found for that engineer. <a href='/dashboard'>Back</a>", status_code=404)
 
         engineer_name = "Engineer"
         for engineer in engineers:
@@ -3265,7 +3403,7 @@ def dashboard_force_end_day(token: str = "", telegram_id: str = ""):
         )
 
         return HTMLResponse(
-            f"Day force-ended for {html_safe(engineer_name)}. <a href='/dashboard?token={html_safe(token)}'>Back to dashboard</a>"
+            f"Day force-ended for {html_safe(engineer_name)}. <a href='/dashboard'>Back to dashboard</a>"
         )
 
     except Exception as e:
@@ -3310,7 +3448,7 @@ def live_engineer_dashboard(request: Request, token: str = "", view: str = "engi
                 <div class='since'>{html_safe(row['since'])}</div>
                 <div class='metrics'><div><span>Start</span><strong>{html_safe(row['start'])}</strong></div><div><span>Productive</span><strong>{html_safe(dashboard_number(row['productive'], 'h'))}</strong></div><div><span>Inactive</span><strong>{html_safe(dashboard_number(row['inactive'], 'h'))}</strong></div></div>
                 <div class='last'>Last: {html_safe(row['last'])}</div>
-                {f"<a class='force-end-btn' href='/dashboard/force-end-day?token={html_safe(token)}&telegram_id={html_safe(row.get('telegram_id',''))}' onclick=\"return confirm('Force end day for {html_safe(row['name'])}?');\">Force End Day</a>" if row.get('telegram_id') and row['css'] not in ['not-started', 'ended'] else ""}
+                {f"<a class='force-end-btn' href='/dashboard/force-end-day?telegram_id={html_safe(row.get('telegram_id',''))}' onclick=\"return confirm('Force end day for {html_safe(row['name'])}?');\">Force End Day</a>" if row.get('telegram_id') and row['css'] not in ['not-started', 'ended'] else ""}
             </div>
             """)
 
