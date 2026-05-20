@@ -10,7 +10,11 @@ from .statuses import (
     DAY_ACTIVE_STATUS,
     DAY_CLOSED_STATUS,
 )
-
+from .roles import (
+    user_can_use_helpdesk,
+    role_counts_for_utilisation,
+    is_vehicle_check_exempt_role,
+)
 __all__ = [
     "now_log_time",
     "graph_datetime_now",
@@ -24,4 +28,7 @@ __all__ = [
     "COMPLETED_STATUS",
     "DAY_ACTIVE_STATUS",
     "DAY_CLOSED_STATUS",
+    "user_can_use_helpdesk",
+    "role_counts_for_utilisation",
+    "is_vehicle_check_exempt_role",
 ]
