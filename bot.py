@@ -9194,7 +9194,13 @@ def task_is_active_or_future(fields):
 
 
 def task_assigned_names_from_fields(fields):
-    assigned = task_assigned_names_from_fields(fields)
+    """Return assigned names for a stored Task / Activity record.
+
+    The previous version accidentally called task_assigned_names_from_fields()
+    from inside itself, causing infinite recursion when the Cancel Task / Activity
+    button tried to display active tasks.
+    """
+    assigned = str(get_field_value(fields, "AssignedNames", "Assigned Names") or "").strip()
     if assigned:
         return assigned
 
