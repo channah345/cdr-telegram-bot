@@ -3992,10 +3992,13 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
+    if text == MENU_CANCEL_TASK_ACTIVITY:
+        return await start_cancel_task_activity(update, context)
+
     if text == MENU_ASK_CHATBOT:
         return await ask_chatbot_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_ASK_CHATBOT, MENU_ENGINEER_MENU]:
+    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_ASK_CHATBOT, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4079,6 +4082,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
+    if text == MENU_CANCEL_TASK_ACTIVITY:
+        return await start_cancel_task_activity(update, context)
+
     coming_next = {
         MENU_LOG_JOB: "Log Job",
         MENU_REASSIGN_JOB: "Reassign Job",
@@ -4089,6 +4095,7 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_DELETE_JOB: "Delete Job",
         MENU_ASK_CHATBOT: "Ask ChatGPT",
         MENU_QUOTE_REMINDER: "Task / Activity",
+        MENU_CANCEL_TASK_ACTIVITY: "Cancel Task / Activity",
         MENU_HELPDESK: "Helpdesk",
     }
 
@@ -9852,7 +9859,7 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not user_can_use_helpdesk(role):
         await update.message.reply_text(
-            "You do not have permission to create task / activitys.",
+            "You do not have permission to create tasks / activities.",
             reply_markup=get_main_menu(role),
         )
         return ConversationHandler.END
@@ -9869,7 +9876,7 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
         context.user_data["quote_reminder"] = {"role": role, "recipients": recipients}
         await update.message.reply_text(
-            "Quote reminder.\n\nWho should this be sent to? Reply with the number.\n\n" +
+            "Task / Activity.\n\nWho should this be sent to? Reply with the number.\n\n" +
             format_quote_recipient_list(recipients),
             reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=False),
         )
@@ -9977,7 +9984,7 @@ async def quote_reminder_scope(update: Update, context: ContextTypes.DEFAULT_TYP
     reminder = context.user_data.get("quote_reminder")
     value = update.message.text.strip()
     if is_blank_or_skip(value):
-        await update.message.reply_text("Please enter what needs to be scoped / quoted.")
+        await update.message.reply_text("Please enter the task / activity details.")
         return QUOTE_SCOPE
 
     reminder["scope"] = value
@@ -10005,7 +10012,7 @@ async def send_quote_reminder(bot, chat_id, reminder):
     await bot.send_message(
         chat_id=chat_id,
         text=(
-            "📌 Quote reminder\n\n"
+            "📌 Task / Activity\n\n"
             f"Client: {reminder.get('client', '')}\n"
             f"Address: {reminder.get('address', '')}\n"
             f"Time: {reminder.get('time', '')}\n"
@@ -10027,7 +10034,7 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
     if answer in ["no", "n", "cancel"]:
         context.user_data.pop("quote_reminder", None)
         await update.message.reply_text(
-            "Quote reminder cancelled.",
+            "Task / Activity cancelled.",
             reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
         )
         return ConversationHandler.END
@@ -10066,10 +10073,10 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
                 failed_names.append(f"{recipient.get('name', 'Unknown')}: {send_error}")
 
         if not sent_names:
-            raise Exception("No task / activitys were sent. " + "; ".join(failed_names))
+            raise Exception("No tasks / activities were sent. " + "; ".join(failed_names))
 
         context.user_data.pop("quote_reminder", None)
-        message = f"Quote reminder sent to {', '.join(sent_names)}."
+        message = f"Task / Activity sent to {', '.join(sent_names)}."
         if failed_names:
             message += f"\n\nFailed: {'; '.join(failed_names)}"
 
@@ -10095,7 +10102,7 @@ async def quote_reminder_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     role = await get_role_for_update(update)
     context.user_data.pop("quote_reminder", None)
     await update.message.reply_text(
-        "Quote reminder cancelled.",
+        "Task / Activity cancelled.",
         reply_markup=get_helpdesk_menu(include_engineer_menu=(role.lower() == "admin")),
     )
     return ConversationHandler.END
