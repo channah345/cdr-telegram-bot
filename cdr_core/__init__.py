@@ -15,6 +15,12 @@ from .roles import (
     role_counts_for_utilisation,
     is_vehicle_check_exempt_role,
 )
+from .job_logic import (
+    get_assigned_engineer_ids,
+    is_closed_job,
+    engineer_has_logged,
+    validate_job_action,
+)
 __all__ = [
     "now_log_time",
     "graph_datetime_now",
@@ -31,4 +37,8 @@ __all__ = [
     "user_can_use_helpdesk",
     "role_counts_for_utilisation",
     "is_vehicle_check_exempt_role",
+    "get_assigned_engineer_ids",
+    "is_closed_job",
+    "engineer_has_logged",
+    "validate_job_action",
 ]
