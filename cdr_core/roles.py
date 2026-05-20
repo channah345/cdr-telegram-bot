@@ -54,3 +54,14 @@ def validate_job_action(fields: dict, engineer_name: str, action: str):
     if action in ["No Access", "Revisit Required", "Completed"] and not has_on_site:
         return False, "You need to click On Site before selecting this option."
     return True, ""
+    
+def user_can_use_helpdesk(role: str) -> bool:
+    return str(role or "").strip().lower() in ["helpdesk", "admin"]
+
+
+def role_counts_for_utilisation(role: str) -> bool:
+    return str(role or "").strip().lower() == "engineer"
+
+
+def is_vehicle_check_exempt_role(role: str) -> bool:
+    return str(role or "").strip().lower() in ["admin", "apprentice", "helpdesk"]
