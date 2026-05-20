@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 
 from cdr_core import (
     now_log_time,
+    graph_datetime_now,
+    get_today_iso,
     AWAITING_DEPLOYMENT_STATUS,
     LEGACY_AWAITING_DEPLOYMENT_STATUS,
     ASSIGNED_STATUS,
@@ -30,14 +32,18 @@ from cdr_core import (
     user_can_use_helpdesk,
     role_counts_for_utilisation,
     is_vehicle_check_exempt_role,
+    get_assigned_engineer_ids as core_get_assigned_engineer_ids,
+    is_closed_job as core_is_closed_job,
+    engineer_has_logged as core_engineer_has_logged,
+    validate_job_action as core_validate_job_action,
 )
 print("✅ CDR Core loaded in bot:", now_log_time())
+print("✅ CDR job logic loaded in bot")
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, Form, Request, UploadFile, File
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto, ReplyKeyboardRemove
-
 try:
     from telegram.warnings import PTBUserWarning
 except Exception:
@@ -95,6 +101,7 @@ WORKSHEET_BASE_FOLDER = "18 - JOB WORKSHEETS"
 RECEIPT_BASE_FOLDER = "19 - RECEIPTS"
 
 
+
 MENU_START_DAY = "🟢 Start Day"
 MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
@@ -121,6 +128,7 @@ UK_TZ = ZoneInfo("Europe/London")
 
 VAN_CHECK_INTERVAL_DAYS = 14
 # Apprentice role supported. Apprentice users can be excluded from van/mileage prompts in the Start/End Day flow.
+
 WORK_COMPLETED = 0
 MATERIALS_USED = 1
 FOLLOW_ON_REQUIRED = 2
@@ -741,6 +749,7 @@ def get_bot_user_role(site_id, telegram_id):
 
     print(f"Telegram ID {telegram_id} not found in Engineers list; no access granted.")
     return "Inactive"
+
 
 
 
