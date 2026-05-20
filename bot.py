@@ -10132,7 +10132,8 @@ logjob_handler = ConversationHandler(
 
 cancel_task_activity_handler = ConversationHandler(
     entry_points=[
-        MessageHandler(filters.Regex(f"^{re.escape(MENU_CANCEL_TASK_ACTIVITY)}$"), start_cancel_task_activity),
+        CommandHandler("canceltask", start_cancel_task_activity),
+        MessageHandler(filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(MENU_CANCEL_TASK_ACTIVITY)}$"), start_cancel_task_activity),
     ],
     states={
         CANCEL_TASK_SELECT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, cancel_task_select)],
@@ -10213,6 +10214,7 @@ telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(CommandHandler("requestjob", request_job))
 telegram_app.add_handler(CommandHandler("helpdesk", helpdesk_start))
+telegram_app.add_handler(cancel_task_activity_handler)
 telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
@@ -10220,7 +10222,6 @@ telegram_app.add_handler(bugidea_handler)
 telegram_app.add_handler(receipt_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(message_engineer_handler)
-telegram_app.add_handler(cancel_task_activity_handler)
 telegram_app.add_handler(quote_reminder_handler)
 telegram_app.add_handler(ask_chatbot_handler)
 telegram_app.add_handler(reopenjob_handler)
