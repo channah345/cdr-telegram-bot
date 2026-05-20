@@ -27,6 +27,9 @@ from cdr_core import (
     COMPLETED_STATUS,
     DAY_ACTIVE_STATUS,
     DAY_CLOSED_STATUS,
+    user_can_use_helpdesk,
+    role_counts_for_utilisation,
+    is_vehicle_check_exempt_role,
 )
 print("✅ CDR Core loaded in bot:", now_log_time())
 
@@ -739,12 +742,6 @@ def get_bot_user_role(site_id, telegram_id):
     print(f"Telegram ID {telegram_id} not found in Engineers list; no access granted.")
     return "Inactive"
 
-
-def user_can_use_helpdesk(role):
-    return str(role or "").strip().lower() in ["helpdesk", "admin"]
-
-def role_counts_for_utilisation(role):
-    return str(role or "").strip().lower() == "engineer"
 
 
 
@@ -3353,10 +3350,6 @@ def create_start_day_log(start_day, van_check_completed=False):
 def is_apprentice_role(role):
     return str(role or "").strip().lower() == "apprentice"
 
-
-def is_vehicle_check_exempt_role(role):
-    """Roles that do not need van registration, start mileage, van checks/photos or end mileage."""
-    return str(role or "").strip().lower() in ["admin", "apprentice"]
 
 
 def create_vehicle_exempt_start_day_log(start_day):
