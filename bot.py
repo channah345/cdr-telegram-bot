@@ -17,8 +17,18 @@ import msal
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from cdr_core import ASSIGNED_STATUS, COMPLETED_STATUS
-print("✅ CDR statuses loaded:", ASSIGNED_STATUS, COMPLETED_STATUS)
+from cdr_core import (
+    now_log_time,
+    AWAITING_DEPLOYMENT_STATUS,
+    LEGACY_AWAITING_DEPLOYMENT_STATUS,
+    ASSIGNED_STATUS,
+    TRAVELLING_STATUS,
+    ON_SITE_STATUS,
+    COMPLETED_STATUS,
+    DAY_ACTIVE_STATUS,
+    DAY_CLOSED_STATUS,
+)
+print("✅ CDR Core loaded in bot:", now_log_time())
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form, Request, UploadFile, File
@@ -82,9 +92,6 @@ WORKSHEET_BASE_FOLDER = "18 - JOB WORKSHEETS"
 RECEIPT_BASE_FOLDER = "19 - RECEIPTS"
 
 
-DAY_ACTIVE_STATUS = "Active"
-DAY_CLOSED_STATUS = "Closed"
-
 MENU_START_DAY = "🟢 Start Day"
 MENU_MY_JOBS = "📋 My Jobs"
 MENU_END_DAY = "🏁 End Day"
@@ -111,13 +118,6 @@ UK_TZ = ZoneInfo("Europe/London")
 
 VAN_CHECK_INTERVAL_DAYS = 14
 # Apprentice role supported. Apprentice users can be excluded from van/mileage prompts in the Start/End Day flow.
-AWAITING_DEPLOYMENT_STATUS = "Awaiting Dispatch"
-LEGACY_AWAITING_DEPLOYMENT_STATUS = "Awaiting Deployment"
-ASSIGNED_STATUS = "Assigned"
-TRAVELLING_STATUS = "Travelling"
-ON_SITE_STATUS = "On Site"
-COMPLETED_STATUS = "Completed"
-
 WORK_COMPLETED = 0
 MATERIALS_USED = 1
 FOLLOW_ON_REQUIRED = 2
