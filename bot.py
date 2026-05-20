@@ -8447,7 +8447,7 @@ async def finalise_worksheet_direct(context, worksheet, fields, item_id, site_id
         get_job_reference(fields),
     )
 
-    if is_final_engineer and outcome in ["Completed", "No Access", "Revisit Required"]:
+    if outcome in ["Completed", "No Access", "Revisit Required"]:
         await notify_trade_group(context, worksheet, fields, updated_log, outcome)
 
     message = f"Worksheet submitted:\n\n{worksheet['cdr_number']} → {outcome}"
@@ -8525,7 +8525,7 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
         required_fields={"EngineerVisitLog", "WorksheetSubmitted"},
     )
 
-    if is_final_engineer and outcome in ["Completed", "No Access", "Revisit Required"]:
+    if outcome in ["Completed", "No Access", "Revisit Required"]:
         await notify_trade_group(context, worksheet, fields, updated_log, outcome)
 
     context.user_data.pop("worksheet", None)
