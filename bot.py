@@ -17,8 +17,8 @@ import msal
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from cdr_core import now_log_time
-print("✅ CDR Core loaded in bot:", now_log_time())
+from cdr_core import ASSIGNED_STATUS, COMPLETED_STATUS
+print("✅ CDR statuses loaded:", ASSIGNED_STATUS, COMPLETED_STATUS)
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form, Request, UploadFile, File
