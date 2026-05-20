@@ -17,6 +17,16 @@ import msal
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from cdr_core import now_log_time
+print("✅ CDR Core loaded in bot:", now_log_time())
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, Form, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto, ReplyKeyboardRemove
+try:
+    from telegram.warnings import PTBUserWarning
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
