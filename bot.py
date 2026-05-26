@@ -1108,6 +1108,7 @@ def build_reassign_review(data):
     assigning = ", ".join(e["name"] for e in data.get("assign_engineers", [])) or "None"
     final = ", ".join(e["name"] for e in data.get("final_engineers", [])) or "None"
     fields = data.get("job_fields", {})
+    date_text = data.get("new_date_display") or "Keep current date"
 
     return (
         "Please review this reassignment before I update SharePoint:\n\n"
@@ -1117,6 +1118,7 @@ def build_reassign_review(data):
         f"Remove: {removing}\n"
         f"Assign/send to: {assigning}\n"
         f"Final assigned engineer(s): {final}\n"
+        f"Attendance date: {date_text}\n"
         f"Reason: {data.get('reason', '') or 'N/A'}\n\n"
         "Reply YES to reassign and send, NO to cancel, or RESTART to start again."
     )
@@ -1552,22 +1554,36 @@ def get_job_reference(fields):
     return cdr_number or site_name or ""
 
 def get_open_jobs_for_engineer_today(jobs_data, engineer_lookup_id):
+    """Return only active jobs that should block an engineer ending today.
+
+    Returned jobs such as Revisit Required / No Access should not block End Day
+    once they are back with Helpdesk/Awaiting Deployment. If Helpdesk later
+    reassigns the job for a future date, it should also not block today's End Day.
+    """
     today = datetime.now(UK_TZ).date()
     open_jobs = []
+    active_statuses = {ASSIGNED_STATUS, TRAVELLING_STATUS, ON_SITE_STATUS}
 
     for job in jobs_data:
         fields = job.get("fields", {})
         job_date = sharepoint_date_to_uk_date(fields.get("Date", ""))
         assigned_ids = get_assigned_engineer_ids(fields)
 
-        if str(engineer_lookup_id) in assigned_ids and job_date == today:
-            status = str(fields.get("Status", ""))
-            outcome = str(fields.get("JobOutcome", ""))
+        if str(engineer_lookup_id) not in assigned_ids or job_date != today:
+            continue
 
-            # A previous No Access/Revisit outcome must not stop a re-dispatched job
-            # being treated as open once the office has assigned an engineer again.
-            if status != COMPLETED_STATUS and outcome != "Completed":
-                open_jobs.append(job)
+        status = str(fields.get("Status", "") or "").strip()
+        outcome = str(fields.get("JobOutcome", "") or "").strip()
+
+        # Completed is never an open day blocker.
+        if status == COMPLETED_STATUS or outcome == "Completed":
+            continue
+
+        # Only live/active engineer-owned statuses block End Day. Jobs returned
+        # to Helpdesk/Awaiting Deployment are office-owned, even if SharePoint
+        # still carries old same-day visit history.
+        if status in active_statuses:
+            open_jobs.append(job)
 
     return open_jobs
 
@@ -4859,8 +4875,11 @@ async def reassign_assign_engineers(update: Update, context: ContextTypes.DEFAUL
 
     data["final_engineers"] = final
 
-    await update.message.reply_text("Reason for reassignment?\n\nExample: Engineer delayed on another job / change of plan / emergency priority.")
-    return REASSIGN_REASON
+    await update.message.reply_text(
+        "What date should this reassignment be attended?\n\n"
+        "Reply Today, Tomorrow, DD/MM/YYYY, or KEEP to leave the current job date unchanged."
+    )
+    return REASSIGN_DATE
 
 
 
@@ -4942,6 +4961,11 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Assigned: {', '.join(e['name'] for e in new_engineers) or 'None'}; "
             f"Final: {', '.join(e['name'] for e in final_engineers) or 'None'}"
         )
+        if data.get("new_date"):
+            reassignment_note += f"; Attendance Date: {data.get('new_date_display') or data.get('new_date')}"
+        else:
+            reassignment_note += "; Attendance Date: Keep current date"
+
         if data.get("reason"):
             reassignment_note += f"; Reason: {data['reason']}"
 
