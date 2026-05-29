@@ -4080,7 +4080,9 @@ def asset_payload_from_context(context):
         "event_type": "Created",
     }
     if data.get("photo_file_id"):
-        payload["notes"] = (payload.get("notes", "") + f"\n\nTelegram asset photo file ID: {data.get('photo_file_id')}").strip()
+        payload["photo_file_id"] = data.get("photo_file_id")
+    if data.get("photo_data_uri"):
+        payload["photo_data_uri"] = data.get("photo_data_uri")
     return payload
 
 
@@ -4206,7 +4208,13 @@ async def asset_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.setdefault("asset_create", {})
     if update.message.photo:
         data["photo_file_id"] = update.message.photo[-1].file_id
-        await update.message.reply_text("Photo noted. Any extra notes for the asset?", reply_markup=asset_skip_keyboard())
+        try:
+            telegram_file = await context.bot.get_file(data["photo_file_id"])
+            photo_bytes = await telegram_file.download_as_bytearray()
+            data["photo_data_uri"] = "data:image/jpeg;base64," + base64.b64encode(bytes(photo_bytes)).decode("ascii")
+        except Exception as exc:
+            print(f"WARNING: Could not download asset photo bytes: {exc}")
+        await update.message.reply_text("Photo saved. Any extra notes for the asset?", reply_markup=asset_skip_keyboard())
         return ASSET_NOTES
     if update.message.text == "⏭️ Skip":
         await update.message.reply_text("Any extra notes for the asset?", reply_markup=asset_skip_keyboard())
