@@ -82,6 +82,8 @@ CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
+ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
 BUILD_VERSION = "phase1-recovery-v47-admin-openai-assistant"
 
@@ -120,6 +122,7 @@ MENU_FIND_JOB = "🔎 Find Job"
 MENU_CANCEL_JOB = "❌ Cancel Job"
 MENU_DELETE_JOB = "🗑 Delete Job"
 MENU_ASK_CHATBOT = "🤖 Ask ChatGPT"
+MENU_CREATE_ASSET = "🏷 Create Asset"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
 
 
@@ -201,6 +204,18 @@ REOPENJOB_ASSIGN_ENGINEERS = 81
 REOPENJOB_REASON = 82
 REOPENJOB_REVIEW = 83
 ASK_CHATBOT_QUESTION = 84
+ASSET_CUSTOMER = 85
+ASSET_SITE_NAME = 86
+ASSET_SITE_ADDRESS = 87
+ASSET_CATEGORY = 88
+ASSET_TYPE = 89
+ASSET_DESCRIPTION = 90
+ASSET_LOCATION = 91
+ASSET_MANUFACTURER = 92
+ASSET_MODEL = 93
+ASSET_SERIAL = 94
+ASSET_PHOTO = 95
+ASSET_NOTES = 96
 
 FINDJOB_SEARCH = 46
 FINDJOB_SELECT = 47
@@ -625,7 +640,7 @@ def get_engineer_menu(include_helpdesk_menu=False):
         [MENU_START_DAY, MENU_MY_JOBS],
         [MENU_END_DAY, MENU_BUG_IDEA],
         [MENU_UPLOAD_RECEIPTS],
-        [MENU_REQUEST_JOB],
+        [MENU_REQUEST_JOB, MENU_CREATE_ASSET],
     ]
 
     # Only Admin users should be able to switch from the Engineer menu
@@ -659,6 +674,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         MENU_MESSAGE_ENGINEER,
         MENU_CANCEL_TASK_ACTIVITY,
         MENU_UPLOAD_RECEIPTS,
+        MENU_CREATE_ASSET,
         MENU_BUG_IDEA,
     ])
 
@@ -1748,6 +1764,9 @@ def get_job_buttons(item_id, maps_query=None):
         ],
         [
             InlineKeyboardButton("⏹ Abort Attendance", callback_data=f"abort_job|{item_id}"),
+        ],
+        [
+            InlineKeyboardButton("🏷 Create Site Asset", callback_data=f"asset_create_job|{item_id}"),
         ],
     ]
 
@@ -3986,6 +4005,250 @@ async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+# =========================
+# Asset Register / Portal integration
+# =========================
+ASSET_CATEGORY_OPTIONS = ["Mechanical", "Electrical", "HVAC", "Fire & Security", "Plumbing", "Building Fabric", "Company Asset", "Other"]
+ASSET_TYPE_OPTIONS = ["Boiler", "DB Board", "AC Unit", "AHU", "Fan Coil", "Pump", "Fire Alarm Panel", "Emergency Lighting", "Water Heater", "Pressurisation Unit", "Extract Fan", "Company Asset", "Other"]
+
+
+def asset_skip_keyboard():
+    return ReplyKeyboardMarkup([["⏭️ Skip"], ["/cancel"]], resize_keyboard=True, one_time_keyboard=False)
+
+
+def asset_category_keyboard():
+    rows = [[x] for x in ASSET_CATEGORY_OPTIONS]
+    rows.append(["/cancel"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+
+def asset_type_keyboard():
+    rows = [ASSET_TYPE_OPTIONS[i:i + 2] for i in range(0, len(ASSET_TYPE_OPTIONS), 2)]
+    rows.append(["/cancel"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+
+def asset_clean_answer(text):
+    value = str(text or "").strip()
+    return "" if value == "⏭️ Skip" else value
+
+
+def portal_asset_headers():
+    headers = {"Content-Type": "application/json"}
+    if ASSET_API_KEY:
+        headers["x-api-key"] = ASSET_API_KEY
+    return headers
+
+
+def create_asset_in_portal(payload):
+    if not PORTAL_BASE_URL:
+        raise RuntimeError("PORTAL_BASE_URL is not set in Railway for the bot.")
+    response = requests.post(
+        f"{PORTAL_BASE_URL}/api/assets",
+        json=payload,
+        headers=portal_asset_headers(),
+        timeout=20,
+    )
+    try:
+        data = response.json()
+    except Exception:
+        data = {"ok": False, "error": response.text[:500]}
+    if not response.ok or not data.get("ok"):
+        raise RuntimeError(data.get("error") or f"Portal returned HTTP {response.status_code}")
+    return data
+
+
+def asset_payload_from_context(context):
+    data = context.user_data.get("asset_create", {}) or {}
+    payload = {
+        "created_by": data.get("created_by", "Telegram Bot"),
+        "engineer": data.get("engineer", ""),
+        "category": data.get("category", "Other"),
+        "asset_type": data.get("asset_type", "Other"),
+        "description": data.get("description", ""),
+        "customer": data.get("customer", ""),
+        "site_name": data.get("site_name", ""),
+        "site_address": data.get("site_address", ""),
+        "location": data.get("location", ""),
+        "manufacturer": data.get("manufacturer", ""),
+        "model": data.get("model", ""),
+        "serial_number": data.get("serial_number", ""),
+        "cdr_number": data.get("cdr_number", ""),
+        "notes": data.get("notes", ""),
+        "history_note": f"Asset created from Telegram bot" + (f" against {data.get('cdr_number')}" if data.get("cdr_number") else ""),
+        "event_type": "Created",
+    }
+    if data.get("photo_file_id"):
+        payload["notes"] = (payload.get("notes", "") + f"\n\nTelegram asset photo file ID: {data.get('photo_file_id')}").strip()
+    return payload
+
+
+async def asset_start_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return ConversationHandler.END
+    role = await get_role_for_update(update)
+    context.user_data["asset_create"] = {"source": "manual", "created_by": f"Telegram Bot - {role}"}
+    await update.message.reply_text(
+        "Create Asset started. This will create a QR-linked asset in the portal.\n\nCustomer name?",
+        reply_markup=asset_skip_keyboard(),
+    )
+    return ASSET_CUSTOMER
+
+
+async def asset_start_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        item_id = query.data.split("|")[1]
+        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        engineers_by_telegram, _ = build_engineer_maps(engineers)
+        user_id = str(query.from_user.id)
+        current_engineer = engineers_by_telegram.get(user_id)
+        if not current_engineer:
+            await query.message.reply_text("You are not set up as an engineer.")
+            return ConversationHandler.END
+        if not engineer_has_active_day(site_id, user_id):
+            await query.message.reply_text("Please start your day first using 🟢 Start Day before creating a site asset from a job.")
+            return ConversationHandler.END
+        job = find_job_by_item_id(jobs_data, item_id)
+        if not job:
+            await query.message.reply_text("Could not find this job. Tap 📋 My Jobs and try again.")
+            return ConversationHandler.END
+        fields = job["fields"]
+        assigned_ids = get_assigned_engineer_ids(fields)
+        if current_engineer["lookup_id"] not in assigned_ids:
+            await query.message.reply_text("You are not assigned to this job.")
+            return ConversationHandler.END
+        context.user_data["asset_create"] = {
+            "source": "job",
+            "job_item_id": item_id,
+            "created_by": "Telegram Bot",
+            "engineer": current_engineer.get("name", ""),
+            "cdr_number": fields.get("CDRNumber", ""),
+            "customer": fields.get("CustomerName", "") or fields.get("Customer", ""),
+            "site_name": fields.get("SiteName", ""),
+            "site_address": fields.get("Address", "") or fields.get("SiteAddress", ""),
+            "notes": f"Created from job {fields.get('CDRNumber','')}.",
+        }
+        await query.message.reply_text(
+            "Create Site Asset started. I have pulled the job/site details through.\n\nChoose the asset category:",
+            reply_markup=asset_category_keyboard(),
+        )
+        return ASSET_CATEGORY
+    except Exception as e:
+        print(f"ERROR starting asset from job: {e}")
+        await query.message.reply_text("Could not start asset creation. Please check Railway logs.")
+        return ConversationHandler.END
+
+
+async def asset_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["customer"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Site name?", reply_markup=asset_skip_keyboard())
+    return ASSET_SITE_NAME
+
+
+async def asset_site_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["site_name"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Site address?", reply_markup=asset_skip_keyboard())
+    return ASSET_SITE_ADDRESS
+
+
+async def asset_site_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["site_address"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Choose the asset category:", reply_markup=asset_category_keyboard())
+    return ASSET_CATEGORY
+
+
+async def asset_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["category"] = asset_clean_answer(update.message.text) or "Other"
+    await update.message.reply_text("Choose the asset type:", reply_markup=asset_type_keyboard())
+    return ASSET_TYPE
+
+
+async def asset_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["asset_type"] = asset_clean_answer(update.message.text) or "Other"
+    await update.message.reply_text("Asset description?\n\nExample: Main plant room boiler / Ground floor DB / Roof AC unit", reply_markup=asset_skip_keyboard())
+    return ASSET_DESCRIPTION
+
+
+async def asset_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["description"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Specific location?\n\nExample: Plant room, riser cupboard, roof, kitchen.", reply_markup=asset_skip_keyboard())
+    return ASSET_LOCATION
+
+
+async def asset_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["location"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Manufacturer?", reply_markup=asset_skip_keyboard())
+    return ASSET_MANUFACTURER
+
+
+async def asset_manufacturer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["manufacturer"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Model?", reply_markup=asset_skip_keyboard())
+    return ASSET_MODEL
+
+
+async def asset_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["model"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Serial number?", reply_markup=asset_skip_keyboard())
+    return ASSET_SERIAL
+
+
+async def asset_serial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault("asset_create", {})["serial_number"] = asset_clean_answer(update.message.text)
+    await update.message.reply_text("Send a photo of the asset, or tap Skip.", reply_markup=asset_skip_keyboard())
+    return ASSET_PHOTO
+
+
+async def asset_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.setdefault("asset_create", {})
+    if update.message.photo:
+        data["photo_file_id"] = update.message.photo[-1].file_id
+        await update.message.reply_text("Photo noted. Any extra notes for the asset?", reply_markup=asset_skip_keyboard())
+        return ASSET_NOTES
+    if update.message.text == "⏭️ Skip":
+        await update.message.reply_text("Any extra notes for the asset?", reply_markup=asset_skip_keyboard())
+        return ASSET_NOTES
+    await update.message.reply_text("Please send a photo, or tap Skip.", reply_markup=asset_skip_keyboard())
+    return ASSET_PHOTO
+
+
+async def asset_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.setdefault("asset_create", {})
+    extra_notes = asset_clean_answer(update.message.text)
+    if extra_notes:
+        data["notes"] = ((data.get("notes", "") + "\n" + extra_notes).strip())
+    try:
+        result = create_asset_in_portal(asset_payload_from_context(context))
+        asset = result.get("asset", {})
+        await update.message.reply_text(
+            "✅ Asset created in the portal.\n\n"
+            f"Asset ID: {asset.get('asset_id','')}\n"
+            f"Type: {asset.get('asset_type','')}\n"
+            f"Site: {asset.get('site_name','')}\n\n"
+            f"View Asset:\n{result.get('asset_url','')}\n\n"
+            f"QR Code:\n{result.get('qr_url','')}\n\n"
+            f"Print Label:\n{result.get('label_url','')}",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+    except Exception as e:
+        print(f"ERROR creating asset in portal: {e}")
+        await update.message.reply_text(
+            f"I could not create the asset in the portal.\n\nReason: {e}\n\nCheck PORTAL_BASE_URL and ASSET_API_KEY in Railway.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+    context.user_data.pop("asset_create", None)
+    return ConversationHandler.END
+
+
+async def asset_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("asset_create", None)
+    await update.message.reply_text("Asset creation cancelled.", reply_markup=get_main_menu(await get_role_for_update(update)))
+    return ConversationHandler.END
+
+
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -4008,8 +4271,14 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
 
+    if text == MENU_CREATE_ASSET:
+        return await asset_start_manual(update, context)
+
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
+
+    if text == MENU_CREATE_ASSET:
+        return await asset_start_manual(update, context)
 
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
@@ -4020,7 +4289,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_ASK_CHATBOT:
         return await ask_chatbot_start(update, context)
 
-    if text in [MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_ASK_CHATBOT, MENU_ENGINEER_MENU]:
+    if text in [MENU_CREATE_ASSET, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_ASK_CHATBOT, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4098,8 +4367,14 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
 
+    if text == MENU_CREATE_ASSET:
+        return await asset_start_manual(update, context)
+
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
+
+    if text == MENU_CREATE_ASSET:
+        return await asset_start_manual(update, context)
 
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
@@ -10213,6 +10488,31 @@ quote_reminder_handler = ConversationHandler(
 
 
 
+
+asset_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("createasset", asset_start_manual),
+        MessageHandler(filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(MENU_CREATE_ASSET)}$"), asset_start_manual),
+        CallbackQueryHandler(asset_start_from_job, pattern=r"^asset_create_job\|"),
+    ],
+    states={
+        ASSET_CUSTOMER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_customer)],
+        ASSET_SITE_NAME: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_site_name)],
+        ASSET_SITE_ADDRESS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_site_address)],
+        ASSET_CATEGORY: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_category)],
+        ASSET_TYPE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_type)],
+        ASSET_DESCRIPTION: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_description)],
+        ASSET_LOCATION: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_location)],
+        ASSET_MANUFACTURER: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_manufacturer)],
+        ASSET_MODEL: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_model)],
+        ASSET_SERIAL: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_serial)],
+        ASSET_PHOTO: [MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.TEXT) & ~filters.COMMAND, asset_photo)],
+        ASSET_NOTES: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, asset_notes)],
+    },
+    fallbacks=[CommandHandler("cancel", asset_cancel)],
+)
+
+
 ask_chatbot_handler = ConversationHandler(
     entry_points=[
         MessageHandler(filters.Regex(f"^{re.escape(MENU_ASK_CHATBOT)}$"), ask_chatbot_start),
@@ -10238,7 +10538,7 @@ abortjob_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|🤖 Ask ChatGPT|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|🤖 Ask ChatGPT|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -10259,6 +10559,7 @@ telegram_app.add_handler(receipt_handler)
 telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(message_engineer_handler)
 telegram_app.add_handler(quote_reminder_handler)
+telegram_app.add_handler(asset_handler)
 telegram_app.add_handler(ask_chatbot_handler)
 telegram_app.add_handler(reopenjob_handler)
 telegram_app.add_handler(reassign_handler)
@@ -10267,7 +10568,7 @@ telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ASK_CHATBOT}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ASK_CHATBOT}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
