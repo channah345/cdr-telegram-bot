@@ -1182,6 +1182,41 @@ def safe_folder_name(value):
     return cleaned or "UNKNOWN"
 
 
+def safe_sharepoint_folder_segment(value, fallback="UNKNOWN"):
+    """Return a SharePoint/Windows-safe folder segment while keeping readable names."""
+    text = str(value or "").strip()
+    text = re.sub(r'[\\/:*?"<>|#%{}~&]', "-", text)
+    text = re.sub(r"\s+", " ", text).strip(" .-")
+    return text[:80] or fallback
+
+
+def first_site_line(fields):
+    """Use the first line of the site name/address for the completed job folder."""
+    site_text = str(get_field_value(fields or {}, "SiteName", "Site Name", "CustomerName", "Customer Name", "Title") or "").strip()
+    first = re.split(r"[\r\n,]+", site_text, maxsplit=1)[0].strip()
+    return safe_sharepoint_folder_segment(first, "Unknown Site")
+
+
+def build_completed_job_pack_folder(worksheet_or_cdr, fields=None, subfolder=None):
+    """Build: 2026/07 - July/JOBNO - First Site Line[/subfolder]."""
+    now = datetime.now(UK_TZ)
+    if isinstance(worksheet_or_cdr, dict):
+        cdr_number = worksheet_or_cdr.get("cdr_number") or (fields or {}).get("CDRNumber", "")
+        fields = fields or worksheet_or_cdr.get("fields", {}) or {}
+    else:
+        cdr_number = worksheet_or_cdr or (fields or {}).get("CDRNumber", "")
+
+    job_number = safe_sharepoint_folder_segment(cdr_number, "UNKNOWN JOB")
+    site_line = first_site_line(fields or {})
+    year_folder = now.strftime("%Y")
+    month_folder = now.strftime("%m - %B")
+    job_folder = f"{job_number} - {site_line}"
+    parts = [year_folder, month_folder, job_folder]
+    if subfolder:
+        parts.append(safe_sharepoint_folder_segment(subfolder, "Files"))
+    return "/".join(parts)
+
+
 def upload_van_check_photo_to_sharepoint(site_id, work_date, van_reg, file_name, file_bytes):
     folder_name = f"{work_date}/{safe_folder_name(van_reg)}"
     return upload_file_to_sharepoint(
@@ -2054,17 +2089,18 @@ def upload_file_to_sharepoint(site_id, base_folder, cdr_number, file_name, file_
     return response.json().get("webUrl", "")
 
 
-def upload_photo_to_sharepoint(site_id, cdr_number, file_name, file_bytes):
+def upload_photo_to_sharepoint(site_id, worksheet, file_name, file_bytes):
+    folder_path = build_completed_job_pack_folder(worksheet, worksheet.get("fields", {}), "03 - Photos")
     return upload_file_to_sharepoint(
         site_id,
-        PHOTO_BASE_FOLDER,
-        cdr_number,
+        WORKSHEET_BASE_FOLDER,
+        folder_path,
         file_name,
         file_bytes,
     )
 
 
-def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url):
+def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url, fields=None):
     if "," not in signature_data_url:
         raise Exception("Invalid signature data")
 
@@ -2072,10 +2108,11 @@ def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url):
     image_bytes = base64.b64decode(image_base64)
     file_name = f"{cdr_number}_client_signature_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.png"
 
+    folder_path = build_completed_job_pack_folder(cdr_number, fields or {}, "02 - Client Signature")
     return upload_file_to_sharepoint(
         site_id,
-        SIGNATURE_BASE_FOLDER,
-        cdr_number,
+        WORKSHEET_BASE_FOLDER,
+        folder_path,
         file_name,
         image_bytes,
     )
@@ -2979,7 +3016,7 @@ def submit_signature(
     if bool_field(job["fields"].get("ClientSignatureReceived")):
         return HTMLResponse("This job has already been signed.", status_code=200)
 
-    signature_link = upload_signature_to_sharepoint(site_id, cdr_number, signature_data)
+    signature_link = upload_signature_to_sharepoint(site_id, cdr_number, signature_data, job.get("fields", {}))
 
     update_list_item_fields(
         site_id,
@@ -4758,10 +4795,9 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Make sure the CDR folder structure exists early, before engineers upload photos or signatures.
         try:
             drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
-            cdr_folder = safe_folder_name(job["cdr_number"])
-            ensure_folder(drive_id, f"{PHOTO_BASE_FOLDER}/{cdr_folder}")
-            ensure_folder(drive_id, f"{WORKSHEET_BASE_FOLDER}/{cdr_folder}")
-            ensure_folder(drive_id, f"{SIGNATURE_BASE_FOLDER}/{cdr_folder}")
+            # Completed evidence is now created only when the job is completed,
+            # under 18 - JOB WORKSHEETS / YYYY / MM - Month / Job Number - First Site Line.
+            ensure_folder(drive_id, WORKSHEET_BASE_FOLDER)
         except Exception as folder_error:
             print(f"WARNING: Could not pre-create job folders for {job['cdr_number']}: {folder_error}")
 
@@ -7476,7 +7512,7 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         photo_link = upload_photo_to_sharepoint(
             site_id,
-            cdr_number,
+            worksheet,
             file_name,
             bytes(file_bytes),
         )
@@ -8576,8 +8612,8 @@ def generate_and_upload_worksheet_pdf(site_id, jobs_list_id, item_id, worksheet,
     try:
         docx_bytes = build_worksheet_docx_bytes(worksheet, fields, updated_log, outcome, site_id)
         cdr_number = worksheet.get("cdr_number") or fields.get("CDRNumber", "JOB")
-        worksheet_folder_name = safe_folder_name(cdr_number)
-        file_name = f"{safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
+        worksheet_folder_name = build_completed_job_pack_folder(worksheet, fields)
+        file_name = f"01 - {safe_docx_filename(cdr_number)}_worksheet_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.docx"
 
         worksheet_link = upload_file_to_sharepoint(
             site_id,
