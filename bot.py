@@ -8,13 +8,13 @@ import time
 import threading
 import zipfile
 import asyncio
-from io import BytesIO
+from io import BytesIO, StringIO
 from urllib.parse import quote_plus, urlparse
 from xml.sax.saxutils import escape as xml_escape
 import warnings
 import requests
 import msal
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from cdr_core import (
@@ -86,7 +86,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
 ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-recovery-v49-reliability"
+BUILD_VERSION = "v51-timesheets-payroll"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -125,6 +125,7 @@ MENU_DELETE_JOB = "🗑 Delete Job"
 MENU_ASK_CHATBOT = "🤖 Ask ChatGPT"
 MENU_CREATE_ASSET = "🏷 Create Asset"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
+MENU_MONTHLY_OVERTIME = "📊 Monthly Overtime"
 
 
 UK_TZ = ZoneInfo("Europe/London")
@@ -149,6 +150,10 @@ START_DAY_VAN_CHECK = 22
 START_DAY_VAN_PHOTOS = 23
 END_DAY_CONFIRM = 24
 END_DAY_MILEAGE = 25
+END_DAY_TIME_REVIEW = 73
+END_DAY_EDIT_START = 74
+END_DAY_EDIT_END = 75
+OVERTIME_MONTH = 76
 BUG_IDEA_TEXT = 26
 
 LOGJOB_CDR_NUMBER = 27
@@ -416,13 +421,19 @@ def get_list_id(site_id, list_name):
 
 
 def get_list_items(site_id, list_id):
-    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?expand=fields"
-    response = HTTP_SESSION.get(url, headers=get_headers())
+    """Return every SharePoint list item, following Microsoft Graph pagination."""
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?$expand=fields&$top=999"
+    items = []
 
-    if response.status_code != 200:
-        raise Exception(f"Could not get items: {response.text}")
+    while url:
+        response = HTTP_SESSION.get(url, headers=get_headers())
+        if response.status_code != 200:
+            raise Exception(f"Could not get items: {response.text}")
+        payload = response.json()
+        items.extend(payload.get("value", []))
+        url = payload.get("@odata.nextLink")
 
-    return response.json()["value"]
+    return items
 
 
 def get_list_columns(site_id, list_id):
@@ -769,6 +780,7 @@ def get_helpdesk_menu(include_engineer_menu=False):
         MENU_QUOTE_REMINDER,
         MENU_MESSAGE_ENGINEER,
         MENU_CANCEL_TASK_ACTIVITY,
+        MENU_MONTHLY_OVERTIME,
         MENU_UPLOAD_RECEIPTS,
         MENU_CREATE_ASSET,
         MENU_BUG_IDEA,
@@ -1354,31 +1366,22 @@ def get_engineer_for_telegram_id(telegram_id):
 
 
 def find_active_day_log(day_logs, telegram_id, work_date=None):
-    work_date = work_date or get_today_iso()
-
+    """Find the engineer's latest active day, including an unclosed prior day."""
+    matches = []
     for log in day_logs:
         fields = log.get("fields", {})
-
-        raw_work_date = fields.get("WorkDate", "")
-        parsed_work_date = sharepoint_date_to_uk_date(raw_work_date)
-
-        if parsed_work_date:
-            log_date = parsed_work_date.isoformat()
-        else:
-            log_date = str(raw_work_date)[:10]
-
         status = str(fields.get("Status", ""))
         log_telegram_id = str(fields.get("EngineerTelegramID", ""))
-
-        if (
-            log_telegram_id == str(telegram_id)
-            and log_date == work_date
-            and status == DAY_ACTIVE_STATUS
-        ):
-            return log
-
-    return None
-
+        if log_telegram_id != str(telegram_id) or status != DAY_ACTIVE_STATUS:
+            continue
+        raw_work_date = fields.get("WorkDate", "")
+        parsed_work_date = sharepoint_date_to_uk_date(raw_work_date)
+        log_date = parsed_work_date.isoformat() if parsed_work_date else str(raw_work_date)[:10]
+        if work_date and log_date != work_date:
+            continue
+        start_dt = parse_sharepoint_datetime(get_field_value(fields, "StartTime", "Start Time"))
+        matches.append((start_dt or datetime.min.replace(tzinfo=UK_TZ), log))
+    return max(matches, key=lambda item: item[0])[1] if matches else None
 
 def get_active_day_for_engineer(site_id, telegram_id):
     day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
@@ -1616,40 +1619,48 @@ def calculate_commute_deductions(start_dt, end_dt, productive_intervals):
 
 
 def calculate_day_pay_hours(start_dt, end_dt, jobs_data=None, engineer_name=""):
-    if not start_dt or not end_dt:
+    """Calculate payable hours using 08:00-16:30 weekdays and full OOH weekends."""
+    if not start_dt or not end_dt or end_dt <= start_dt:
         return None
 
-    if end_dt < start_dt:
-        return None
-
-    normal_start = start_dt.replace(hour=8, minute=0, second=0, microsecond=0)
-    normal_end = start_dt.replace(hour=16, minute=30, second=0, microsecond=0)
-
-    # If the shift ends on a different date, calculate normal window for the start date only.
-    # This matches the CDR standard working day rule of 08:00-16:30.
-    overlap_start = max(start_dt, normal_start)
-    overlap_end = min(end_dt, normal_end)
-
+    gross_hours = hours_between(start_dt, end_dt)
     normal_gross = 0.0
-    if overlap_end > overlap_start:
-        normal_gross = (overlap_end - overlap_start).total_seconds() / 3600
+    cursor_date = start_dt.astimezone(UK_TZ).date()
+    final_date = end_dt.astimezone(UK_TZ).date()
 
-    total_hours = (end_dt - start_dt).total_seconds() / 3600
-    break_deducted = 0.5 if normal_gross >= 0.5 else normal_gross
-    normal_hours = max(0.0, normal_gross - break_deducted)
-    ooh_hours = max(0.0, total_hours - normal_gross)
+    while cursor_date <= final_date:
+        # Monday-Friday only. Saturday/Sunday are fully OOH.
+        if cursor_date.weekday() < 5:
+            normal_start = datetime.combine(cursor_date, datetime.min.time(), UK_TZ).replace(hour=8)
+            normal_end = datetime.combine(cursor_date, datetime.min.time(), UK_TZ).replace(hour=16, minute=30)
+            overlap_start = max(start_dt, normal_start)
+            overlap_end = min(end_dt, normal_end)
+            if overlap_end > overlap_start:
+                normal_gross += hours_between(overlap_start, overlap_end)
+        cursor_date += timedelta(days=1)
+
+    ooh_gross = max(0.0, gross_hours - normal_gross)
+    # Apply one unpaid 30-minute break to any shift of 6+ hours. Deduct it from
+    # normal hours first, otherwise from OOH (for weekend/fully OOH shifts).
+    break_deducted = 0.5 if gross_hours >= 6.0 else 0.0
+    normal_break = min(normal_gross, break_deducted)
+    ooh_break = max(0.0, break_deducted - normal_break)
+    normal_hours = max(0.0, normal_gross - normal_break)
+    ooh_hours = max(0.0, ooh_gross - ooh_break)
 
     activity = calculate_activity_hours(start_dt, end_dt, jobs_data, engineer_name)
-    commute = calculate_commute_deductions(
-        start_dt,
-        end_dt,
-        activity.get("productive_intervals", []),
-    )
-
+    commute = calculate_commute_deductions(start_dt, end_dt, activity.get("productive_intervals", []))
     payable_ooh_hours = max(0.0, ooh_hours - commute["commute_deduction_hours"])
+    total_payable_hours = normal_hours + payable_ooh_hours
+
+    available_work_hours = max(0.0, gross_hours - break_deducted)
+    productive_hours = min(activity["productive_hours"], available_work_hours)
+    inactive_hours = max(0.0, available_work_hours - productive_hours)
+    utilisation_percent = min(100.0, productive_hours / available_work_hours * 100) if available_work_hours else 0.0
 
     return {
-        "total_hours": round_hours(total_hours),
+        "gross_hours": round_hours(gross_hours),
+        "total_hours": round_hours(total_payable_hours),
         "normal_hours": round_hours(normal_hours),
         "ooh_hours": round_hours(ooh_hours),
         "break_deducted": round_hours(break_deducted),
@@ -1657,11 +1668,10 @@ def calculate_day_pay_hours(start_dt, end_dt, jobs_data=None, engineer_name=""):
         "evening_commute_deduction_hours": commute["evening_commute_deduction_hours"],
         "commute_deduction_hours": commute["commute_deduction_hours"],
         "payable_ooh_hours": round_hours(payable_ooh_hours),
-        "productive_hours": activity["productive_hours"],
-        "inactive_hours": activity["inactive_hours"],
-        "utilisation_percent": activity["utilisation_percent"],
+        "productive_hours": round_hours(productive_hours),
+        "inactive_hours": round_hours(inactive_hours),
+        "utilisation_percent": round_hours(utilisation_percent),
     }
-
 
 def build_pay_summary(start_dt, end_dt, hours):
     if not hours:
@@ -1670,8 +1680,9 @@ def build_pay_summary(start_dt, end_dt, hours):
     return (
         f"Start: {start_dt.strftime('%d/%m/%Y %H:%M')}\n"
         f"End: {end_dt.strftime('%d/%m/%Y %H:%M')}\n"
-        f"Total hours: {hours['total_hours']}\n"
-        f"Normal hours: {hours['normal_hours']}\n"
+        f"Gross clocked hours: {hours['gross_hours']}\n"
+        f"Total payable hours: {hours['total_hours']}\n"
+        f"Normal payable hours: {hours['normal_hours']}\n"
         f"OOH before commute deduction: {hours['ooh_hours']} at 1.5x\n"
         f"Morning commute deduction: {hours['morning_commute_deduction_hours']}\n"
         f"Evening commute deduction: {hours['evening_commute_deduction_hours']}\n"
@@ -3555,13 +3566,13 @@ async def close_end_day_record(context, end_day, mileage=None, include_mileage=T
             f"Open job(s):\n{format_open_jobs_for_end_day(open_jobs)}"
         ), None
 
-    end_time = datetime.now(UK_TZ)
+    end_time = end_day.get("corrected_end_time") or datetime.now(UK_TZ)
     start_time_value = get_field_value(
         end_day.get("day_log_fields", {}),
         "StartTime",
         "Start Time",
     )
-    start_time = parse_sharepoint_datetime(start_time_value)
+    start_time = end_day.get("corrected_start_time") or parse_sharepoint_datetime(start_time_value)
     hours = calculate_day_pay_hours(
         start_time,
         end_time,
@@ -3571,6 +3582,8 @@ async def close_end_day_record(context, end_day, mileage=None, include_mileage=T
     pay_summary = build_pay_summary(start_time, end_time, hours)
 
     update_payload = {
+        "Start Time": start_time.isoformat(),
+        "StartTime": start_time.isoformat(),
         "End Time": end_time.isoformat(),
         "EndTime": end_time.isoformat(),
         "Status": DAY_CLOSED_STATUS,
@@ -3599,6 +3612,8 @@ async def close_end_day_record(context, end_day, mileage=None, include_mileage=T
 
     if hours:
         update_payload.update({
+            "Gross Hours": hours["gross_hours"],
+            "GrossHours": hours["gross_hours"],
             "Total Hours": hours["total_hours"],
             "TotalHours": hours["total_hours"],
             "Normal Hours": hours["normal_hours"],
@@ -3893,20 +3908,7 @@ async def endday_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
-    end_day = context.user_data.get("end_day")
-    if end_day and is_vehicle_check_exempt_role(end_day.get("role")):
-        ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
-        await update.message.reply_text(
-            message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
-            reply_markup=get_main_menu(await get_role_for_update(update)),
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Please enter your end mileage as a number.\n\n"
-        "If you do not need to record mileage, type 0."
-    )
-    return END_DAY_MILEAGE
+    return await show_end_day_time_review(update.message, context)
 
 
 async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3923,18 +3925,95 @@ async def endday_confirm_button(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("End day cancelled. Your day is still active.", reply_markup=get_main_menu(await get_role_for_update(update)))
         return ConversationHandler.END
 
-    end_day = context.user_data.get("end_day")
-    if end_day and is_vehicle_check_exempt_role(end_day.get("role")):
-        ok, message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
-        await query.message.reply_text(
-            message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
+    return await show_end_day_time_review(query.message, context)
+
+
+async def show_end_day_time_review(message, context):
+    end_day = context.user_data.get("end_day") or {}
+    start_value = get_field_value(end_day.get("day_log_fields", {}), "StartTime", "Start Time")
+    start_dt = parse_sharepoint_datetime(start_value)
+    end_dt = datetime.now(UK_TZ)
+    end_day["corrected_start_time"] = start_dt
+    end_day["corrected_end_time"] = end_dt
+    context.user_data["end_day"] = end_day
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Use These Times", callback_data="endday_times|use")],
+        [InlineKeyboardButton("✏️ Edit Start / End Times", callback_data="endday_times|edit")],
+    ])
+    await message.reply_text(
+        "Please check your times before ending your day:\n\n"
+        f"Start: {start_dt.strftime('%d/%m/%Y %H:%M') if start_dt else 'Missing'}\n"
+        f"End: {end_dt.strftime('%d/%m/%Y %H:%M')}\n\n"
+        "Correct them now if you forgot to start or end at the right time.",
+        reply_markup=keyboard,
+    )
+    return END_DAY_TIME_REVIEW
+
+
+async def endday_time_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split("|", 1)[1]
+    if action == "edit":
+        await query.message.reply_text("Enter the correct start time as HH:MM, for example 08:00.")
+        return END_DAY_EDIT_START
+    return await continue_end_day_after_times(query.message, update, context)
+
+
+def parse_day_time(text, base_date):
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(text or ""))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return datetime.combine(base_date, datetime.min.time(), UK_TZ).replace(hour=hour, minute=minute)
+
+
+async def endday_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    end_day = context.user_data.get("end_day") or {}
+    existing = end_day.get("corrected_start_time") or datetime.now(UK_TZ)
+    corrected = parse_day_time(update.message.text, existing.date())
+    if not corrected:
+        await update.message.reply_text("Use HH:MM, for example 08:00.")
+        return END_DAY_EDIT_START
+    end_day["corrected_start_time"] = corrected
+    context.user_data["end_day"] = end_day
+    await update.message.reply_text("Enter the correct end time as HH:MM, for example 16:30.")
+    return END_DAY_EDIT_END
+
+
+async def endday_edit_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    end_day = context.user_data.get("end_day") or {}
+    start_dt = end_day.get("corrected_start_time")
+    corrected = parse_day_time(update.message.text, start_dt.date() if start_dt else datetime.now(UK_TZ).date())
+    if not corrected:
+        await update.message.reply_text("Use HH:MM, for example 16:30.")
+        return END_DAY_EDIT_END
+    if start_dt and corrected <= start_dt:
+        corrected += timedelta(days=1)
+    if start_dt and hours_between(start_dt, corrected) > 24:
+        await update.message.reply_text("That shift is over 24 hours. Please enter the end time again.")
+        return END_DAY_EDIT_END
+    end_day["corrected_end_time"] = corrected
+    context.user_data["end_day"] = end_day
+    await update.message.reply_text(
+        f"Updated times:\nStart: {start_dt.strftime('%d/%m/%Y %H:%M')}\nEnd: {corrected.strftime('%d/%m/%Y %H:%M')}"
+    )
+    return await continue_end_day_after_times(update.message, update, context)
+
+
+async def continue_end_day_after_times(message, update, context):
+    end_day = context.user_data.get("end_day") or {}
+    if is_vehicle_check_exempt_role(end_day.get("role")):
+        ok, result_message, pay_summary = await close_end_day_record(context, end_day, include_mileage=False)
+        await message.reply_text(
+            result_message + (f"\n\n{pay_summary}" if ok and pay_summary else ""),
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
         return ConversationHandler.END
-
-    await query.message.reply_text(
-        "Please enter your end mileage as a number.\n\n"
-        "If you do not need to record mileage, type 0."
+    await message.reply_text(
+        "Please enter your end mileage as a number.\n\nIf you do not need to record mileage, type 0."
     )
     return END_DAY_MILEAGE
 
@@ -4389,6 +4468,88 @@ async def asset_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def parse_payroll_month(value):
+    value = str(value or "").strip().lower()
+    now = datetime.now(UK_TZ)
+    if value in {"this month", "current", "now"}:
+        return now.year, now.month
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})", value)
+    if not match:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    return (year, month) if 1 <= month <= 12 else None
+
+
+async def monthly_overtime_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = await get_role_for_update(update)
+    if not user_can_use_helpdesk(role):
+        await update.message.reply_text("This report is only available to Helpdesk/Admin users.")
+        return ConversationHandler.END
+    args = getattr(context, "args", []) or []
+    if args:
+        parsed = parse_payroll_month(args[0])
+        if parsed:
+            return await send_monthly_overtime_report(update, context, *parsed)
+    await update.message.reply_text("Enter the payroll month as YYYY-MM, for example 2026-07, or type THIS MONTH.")
+    return OVERTIME_MONTH
+
+
+async def monthly_overtime_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = parse_payroll_month(update.message.text)
+    if not parsed:
+        await update.message.reply_text("Use YYYY-MM, for example 2026-07, or type THIS MONTH.")
+        return OVERTIME_MONTH
+    return await send_monthly_overtime_report(update, context, *parsed)
+
+
+async def send_monthly_overtime_report(update, context, year, month):
+    site_id = get_site_id()
+    list_id = get_list_id(site_id, DAY_LOGS_LIST)
+    logs = await asyncio.to_thread(get_list_items, site_id, list_id)
+    totals = {}
+    for item in logs:
+        fields = item.get("fields", {})
+        work_date = sharepoint_date_to_uk_date(get_field_value(fields, "WorkDate", "Work Date"))
+        if not work_date or work_date.year != year or work_date.month != month:
+            continue
+        name = str(get_field_value(fields, "EngineerName", "Engineer Name", "Title") or "Unknown Engineer").strip()
+        start_dt = parse_sharepoint_datetime(get_field_value(fields, "StartTime", "Start Time"))
+        end_dt = parse_sharepoint_datetime(get_field_value(fields, "EndTime", "End Time"))
+        hours = calculate_day_pay_hours(start_dt, end_dt, engineer_name=name) if start_dt and end_dt else None
+        if not hours:
+            continue
+        stored_commute = get_field_value(fields, "CommuteDeductionHours", "Commute Deduction Hours")
+        try:
+            stored_commute = max(0.0, float(stored_commute or 0))
+        except Exception:
+            stored_commute = 0.0
+        hours["commute_deduction_hours"] = round_hours(stored_commute)
+        hours["payable_ooh_hours"] = round_hours(max(0.0, hours["ooh_hours"] - stored_commute))
+        hours["total_hours"] = round_hours(hours["normal_hours"] + hours["payable_ooh_hours"])
+        row = totals.setdefault(name, {"days": 0, "gross": 0.0, "normal": 0.0, "ooh": 0.0, "payable_ooh": 0.0, "total": 0.0, "commute": 0.0})
+        row["days"] += 1
+        row["gross"] += hours["gross_hours"]
+        row["normal"] += hours["normal_hours"]
+        row["ooh"] += hours["ooh_hours"]
+        row["payable_ooh"] += hours["payable_ooh_hours"]
+        row["total"] += hours["total_hours"]
+        row["commute"] += hours["commute_deduction_hours"]
+
+    output = StringIO()
+    import csv
+    writer = csv.writer(output)
+    writer.writerow(["Engineer", "Days", "Gross Hours", "Normal Payable Hours", "OOH Before Commute", "Commute Deduction", "Payable OOH / Overtime", "Total Payable Hours"])
+    for name in sorted(totals):
+        r = totals[name]
+        writer.writerow([name, r["days"], round(r["gross"], 2), round(r["normal"], 2), round(r["ooh"], 2), round(r["commute"], 2), round(r["payable_ooh"], 2), round(r["total"], 2)])
+    data = output.getvalue().encode("utf-8-sig")
+    filename = f"CDR_Overtime_{year}-{month:02d}.csv"
+    summary = "\n".join(f"{name}: {round(values['payable_ooh'], 2)} OOH hours" for name, values in sorted(totals.items())) or "No completed day logs were found for this month."
+    await update.effective_message.reply_document(document=BytesIO(data), filename=filename, caption=f"Monthly overtime report for {month:02d}/{year}")
+    await update.effective_message.reply_text(summary, reply_markup=get_main_menu(await get_role_for_update(update)))
+    return ConversationHandler.END
+
+
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update):
         return ConversationHandler.END
@@ -4420,13 +4581,16 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_CREATE_ASSET:
         return await asset_start_manual(update, context)
 
+    if text == MENU_MONTHLY_OVERTIME:
+        return await monthly_overtime_start(update, context)
+
     if text == MENU_QUOTE_REMINDER:
         return await quote_reminder_start(update, context)
 
     if text == MENU_CANCEL_TASK_ACTIVITY:
         return await start_cancel_task_activity(update, context)
 
-    if text in [MENU_CREATE_ASSET, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_ENGINEER_MENU]:
+    if text in [MENU_CREATE_ASSET, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_MONTHLY_OVERTIME, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4512,6 +4676,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == MENU_CANCEL_TASK_ACTIVITY:
         return await start_cancel_task_activity(update, context)
+
+    if text == MENU_MONTHLY_OVERTIME:
+        return await monthly_overtime_start(update, context)
 
     coming_next = {
         MENU_LOG_JOB: "Log Job",
@@ -10047,7 +10214,7 @@ async def post_init(app):
 
 # Protect all inline actions from repeated taps while the first request is running.
 for _callback_name in (
-    "startday_confirm_button", "endday_confirm_button", "receipt_type_button",
+    "startday_confirm_button", "endday_confirm_button", "endday_time_review_button", "receipt_type_button",
     "complete_button_start", "worksheet_follow_on_required_button",
     "worksheet_photos_done_button", "worksheet_signature_required_button",
     "worksheet_signature_waiting_button", "worksheet_review_button",
@@ -10109,6 +10276,9 @@ endday_handler = ConversationHandler(
             CallbackQueryHandler(endday_confirm_button, pattern=r"^endday_confirm\|"),
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, endday_confirm),
         ],
+        END_DAY_TIME_REVIEW: [CallbackQueryHandler(endday_time_review_button, pattern=r"^endday_times\|")],
+        END_DAY_EDIT_START: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, endday_edit_start)],
+        END_DAY_EDIT_END: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, endday_edit_end)],
         END_DAY_MILEAGE: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, endday_mileage)],
     },
     fallbacks=[CommandHandler("cancel", endday_cancel)],
@@ -10731,9 +10901,21 @@ abortjob_handler = ConversationHandler(
 
 
 
+monthly_overtime_handler = ConversationHandler(
+    name="monthly_overtime_handler",
+    persistent=True,
+    entry_points=[
+        CommandHandler("overtime", monthly_overtime_start),
+        MessageHandler(filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(MENU_MONTHLY_OVERTIME)}$"), monthly_overtime_start),
+    ],
+    states={OVERTIME_MONTH: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, monthly_overtime_month)]},
+    fallbacks=[CommandHandler("cancel", endday_cancel)],
+)
+
+
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|📊 Monthly Overtime|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder|/overtime)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -10746,6 +10928,7 @@ telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(CommandHandler("requestjob", request_job))
 telegram_app.add_handler(CommandHandler("helpdesk", helpdesk_start))
 telegram_app.add_handler(cancel_task_activity_handler)
+telegram_app.add_handler(monthly_overtime_handler)
 telegram_app.add_handler(startday_handler)
 telegram_app.add_handler(endday_handler)
 telegram_app.add_handler(worksheet_handler)
@@ -10761,7 +10944,7 @@ telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_MONTHLY_OVERTIME}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
