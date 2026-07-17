@@ -89,7 +89,7 @@ EMPLOYEE_DOCUMENTS_BASE_FOLDER = os.getenv("EMPLOYEE_DOCUMENTS_BASE_FOLDER", "20
 PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
 ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "v53-engineer-documents"
+BUILD_VERSION = "v54-document-picker-policies"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -4608,6 +4608,7 @@ EMPLOYEE_DOCUMENT_CATEGORIES = {
     "contract": ("📘 Contract", "Contract", False),
     "handbook": ("📚 Company Handbook", "Shared/Handbook", True),
     "certificates": ("🎓 Certificates", "Certificates", False),
+    "policies": ("📑 Policies", "Shared/Policies", True),
 }
 
 
@@ -4615,7 +4616,7 @@ def _employee_document_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Payslips", callback_data="mydocs|payslips"), InlineKeyboardButton("📘 Contract", callback_data="mydocs|contract")],
         [InlineKeyboardButton("📚 Company Handbook", callback_data="mydocs|handbook")],
-        [InlineKeyboardButton("🎓 Certificates", callback_data="mydocs|certificates")],
+        [InlineKeyboardButton("🎓 Certificates", callback_data="mydocs|certificates"), InlineKeyboardButton("📑 Policies", callback_data="mydocs|policies")],
         [InlineKeyboardButton("🏖 Open TimeTastic", url=TIMETASTIC_URL)],
         [InlineKeyboardButton("✖ Close", callback_data="mydocs|close")],
     ])
@@ -4703,9 +4704,21 @@ async def my_documents_callback(update: Update, context: ContextTypes.DEFAULT_TY
         str(index): {"drive_id": drive_id, "item_id": item["id"], "name": item.get("name", "document"), "category": action}
         for index, item in enumerate(files[:25])
     }
-    rows = [[InlineKeyboardButton(item.get("name", "Document")[:55], callback_data=f"mydocfile|{index}")] for index, item in enumerate(files[:25])]
+    def friendly_document_name(filename):
+        name = (filename or "Document").strip()
+        display_name, _extension = os.path.splitext(name)
+        return (display_name or name)[:55]
+
+    rows = [
+        [InlineKeyboardButton(friendly_document_name(item.get("name", "Document")), callback_data=f"mydocfile|{index}")]
+        for index, item in enumerate(files[:25])
+    ]
     rows.append([InlineKeyboardButton("⬅ Back", callback_data="mydocs|menu")])
-    await query.edit_message_text(f"{label}\n\nChoose a file:", reply_markup=InlineKeyboardMarkup(rows))
+    section_name = label.split(" ", 1)[-1]
+    await query.edit_message_text(
+        f"{label}\n\nWhich {section_name.lower()} document would you like me to send?",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def my_document_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
