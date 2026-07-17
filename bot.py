@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import base64
 import secrets
@@ -86,7 +87,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
 ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "v51-timesheets-payroll"
+BUILD_VERSION = "v52-ai-worksheet-rewrite"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -142,6 +143,8 @@ PHOTOS = 5
 SIGNATURE_REQUIRED = 6
 SIGNATURE_WAITING = 7
 REVIEW = 8
+WORK_COMPLETED_AI_REVIEW = 9
+WORK_COMPLETED_AI_EDIT = 10
 
 START_DAY_CONFIRM = 19
 START_DAY_VAN_REG = 20
@@ -7615,9 +7618,22 @@ async def worksheet_work_completed(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("That is a menu button, so I have not added it to the worksheet. Please type the work completed, or type /cancel.")
         return WORK_COMPLETED
 
-    context.user_data["worksheet"]["WorkCompleted"] = update.message.text
-    await update.message.reply_text("What materials were used? Type None if none.")
-    return MATERIALS_USED
+    original = str(update.message.text or "").strip()
+    worksheet = context.user_data["worksheet"]
+    worksheet["OriginalWorkCompleted"] = original
+    await update.message.reply_text("Improving the wording for your worksheet…")
+    result = await asyncio.to_thread(rewrite_worksheet_description, original)
+    worksheet["AIWorkCompleted"] = result["rewritten"]
+    worksheet["AIWorkCompletedWarnings"] = result["warnings"]
+
+    warning_text = ""
+    if result["warnings"]:
+        warning_text = "\n\n⚠️ Check before approving:\n" + "\n".join(f"• {w}" for w in result["warnings"])
+    await update.message.reply_text(
+        "Proposed worksheet wording:\n\n" + result["rewritten"] + warning_text,
+        reply_markup=worksheet_ai_review_keyboard(),
+    )
+    return WORK_COMPLETED_AI_REVIEW
 
 
 async def worksheet_materials_used(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10011,6 +10027,99 @@ async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # -----------------------------
+# OpenAI worksheet writing assistant
+# -----------------------------
+def rewrite_worksheet_description(original_text):
+    """Rewrite engineer notes professionally without inventing technical facts."""
+    original_text = str(original_text or "").strip()
+    if not original_text:
+        return {"rewritten": "", "warnings": ["No work-completed notes were supplied."], "ok": False}
+    if not OPENAI_API_KEY:
+        return {"rewritten": original_text, "warnings": ["AI rewrite unavailable because OPENAI_API_KEY is not configured."], "ok": False}
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": (
+            "You rewrite UK mechanical, electrical, plumbing, HVAC and general maintenance engineer notes for a client job worksheet. "
+            "Preserve every supplied fact and technical term. Improve spelling, grammar, chronology and professional tone. "
+            "Never invent or assume diagnoses, work undertaken, parts, readings, test results, compliance statements, safety status, commissioning, isolation, or that equipment was left operational unless explicitly stated. "
+            "Do not exaggerate. Write one concise professional paragraph. "
+            "Return JSON only with keys rewritten and warnings. warnings must be an array of short missing-information cautions; use an empty array when none are needed."
+        ),
+        "input": original_text,
+        "max_output_tokens": 500,
+        "store": False,
+    }
+    try:
+        response = HTTP_SESSION.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=45,
+        )
+        if response.status_code >= 400:
+            return {"rewritten": original_text, "warnings": [f"AI rewrite unavailable ({response.status_code}). Original wording retained."], "ok": False}
+        raw = extract_openai_response_text(response.json()).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        data = json.loads(raw)
+        rewritten = str(data.get("rewritten") or "").strip()
+        warnings = data.get("warnings") or []
+        if not isinstance(warnings, list):
+            warnings = [str(warnings)]
+        warnings = [str(x).strip() for x in warnings if str(x).strip()]
+        if not rewritten:
+            raise ValueError("Empty rewritten text")
+        return {"rewritten": rewritten, "warnings": warnings, "ok": True}
+    except Exception as exc:
+        print(f"AI worksheet rewrite failed: {exc}")
+        return {"rewritten": original_text, "warnings": ["AI rewrite was unavailable. Original wording retained."], "ok": False}
+
+
+def worksheet_ai_review_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Use AI wording", callback_data="worksheet_ai|use")],
+        [InlineKeyboardButton("✏️ Edit wording", callback_data="worksheet_ai|edit")],
+        [InlineKeyboardButton("↩️ Use my original", callback_data="worksheet_ai|original")],
+    ])
+
+
+async def continue_after_work_completed(update, context):
+    target = update.callback_query.message if update.callback_query else update.message
+    await target.reply_text("What materials were used? Type None if none.")
+    return MATERIALS_USED
+
+
+async def worksheet_ai_review_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    worksheet = context.user_data.get("worksheet") or {}
+    action = query.data.split("|", 1)[1]
+    if action == "use":
+        worksheet["WorkCompleted"] = worksheet.get("AIWorkCompleted") or worksheet.get("OriginalWorkCompleted", "")
+        await query.edit_message_reply_markup(reply_markup=None)
+        return await continue_after_work_completed(update, context)
+    if action == "original":
+        worksheet["WorkCompleted"] = worksheet.get("OriginalWorkCompleted", "")
+        await query.edit_message_reply_markup(reply_markup=None)
+        return await continue_after_work_completed(update, context)
+    await query.message.reply_text("Type the final wording you want shown on the worksheet.")
+    return WORK_COMPLETED_AI_EDIT
+
+
+async def worksheet_ai_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = str(update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Please type the final work-completed wording.")
+        return WORK_COMPLETED_AI_EDIT
+    context.user_data["worksheet"]["WorkCompleted"] = text
+    context.user_data["worksheet"]["AIWorkCompletedEdited"] = True
+    return await continue_after_work_completed(update, context)
+
+
+# -----------------------------
 # Admin-only OpenAI assistant
 # -----------------------------
 def extract_openai_response_text(response_json):
@@ -10215,7 +10324,7 @@ async def post_init(app):
 # Protect all inline actions from repeated taps while the first request is running.
 for _callback_name in (
     "startday_confirm_button", "endday_confirm_button", "endday_time_review_button", "receipt_type_button",
-    "complete_button_start", "worksheet_follow_on_required_button",
+    "complete_button_start", "worksheet_ai_review_button", "worksheet_follow_on_required_button",
     "worksheet_photos_done_button", "worksheet_signature_required_button",
     "worksheet_signature_waiting_button", "worksheet_review_button",
     "worksheet_outcome_edit_button", "asset_start_from_job",
@@ -10295,6 +10404,8 @@ worksheet_handler = ConversationHandler(
     ],
     states={
         WORK_COMPLETED: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_work_completed)],
+        WORK_COMPLETED_AI_REVIEW: [CallbackQueryHandler(worksheet_ai_review_button, pattern=r"^worksheet_ai\|")],
+        WORK_COMPLETED_AI_EDIT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_ai_edit)],
         MATERIALS_USED: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, worksheet_materials_used)],
         FOLLOW_ON_REQUIRED: [
             CallbackQueryHandler(worksheet_follow_on_required_button, pattern=r"^follow_on_required\|"),
