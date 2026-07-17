@@ -56,6 +56,7 @@ warnings.filterwarnings(
 )
 from telegram.ext import (
     ApplicationBuilder,
+    PicklePersistence,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
@@ -85,7 +86,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
 ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "phase1-recovery-v47-admin-openai-assistant"
+BUILD_VERSION = "phase1-recovery-v49-reliability"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -241,6 +242,88 @@ msal_app = msal.ConfidentialClientApplication(
 web_app = FastAPI()
 
 
+class TimeoutSession(requests.Session):
+    """Shared HTTP session with retries, connection pooling and safe defaults."""
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", (10, 60))
+        return super().request(method, url, **kwargs)
+
+
+HTTP_SESSION = TimeoutSession()
+_retry = requests.adapters.Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=0.6,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset({"GET", "PUT", "DELETE", "HEAD", "OPTIONS"}),
+    respect_retry_after_header=True,
+)
+_adapter = requests.adapters.HTTPAdapter(max_retries=_retry, pool_connections=20, pool_maxsize=20)
+HTTP_SESSION.mount("https://", _adapter)
+HTTP_SESSION.mount("http://", _adapter)
+
+_CACHE_LOCK = threading.RLock()
+_TOKEN_CACHE = {"access_token": None, "expires_at": 0.0}
+_SITE_CACHE = {"value": None, "expires_at": 0.0}
+_LIST_ID_CACHE = {}
+_COLUMN_CACHE = {}
+_DRIVE_CACHE = {}
+CACHE_TTL_SECONDS = int(os.getenv("GRAPH_METADATA_CACHE_TTL", "3600"))
+SESSION_DATA_PATH = os.getenv("SESSION_DATA_PATH", "bot_sessions.pkl")
+_CALLBACK_IN_FLIGHT = {}
+_CALLBACK_LOCK = asyncio.Lock()
+
+
+def _cache_get(cache, key=None):
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        item = cache if key is None else cache.get(key)
+        if not item or item.get("expires_at", 0) <= now:
+            return None
+        return item.get("value")
+
+
+def _cache_set(cache, value, key=None, ttl=CACHE_TTL_SECONDS):
+    item = {"value": value, "expires_at": time.monotonic() + ttl}
+    with _CACHE_LOCK:
+        if key is None:
+            cache.update(item)
+        else:
+            cache[key] = item
+    return value
+
+
+def callback_spam_guard(handler):
+    """Ignore duplicate button presses while the original press is processing."""
+    async def wrapped(update, context):
+        query = update.callback_query
+        if not query:
+            return await handler(update, context)
+        key = (str(query.from_user.id), str(query.data or ""))
+        now = time.monotonic()
+        async with _CALLBACK_LOCK:
+            # Clear stale entries left by a cancelled task or process interruption.
+            stale = [k for k, started in _CALLBACK_IN_FLIGHT.items() if now - started > 180]
+            for stale_key in stale:
+                _CALLBACK_IN_FLIGHT.pop(stale_key, None)
+            if key in _CALLBACK_IN_FLIGHT:
+                try:
+                    await query.answer("Already processing — please wait.", show_alert=False)
+                except Exception:
+                    pass
+                return None
+            _CALLBACK_IN_FLIGHT[key] = now
+        try:
+            return await handler(update, context)
+        finally:
+            async with _CALLBACK_LOCK:
+                _CALLBACK_IN_FLIGHT.pop(key, None)
+    wrapped.__name__ = getattr(handler, "__name__", "guarded_callback")
+    return wrapped
+
+
 
 def is_group_chat(update):
     return update.effective_chat and update.effective_chat.type != "private"
@@ -297,35 +380,44 @@ def sharepoint_date_to_uk_date(value):
 
 
 def get_site_id():
+    cached = _cache_get(_SITE_CACHE)
+    if cached:
+        return cached
+
     site_hostname = SHAREPOINT_SITE.split("/")[2]
     site_path = "/" + "/".join(SHAREPOINT_SITE.split("/")[3:])
     site_url = f"https://graph.microsoft.com/v1.0/sites/{site_hostname}:{site_path}"
 
-    response = requests.get(site_url, headers=get_headers())
+    response = HTTP_SESSION.get(site_url, headers=get_headers())
 
     if response.status_code != 200:
         raise Exception(f"Could not get SharePoint site: {response.text}")
 
-    return response.json()["id"]
+    return _cache_set(_SITE_CACHE, response.json()["id"])
 
 
 def get_list_id(site_id, list_name):
+    cache_key = (str(site_id), str(list_name))
+    cached = _cache_get(_LIST_ID_CACHE, cache_key)
+    if cached:
+        return cached
+
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists"
-    response = requests.get(url, headers=get_headers())
+    response = HTTP_SESSION.get(url, headers=get_headers())
 
     if response.status_code != 200:
         raise Exception(f"Could not get lists: {response.text}")
 
     for lst in response.json()["value"]:
         if lst["name"] == list_name:
-            return lst["id"]
+            return _cache_set(_LIST_ID_CACHE, lst["id"], cache_key)
 
     raise Exception(f"List not found: {list_name}")
 
 
 def get_list_items(site_id, list_id):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?expand=fields"
-    response = requests.get(url, headers=get_headers())
+    response = HTTP_SESSION.get(url, headers=get_headers())
 
     if response.status_code != 200:
         raise Exception(f"Could not get items: {response.text}")
@@ -334,13 +426,18 @@ def get_list_items(site_id, list_id):
 
 
 def get_list_columns(site_id, list_id):
+    cache_key = (str(site_id), str(list_id))
+    cached = _cache_get(_COLUMN_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns"
-    response = requests.get(url, headers=get_headers())
+    response = HTTP_SESSION.get(url, headers=get_headers())
 
     if response.status_code != 200:
         raise Exception(f"Could not get list columns: {response.text}")
 
-    return response.json().get("value", [])
+    return _cache_set(_COLUMN_CACHE, response.json().get("value", []), cache_key)
 
 
 def normalise_field_name(value):
@@ -406,7 +503,7 @@ def update_list_item_fields(site_id, list_id, item_id, fields_to_update):
     ignored_fields = []
 
     while True:
-        response = requests.patch(
+        response = HTTP_SESSION.patch(
             url,
             headers=get_headers(),
             json=payload,
@@ -486,7 +583,7 @@ def update_list_item_fields_in_safe_chunks(site_id, list_id, item_id, fields_to_
 def create_list_item_fields(site_id, list_id, fields_to_create):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
 
-    response = requests.post(
+    response = HTTP_SESSION.post(
         url,
         headers=get_headers(),
         json={"fields": fields_to_create},
@@ -501,7 +598,7 @@ def create_list_item_fields(site_id, list_id, fields_to_create):
 def delete_list_item(site_id, list_id, item_id):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}"
 
-    response = requests.delete(url, headers=get_headers())
+    response = HTTP_SESSION.delete(url, headers=get_headers())
 
     if response.status_code not in [200, 202, 204]:
         raise Exception(f"Could not delete list item {item_id}: {response.text}")
@@ -647,7 +744,7 @@ def get_engineer_menu(include_helpdesk_menu=False):
     # into the Helpdesk menu. Helpdesk users stay in the Helpdesk menu,
     # and Engineer users stay in the Engineer menu.
     if include_helpdesk_menu:
-        rows.append([MENU_HELPDESK, MENU_ASK_CHATBOT])
+        rows.append([MENU_HELPDESK])
 
     return ReplyKeyboardMarkup(
         rows,
@@ -662,7 +759,6 @@ def get_helpdesk_menu(include_engineer_menu=False):
         MENU_REASSIGN_JOB,
         MENU_REOPEN_JOB,
         MENU_OPEN_JOBS,
-        MENU_FIND_JOB,
         MENU_CANCEL_JOB,
     ]
 
@@ -679,7 +775,6 @@ def get_helpdesk_menu(include_engineer_menu=False):
     ])
 
     if include_engineer_menu:
-        buttons.append(MENU_ASK_CHATBOT)
         buttons.append(MENU_ENGINEER_MENU)
 
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
@@ -1982,7 +2077,7 @@ def find_job_by_item_id(jobs_data, item_id):
 
 def get_drive_id(site_id, drive_name):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
-    response = requests.get(url, headers=get_headers())
+    response = HTTP_SESSION.get(url, headers=get_headers())
 
     if response.status_code != 200:
         raise Exception(f"Could not get SharePoint drives: {response.text}")
@@ -2002,7 +2097,7 @@ def ensure_folder(drive_id, folder_path):
         current_path = f"{current_path}/{part}" if current_path else part
 
         check_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{current_path}"
-        check_response = requests.get(check_url, headers=get_headers())
+        check_response = HTTP_SESSION.get(check_url, headers=get_headers())
 
         if check_response.status_code == 200:
             continue
@@ -2023,7 +2118,7 @@ def ensure_folder(drive_id, folder_path):
             "@microsoft.graph.conflictBehavior": "replace",
         }
 
-        create_response = requests.post(create_url, headers=get_headers(), json=body)
+        create_response = HTTP_SESSION.post(create_url, headers=get_headers(), json=body)
 
         if create_response.status_code not in [200, 201]:
             raise Exception(f"Could not create folder {current_path}: {create_response.text}")
@@ -2053,7 +2148,7 @@ def get_sharepoint_rest_headers():
 
 def get_drive_web_url(site_id, drive_name):
     url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
-    response = requests.get(url, headers=get_headers())
+    response = HTTP_SESSION.get(url, headers=get_headers())
 
     if response.status_code != 200:
         raise Exception(f"Could not get SharePoint drives: {response.text}")
@@ -2077,7 +2172,7 @@ def upload_file_to_sharepoint(site_id, base_folder, cdr_number, file_name, file_
         f"/{folder_path}/{file_name}:/content"
     )
 
-    response = requests.put(
+    response = HTTP_SESSION.put(
         url,
         headers=get_headers(content_type=False),
         data=file_bytes,
@@ -3213,7 +3308,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         await update.message.reply_text(
-            "Are you sure you want to start your day?",
+            f"Hi {current_engineer['name']}, are you sure you want to start your day?",
             reply_markup=get_yes_no_keyboard("startday_confirm"),
         )
         return START_DAY_CONFIRM
@@ -3765,7 +3860,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         await update.message.reply_text(
-            "Are you sure you want to end your day?",
+            f"Hi {current_engineer['name']}, are you sure you want to end your day?",
             reply_markup=get_yes_no_keyboard("endday_confirm"),
         )
         return END_DAY_CONFIRM
@@ -4081,7 +4176,7 @@ def portal_asset_headers():
 def create_asset_in_portal(payload):
     if not PORTAL_BASE_URL:
         raise RuntimeError("PORTAL_BASE_URL is not set in Railway for the bot.")
-    response = requests.post(
+    response = HTTP_SESSION.post(
         f"{PORTAL_BASE_URL}/api/assets",
         json=payload,
         headers=portal_asset_headers(),
@@ -4140,7 +4235,7 @@ async def asset_start_from_job(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     try:
         item_id = query.data.split("|")[1]
-        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        site_id, _, jobs_list_id, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
         engineers_by_telegram, _ = build_engineer_maps(engineers)
         user_id = str(query.from_user.id)
         current_engineer = engineers_by_telegram.get(user_id)
@@ -4331,10 +4426,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_CANCEL_TASK_ACTIVITY:
         return await start_cancel_task_activity(update, context)
 
-    if text == MENU_ASK_CHATBOT:
-        return await ask_chatbot_start(update, context)
-
-    if text in [MENU_CREATE_ASSET, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_FIND_JOB, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_ASK_CHATBOT, MENU_ENGINEER_MENU]:
+    if text in [MENU_CREATE_ASSET, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
 
 
@@ -4385,9 +4477,6 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if text == MENU_ASK_CHATBOT:
-        return await ask_chatbot_start(update, context)
-
     if text == MENU_LOG_JOB:
         return await logjob_start(update, context)
 
@@ -4396,9 +4485,6 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == MENU_REOPEN_JOB:
         return await reopenjob_start(update, context)
-
-    if text == MENU_FIND_JOB:
-        return await findjob_start(update, context)
 
     if text == MENU_OPEN_JOBS:
         return await openjobs_start(update, context)
@@ -4432,10 +4518,8 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
         MENU_REASSIGN_JOB: "Reassign Job",
         MENU_REOPEN_JOB: "Reopen Job",
         MENU_OPEN_JOBS: "Open Jobs",
-        MENU_FIND_JOB: "Find Job",
         MENU_CANCEL_JOB: "Cancel Job",
         MENU_DELETE_JOB: "Delete Job",
-        MENU_ASK_CHATBOT: "Ask ChatGPT",
         MENU_QUOTE_REMINDER: "Task / Activity",
         MENU_CANCEL_TASK_ACTIVITY: "Cancel Task / Activity",
         MENU_HELPDESK: "Helpdesk",
@@ -6167,14 +6251,12 @@ HELPDESK_MENU_TEXTS = {
     MENU_REASSIGN_JOB,
     MENU_REOPEN_JOB,
     MENU_OPEN_JOBS,
-    MENU_FIND_JOB,
     MENU_UPLOAD_RECEIPTS,
     MENU_CANCEL_JOB,
     MENU_DELETE_JOB,
     MENU_QUOTE_REMINDER,
     MENU_MESSAGE_ENGINEER,
     MENU_CANCEL_TASK_ACTIVITY,
-    MENU_ASK_CHATBOT,
     MENU_ENGINEER_MENU,
 }
 
@@ -7993,7 +8075,7 @@ def get_signature_image_bytes(site_id, cdr_number):
         drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
         folder_path = f"{SIGNATURE_BASE_FOLDER}/{cdr_number}"
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{folder_path}:/children"
-        response = requests.get(url, headers=get_headers())
+        response = HTTP_SESSION.get(url, headers=get_headers())
 
         if response.status_code != 200:
             print(f"Could not list signature folder for {cdr_number}: {response.text}")
@@ -8006,7 +8088,7 @@ def get_signature_image_bytes(site_id, cdr_number):
         files.sort(key=lambda item: item.get("lastModifiedDateTime", ""), reverse=True)
         item_id = files[0]["id"]
         content_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
-        content_response = requests.get(content_url, headers=get_headers(content_type=False))
+        content_response = HTTP_SESSION.get(content_url, headers=get_headers(content_type=False))
 
         if content_response.status_code != 200:
             print(f"Could not download signature image for {cdr_number}: {content_response.text}")
@@ -9139,7 +9221,8 @@ async def send_new_jobs(app):
 
         for item_id in sent_job_ids:
             try:
-                update_list_item_fields(
+                await asyncio.to_thread(
+                    update_list_item_fields,
                     site_id,
                     jobs_list_id,
                     item_id,
@@ -9162,9 +9245,9 @@ async def remind_engineers_to_start_day(app):
         return
 
     try:
-        site_id = get_site_id()
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
+        site_id = await asyncio.to_thread(get_site_id)
+        engineers_list_id = await asyncio.to_thread(get_list_id, site_id, ENGINEERS_LIST)
+        engineers = await asyncio.to_thread(get_list_items, site_id, engineers_list_id)
 
         for engineer in engineers:
             fields = engineer.get("fields", {})
@@ -9204,9 +9287,9 @@ async def remind_active_engineers_to_end_day(app):
         return
 
     try:
-        site_id = get_site_id()
-        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
-        day_logs = get_list_items(site_id, day_logs_list_id)
+        site_id = await asyncio.to_thread(get_site_id)
+        day_logs_list_id = await asyncio.to_thread(get_list_id, site_id, DAY_LOGS_LIST)
+        day_logs = await asyncio.to_thread(get_list_items, site_id, day_logs_list_id)
         today = get_today_iso()
 
         for log in day_logs:
@@ -9804,7 +9887,7 @@ def call_openai_assistant(question):
     }
 
     try:
-        response = requests.post(
+        response = HTTP_SESSION.post(
             "https://api.openai.com/v1/responses",
             headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -9899,6 +9982,20 @@ async def ask_chatbot_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 GLOBAL_SCHEDULER = None
 
 
+async def global_error_handler(update, context):
+    error = context.error
+    update_id = getattr(update, "update_id", "unknown") if update else "unknown"
+    print(f"UNHANDLED BOT ERROR | update={update_id} | {type(error).__name__}: {error}")
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "Something went wrong while processing that request. Nothing has been submitted twice. "
+                "Please try again shortly or contact Helpdesk if it continues."
+            )
+    except Exception as reply_error:
+        print(f"Could not send friendly error message: {reply_error}")
+
+
 async def post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -9948,9 +10045,26 @@ async def post_init(app):
     print("Scheduler started.")
 
 
+# Protect all inline actions from repeated taps while the first request is running.
+for _callback_name in (
+    "startday_confirm_button", "endday_confirm_button", "receipt_type_button",
+    "complete_button_start", "worksheet_follow_on_required_button",
+    "worksheet_photos_done_button", "worksheet_signature_required_button",
+    "worksheet_signature_waiting_button", "worksheet_review_button",
+    "worksheet_outcome_edit_button", "asset_start_from_job",
+    "abort_job_start", "abort_job_reason", "status_button",
+):
+    if _callback_name in globals():
+        globals()[_callback_name] = callback_spam_guard(globals()[_callback_name])
+
+_persistence_dir = os.path.dirname(os.path.abspath(SESSION_DATA_PATH))
+os.makedirs(_persistence_dir, exist_ok=True)
+SESSION_PERSISTENCE = PicklePersistence(filepath=SESSION_DATA_PATH)
+
 telegram_app = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
+    .persistence(SESSION_PERSISTENCE)
     .connect_timeout(30)
     .read_timeout(60)
     .write_timeout(120)
@@ -9958,8 +10072,11 @@ telegram_app = (
     .post_init(post_init)
     .build()
 )
+telegram_app.add_error_handler(global_error_handler)
 
 startday_handler = ConversationHandler(
+    name="startday_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("startday", startday_start),
         MessageHandler(filters.Regex(f"^{MENU_START_DAY}$"), startday_start),
@@ -9981,6 +10098,8 @@ startday_handler = ConversationHandler(
 )
 
 endday_handler = ConversationHandler(
+    name="endday_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("endday", endday_start),
         MessageHandler(filters.Regex(f"^{MENU_END_DAY}$"), endday_start),
@@ -9997,6 +10116,8 @@ endday_handler = ConversationHandler(
 
 
 worksheet_handler = ConversationHandler(
+    name="worksheet_handler",
+    persistent=True,
     entry_points=[
         CallbackQueryHandler(complete_button_start, pattern="^start_worksheet\\|"),
         CallbackQueryHandler(noaccess_reason_start, pattern="^noaccess_reason\\|"),
@@ -10034,6 +10155,8 @@ worksheet_handler = ConversationHandler(
 
 
 bugidea_handler = ConversationHandler(
+    name="bugidea_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("bugidea", bugidea_start),
         MessageHandler(filters.Regex(f"^{MENU_BUG_IDEA}$"), bugidea_start),
@@ -10047,6 +10170,8 @@ bugidea_handler = ConversationHandler(
 
 
 reopenjob_handler = ConversationHandler(
+    name="reopenjob_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("reopenjob", reopenjob_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_REOPEN_JOB)}$"), reopenjob_start),
@@ -10063,6 +10188,8 @@ reopenjob_handler = ConversationHandler(
 
 
 reassign_handler = ConversationHandler(
+    name="reassign_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("reassign", reassign_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_REASSIGN_JOB)}$"), reassign_start),
@@ -10080,6 +10207,8 @@ reassign_handler = ConversationHandler(
 
 
 openjobs_handler = ConversationHandler(
+    name="openjobs_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("openjobs", openjobs_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_OPEN_JOBS)}$"), openjobs_start),
@@ -10094,6 +10223,8 @@ openjobs_handler = ConversationHandler(
 
 
 canceljob_handler = ConversationHandler(
+    name="canceljob_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("canceljob", canceljob_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_CANCEL_JOB)}$"), canceljob_start),
@@ -10107,6 +10238,8 @@ canceljob_handler = ConversationHandler(
 
 
 deletejob_handler = ConversationHandler(
+    name="deletejob_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("deletejob", deletejob_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_DELETE_JOB)}$"), deletejob_start),
@@ -10120,6 +10253,8 @@ deletejob_handler = ConversationHandler(
 
 
 receipt_handler = ConversationHandler(
+    name="receipt_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("receipts", receipt_start),
         CommandHandler("uploadreceipts", receipt_start),
@@ -10136,6 +10271,8 @@ receipt_handler = ConversationHandler(
 
 
 findjob_handler = ConversationHandler(
+    name="findjob_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("findjob", findjob_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_FIND_JOB)}$"), findjob_start),
@@ -10464,6 +10601,8 @@ async def quote_reminder_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 logjob_handler = ConversationHandler(
+    name="logjob_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("logjob", logjob_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_LOG_JOB)}$"), logjob_start),
@@ -10486,6 +10625,8 @@ logjob_handler = ConversationHandler(
 )
 
 cancel_task_activity_handler = ConversationHandler(
+    name="cancel_task_activity_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("canceltask", start_cancel_task_activity),
         MessageHandler(filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(MENU_CANCEL_TASK_ACTIVITY)}$"), start_cancel_task_activity),
@@ -10500,6 +10641,8 @@ cancel_task_activity_handler = ConversationHandler(
 
 
 message_engineer_handler = ConversationHandler(
+    name="message_engineer_handler",
+    persistent=True,
     entry_points=[
         MessageHandler(filters.Regex(f"^{re.escape(MENU_MESSAGE_ENGINEER)}$"), start_message_engineer),
     ],
@@ -10514,6 +10657,8 @@ message_engineer_handler = ConversationHandler(
 
 
 quote_reminder_handler = ConversationHandler(
+    name="quote_reminder_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("quotereminder", quote_reminder_start),
         MessageHandler(filters.Regex(f"^{re.escape(MENU_QUOTE_REMINDER)}$"), quote_reminder_start),
@@ -10534,6 +10679,8 @@ quote_reminder_handler = ConversationHandler(
 
 
 asset_handler = ConversationHandler(
+    name="asset_handler",
+    persistent=True,
     entry_points=[
         CommandHandler("createasset", asset_start_manual),
         MessageHandler(filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(MENU_CREATE_ASSET)}$"), asset_start_manual),
@@ -10558,6 +10705,8 @@ asset_handler = ConversationHandler(
 
 
 ask_chatbot_handler = ConversationHandler(
+    name="ask_chatbot_handler",
+    persistent=True,
     entry_points=[
         MessageHandler(filters.Regex(f"^{re.escape(MENU_ASK_CHATBOT)}$"), ask_chatbot_start),
     ],
@@ -10568,6 +10717,8 @@ ask_chatbot_handler = ConversationHandler(
 )
 
 abortjob_handler = ConversationHandler(
+    name="abortjob_handler",
+    persistent=True,
     entry_points=[
         CallbackQueryHandler(abort_job_start, pattern="^abort_job\\|"),
     ],
@@ -10582,7 +10733,7 @@ abortjob_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|🔎 Find Job|❌ Cancel Job|🗑 Delete Job|🤖 Ask ChatGPT|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/findjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -10604,15 +10755,13 @@ telegram_app.add_handler(logjob_handler)
 telegram_app.add_handler(message_engineer_handler)
 telegram_app.add_handler(quote_reminder_handler)
 telegram_app.add_handler(asset_handler)
-telegram_app.add_handler(ask_chatbot_handler)
 telegram_app.add_handler(reopenjob_handler)
 telegram_app.add_handler(reassign_handler)
 telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
-telegram_app.add_handler(findjob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_FIND_JOB}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ASK_CHATBOT}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
