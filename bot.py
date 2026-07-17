@@ -10,7 +10,7 @@ import threading
 import zipfile
 import asyncio
 from io import BytesIO, StringIO
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 from xml.sax.saxutils import escape as xml_escape
 import warnings
 import requests
@@ -84,10 +84,12 @@ CDR_MECHANICAL_CHAT_ID = os.getenv("CDR_MECHANICAL_CHAT_ID")
 SIGNATURE_BASE_URL = os.getenv("SIGNATURE_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TIMETASTIC_URL = os.getenv("TIMETASTIC_URL", "https://timetastic.co.uk/login/").strip()
+EMPLOYEE_DOCUMENTS_BASE_FOLDER = os.getenv("EMPLOYEE_DOCUMENTS_BASE_FOLDER", "20 - EMPLOYEE DOCUMENTS").strip().strip("/")
 PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
 ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "v52-ai-worksheet-rewrite"
+BUILD_VERSION = "v53-engineer-documents"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -127,6 +129,7 @@ MENU_ASK_CHATBOT = "🤖 Ask ChatGPT"
 MENU_CREATE_ASSET = "🏷 Create Asset"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
 MENU_MONTHLY_OVERTIME = "📊 Monthly Overtime"
+MENU_MY_DOCUMENTS = "👤 My Documents"
 
 
 UK_TZ = ZoneInfo("Europe/London")
@@ -750,7 +753,7 @@ def get_engineer_menu(include_helpdesk_menu=False):
     rows = [
         [MENU_START_DAY, MENU_MY_JOBS],
         [MENU_END_DAY, MENU_BUG_IDEA],
-        [MENU_UPLOAD_RECEIPTS],
+        [MENU_UPLOAD_RECEIPTS, MENU_MY_DOCUMENTS],
         [MENU_REQUEST_JOB, MENU_CREATE_ASSET],
     ]
 
@@ -4581,6 +4584,9 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
 
+    if text == MENU_MY_DOCUMENTS:
+        return await my_documents_menu(update, context)
+
     if text == MENU_CREATE_ASSET:
         return await asset_start_manual(update, context)
 
@@ -4595,6 +4601,141 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text in [MENU_CREATE_ASSET, MENU_HELPDESK, MENU_LOG_JOB, MENU_REASSIGN_JOB, MENU_REOPEN_JOB, MENU_OPEN_JOBS, MENU_CANCEL_JOB, MENU_DELETE_JOB, MENU_QUOTE_REMINDER, MENU_CANCEL_TASK_ACTIVITY, MENU_MONTHLY_OVERTIME, MENU_ENGINEER_MENU]:
         return await helpdesk_menu_button(update, context)
+
+
+EMPLOYEE_DOCUMENT_CATEGORIES = {
+    "payslips": ("📄 Payslips", "Payslips", False),
+    "contract": ("📘 Contract", "Contract", False),
+    "handbook": ("📚 Company Handbook", "Shared/Handbook", True),
+    "certificates": ("🎓 Certificates", "Certificates", False),
+}
+
+
+def _employee_document_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Payslips", callback_data="mydocs|payslips"), InlineKeyboardButton("📘 Contract", callback_data="mydocs|contract")],
+        [InlineKeyboardButton("📚 Company Handbook", callback_data="mydocs|handbook")],
+        [InlineKeyboardButton("🎓 Certificates", callback_data="mydocs|certificates")],
+        [InlineKeyboardButton("🏖 Open TimeTastic", url=TIMETASTIC_URL)],
+        [InlineKeyboardButton("✖ Close", callback_data="mydocs|close")],
+    ])
+
+
+async def my_documents_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update):
+        return
+    engineer_result = await asyncio.to_thread(get_engineer_for_telegram_id, update.effective_user.id)
+    _site_id, _list_id, _engineers, engineer = engineer_result
+    if not engineer:
+        await update.effective_message.reply_text(
+            "I could not match your Telegram account to an active engineer record. Please ask an administrator to check your Telegram ID.",
+            reply_markup=get_main_menu(await get_role_for_update(update)),
+        )
+        return
+    context.user_data["employee_document_engineer"] = engineer
+    await update.effective_message.reply_text(
+        f"Hi {engineer.get('name', 'there')}, choose a document section below. Personal documents are only available in this private chat.",
+        reply_markup=_employee_document_keyboard(),
+    )
+
+
+def _list_drive_folder_files(site_id, folder_path):
+    drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
+    encoded_path = quote(folder_path.strip("/"), safe="/")
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{encoded_path}:/children?$select=id,name,file,folder,lastModifiedDateTime,parentReference"
+    files = []
+    while url:
+        response = HTTP_SESSION.get(url, headers=get_headers(content_type=False))
+        if response.status_code == 404:
+            return drive_id, []
+        response.raise_for_status()
+        payload = response.json()
+        files.extend(item for item in payload.get("value", []) if item.get("file"))
+        url = payload.get("@odata.nextLink")
+    files.sort(key=lambda item: item.get("lastModifiedDateTime", ""), reverse=True)
+    return drive_id, files
+
+
+async def my_documents_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.message.chat.type != "private":
+        await query.edit_message_text("Personal documents can only be accessed in a private chat with the bot.")
+        return
+
+    action = query.data.split("|", 1)[1]
+    if action == "close":
+        await query.edit_message_text("My Documents closed.")
+        return
+    if action == "menu":
+        await query.edit_message_text("Choose a document section:", reply_markup=_employee_document_keyboard())
+        return
+    if action not in EMPLOYEE_DOCUMENT_CATEGORIES:
+        await query.edit_message_text("That document section is not available.", reply_markup=_employee_document_keyboard())
+        return
+
+    site_id, _list_id, _engineers, engineer = await asyncio.to_thread(get_engineer_for_telegram_id, update.effective_user.id)
+    if not engineer:
+        await query.edit_message_text("Your Telegram account is not linked to an engineer record.")
+        return
+
+    label, relative_folder, shared = EMPLOYEE_DOCUMENT_CATEGORIES[action]
+    if shared:
+        folder_path = f"{EMPLOYEE_DOCUMENTS_BASE_FOLDER}/{relative_folder}"
+    else:
+        folder_path = f"{EMPLOYEE_DOCUMENTS_BASE_FOLDER}/{safe_folder_name(engineer.get('name', ''))}/{relative_folder}"
+
+    try:
+        drive_id, files = await asyncio.to_thread(_list_drive_folder_files, site_id, folder_path)
+    except Exception as exc:
+        print(f"ERROR listing employee documents for {update.effective_user.id}: {exc}")
+        await query.edit_message_text("I could not access the document library right now. Please try again later.", reply_markup=_employee_document_keyboard())
+        return
+
+    if not files:
+        await query.edit_message_text(
+            f"No {label.replace(chr(0xfe0f), '')} files are currently available for you.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="mydocs|menu")]]),
+        )
+        return
+
+    context.user_data["employee_document_files"] = {
+        str(index): {"drive_id": drive_id, "item_id": item["id"], "name": item.get("name", "document"), "category": action}
+        for index, item in enumerate(files[:25])
+    }
+    rows = [[InlineKeyboardButton(item.get("name", "Document")[:55], callback_data=f"mydocfile|{index}")] for index, item in enumerate(files[:25])]
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="mydocs|menu")])
+    await query.edit_message_text(f"{label}\n\nChoose a file:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def my_document_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Preparing document…")
+    if query.message.chat.type != "private":
+        await query.edit_message_text("Personal documents can only be sent in a private chat.")
+        return
+    index = query.data.split("|", 1)[1]
+    file_info = (context.user_data.get("employee_document_files") or {}).get(index)
+    if not file_info:
+        await query.edit_message_text("This document selection has expired. Please reopen My Documents.", reply_markup=_employee_document_keyboard())
+        return
+
+    # Re-confirm the requester is still a linked engineer before downloading.
+    site_id, _list_id, _engineers, engineer = await asyncio.to_thread(get_engineer_for_telegram_id, update.effective_user.id)
+    if not engineer:
+        await query.edit_message_text("Your Telegram account is no longer linked to an engineer record.")
+        return
+    try:
+        url = f"https://graph.microsoft.com/v1.0/drives/{file_info['drive_id']}/items/{file_info['item_id']}/content"
+        response = await asyncio.to_thread(HTTP_SESSION.get, url, headers=get_headers(content_type=False))
+        response.raise_for_status()
+        document = BytesIO(response.content)
+        document.name = file_info["name"]
+        await query.message.reply_document(document=document, filename=file_info["name"], caption=file_info["name"])
+        print(f"Employee document sent: telegram_id={update.effective_user.id}, engineer={engineer.get('name')}, file={file_info['name']}")
+    except Exception as exc:
+        print(f"ERROR sending employee document to {update.effective_user.id}: {exc}")
+        await query.message.reply_text("I could not download that document right now. Please try again later.")
 
 
 async def helpdesk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4670,6 +4811,9 @@ async def helpdesk_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
+
+    if text == MENU_MY_DOCUMENTS:
+        return await my_documents_menu(update, context)
 
     if text == MENU_CREATE_ASSET:
         return await asset_start_manual(update, context)
@@ -11026,7 +11170,7 @@ monthly_overtime_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|📊 Monthly Overtime|/start|/my_id|/id|/jobs|/requestjob|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder|/overtime)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|📊 Monthly Overtime|👤 My Documents|/start|/my_id|/id|/jobs|/requestjob|/documents|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder|/overtime)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -11037,6 +11181,7 @@ telegram_app.add_handler(CommandHandler("my_id", my_id))
 telegram_app.add_handler(CommandHandler("id", id))
 telegram_app.add_handler(CommandHandler("jobs", jobs))
 telegram_app.add_handler(CommandHandler("requestjob", request_job))
+telegram_app.add_handler(CommandHandler("documents", my_documents_menu))
 telegram_app.add_handler(CommandHandler("helpdesk", helpdesk_start))
 telegram_app.add_handler(cancel_task_activity_handler)
 telegram_app.add_handler(monthly_overtime_handler)
@@ -11055,7 +11200,9 @@ telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_MONTHLY_OVERTIME}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_MY_DOCUMENTS}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_MONTHLY_OVERTIME}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(CallbackQueryHandler(my_documents_callback, pattern=r"^mydocs\|"))
+telegram_app.add_handler(CallbackQueryHandler(my_document_file_callback, pattern=r"^mydocfile\|"))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
