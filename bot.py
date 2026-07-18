@@ -709,6 +709,36 @@ def engineer_has_logged(fields, engineer_name, action):
     return any(search_text in line for line in current_visit_lines)
 
 
+def get_aggregate_live_job_status(engineer_visit_log):
+    """Work out the shared job status from each engineer's latest open visit."""
+    states = {}
+    terminal_actions = {
+        "Completed", "No Access", "Revisit Required", "Aborted Attendance",
+        "Travelling Reverted",
+    }
+
+    for raw_line in str(engineer_visit_log or "").splitlines():
+        parts = raw_line.strip().split(" - ", 3)
+        if len(parts) < 3:
+            continue
+        engineer = parts[1].strip().lower()
+        action = parts[2].strip()
+        if not engineer:
+            continue
+        if action == "Travelling":
+            states[engineer] = TRAVELLING_STATUS
+        elif action == "On Site":
+            states[engineer] = ON_SITE_STATUS
+        elif action in terminal_actions or action.startswith("Submitted for Helpdesk Review - "):
+            states.pop(engineer, None)
+
+    if ON_SITE_STATUS in states.values():
+        return ON_SITE_STATUS
+    if TRAVELLING_STATUS in states.values():
+        return TRAVELLING_STATUS
+    return ASSIGNED_STATUS
+
+
 def can_click_action(fields, engineer_name, action):
     return validate_job_action(fields, engineer_name, action)
 
@@ -1389,14 +1419,21 @@ def find_active_day_log(day_logs, telegram_id, work_date=None):
         matches.append((start_dt or datetime.min.replace(tzinfo=UK_TZ), log))
     return max(matches, key=lambda item: item[0])[1] if matches else None
 
-def get_active_day_for_engineer(site_id, telegram_id):
+def get_active_day_for_engineer(site_id, telegram_id, work_date=None):
+    """Return an active day log for a specific work date.
+
+    Current-day checks default to today so an old unclosed SharePoint record
+    cannot unlock jobs or make the bot report that a new day has already begun.
+    Pass work_date=None only when deliberately searching historical active logs.
+    """
     day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
     day_logs = get_list_items(site_id, day_logs_list_id)
-    return day_logs_list_id, find_active_day_log(day_logs, telegram_id)
+    target_date = get_today_iso() if work_date is None else work_date
+    return day_logs_list_id, find_active_day_log(day_logs, telegram_id, target_date)
 
 
 def engineer_has_active_day(site_id, telegram_id):
-    _, active_day = get_active_day_for_engineer(site_id, telegram_id)
+    _, active_day = get_active_day_for_engineer(site_id, telegram_id, get_today_iso())
     return active_day is not None
 
 
@@ -3300,7 +3337,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
         day_logs = get_list_items(site_id, day_logs_list_id)
-        active_day = find_active_day_log(day_logs, user_id)
+        active_day = find_active_day_log(day_logs, user_id, get_today_iso())
 
         if active_day:
             await update.message.reply_text(
@@ -3847,7 +3884,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        day_logs_list_id, active_day = get_active_day_for_engineer(site_id, user_id)
+        day_logs_list_id, active_day = get_active_day_for_engineer(site_id, user_id, get_today_iso())
 
         if not active_day:
             await update.message.reply_text(
@@ -4093,7 +4130,7 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        _, active_day = get_active_day_for_engineer(site_id, user_id)
+        _, active_day = get_active_day_for_engineer(site_id, user_id, get_today_iso())
 
         if active_day:
             fields = active_day["fields"]
@@ -7501,14 +7538,12 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "undo_travelling":
             has_travelled = has_engineer_action(fields, current_engineer["name"], "Travelling")
             has_on_site = has_engineer_action(fields, current_engineer["name"], "On Site")
-            current_status = str(fields.get("Status", "") or "").strip()
-
             if not has_travelled:
                 await query.message.reply_text("Travelling has not been logged on this job, so there is nothing to undo.")
                 return
 
-            if has_on_site or current_status == ON_SITE_STATUS:
-                await query.message.reply_text("Travelling cannot be undone after Arrived On Site has been logged.")
+            if has_on_site:
+                await query.message.reply_text("Travelling cannot be undone after you have logged Arrived On Site.")
                 return
 
             updated_log = append_engineer_log(
@@ -7518,12 +7553,14 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Accidental travelling click reversed by engineer",
             )
 
+            aggregate_status = get_aggregate_live_job_status(updated_log)
+
             update_list_item_fields(
                 site_id,
                 jobs_list_id,
                 item_id,
                 {
-                    "Status": ASSIGNED_STATUS,
+                    "Status": aggregate_status,
                     "EngineerVisitLog": updated_log,
                     "WorksheetSubmitted": False,
                 },
@@ -7537,7 +7574,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             await query.message.reply_text(
-                f"Travelling reversed:\n\n{fields.get('CDRNumber', '')} → Assigned\n\nThe job is still assigned to you. You can press Start Travelling again when needed."
+                f"Travelling reversed for you:\n\n{fields.get('CDRNumber', '')}\n\nThe job remains {aggregate_status} overall because another engineer may still be travelling or on site. You can press Start Travelling again when needed."
             )
 
             await notify_helpdesk(
@@ -7547,7 +7584,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"CDR Number: {fields.get('CDRNumber', '')}\n"
                     f"Engineer: {current_engineer['name']}\n"
                     f"Site: {fields.get('SiteName', '')}\n"
-                    "The job has been put back to Assigned and remains with the engineer."
+                    f"Overall job status remains: {aggregate_status}."
                 ),
             )
 
