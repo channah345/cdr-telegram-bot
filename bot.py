@@ -4485,6 +4485,8 @@ async def asset_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = create_asset_in_portal(asset_payload_from_context(context))
         asset = result.get("asset", {})
+        duplicate_warning = result.get("duplicate_warning")
+        warning_text = f"\n\n⚠️ Possible duplicate: asset {duplicate_warning} has the same serial number at this site." if duplicate_warning else ""
         await update.message.reply_text(
             "✅ Asset created in the portal.\n\n"
             f"Asset ID: {asset.get('asset_id','')}\n"
@@ -4492,7 +4494,7 @@ async def asset_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Site: {asset.get('site_name','')}\n\n"
             f"View Asset:\n{result.get('asset_url','')}\n\n"
             f"QR Code:\n{result.get('qr_url','')}\n\n"
-            f"Print Label:\n{result.get('label_url','')}",
+            f"Print Label:\n{result.get('label_url','')}" + warning_text,
             reply_markup=get_main_menu(await get_role_for_update(update)),
         )
     except Exception as e:
