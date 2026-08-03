@@ -21,6 +21,7 @@ from .job_logic import (
     engineer_has_logged,
     validate_job_action,
 )
+from .fields import bool_field, get_field_value, normalise_cdr, normalise_field_name
 __all__ = [
     "now_log_time",
     "graph_datetime_now",
@@ -41,4 +42,8 @@ __all__ = [
     "is_closed_job",
     "engineer_has_logged",
     "validate_job_action",
+    "bool_field",
+    "get_field_value",
+    "normalise_cdr",
+    "normalise_field_name",
 ]

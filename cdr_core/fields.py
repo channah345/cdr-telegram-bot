@@ -1,31 +1,29 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
+"""Canonical SharePoint field normalisation helpers."""
 
-UK_TZ = ZoneInfo("Europe/London")
 
-def now_log_time() -> str:
-    return datetime.now(UK_TZ).strftime("%d/%m/%Y %H:%M")
+def normalise_field_name(value) -> str:
+    return "".join(str(value or "").lower().replace("_x0020_", "").split())
 
-def graph_datetime_now() -> str:
-    return datetime.now(UK_TZ).isoformat()
 
-def format_sharepoint_date(value) -> str:
-    if not value:
-        return ""
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return dt.astimezone(UK_TZ).strftime("%d/%m/%Y")
-    except Exception:
-        return str(value)
+def get_field_value(fields: dict, *names):
+    fields = fields or {}
+    for name in names:
+        if name in fields and fields.get(name) not in [None, ""]:
+            return fields.get(name)
+    wanted = {normalise_field_name(name) for name in names}
+    for key, value in fields.items():
+        if normalise_field_name(key) in wanted and value not in [None, ""]:
+            return value
+    return None
 
-def sharepoint_date_to_uk_date(value):
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return dt.astimezone(UK_TZ).date()
-    except Exception:
-        return None
 
-def parse_sharepoint_date_to_date(value):
-    return sharepoint_date_to_uk_date(value)
+def bool_field(value) -> bool:
+    return value in [True, "true", "True", "Yes", "yes", "1", 1]
+
+
+def normalise_cdr(value) -> str:
+    value = str(value or "").strip().lower()
+    for prefix in ["cdr:", "cdr number:", "cdrnumber:"]:
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+    return value.replace(" ", "").replace("-", "").replace("_", "")

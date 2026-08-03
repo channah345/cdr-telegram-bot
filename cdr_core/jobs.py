@@ -1,116 +1,63 @@
-import re
-import requests
-import msal
-from .config import CDRConfig
-from .fields import normalise_field_name
+"""Pure job rules shared by web and Telegram interfaces."""
 
-class SharePointClient:
-    def __init__(self, config: CDRConfig | None = None):
-        self.config = config or CDRConfig()
-        self._app = msal.ConfidentialClientApplication(
-            self.config.client_id,
-            authority=self.config.authority,
-            client_credential=self.config.client_secret,
-        )
-        self._site_id = None
-        self._list_ids = {}
-        self._drive_ids = {}
+from .statuses import (
+    ASSIGNED_STATUS, AWAITING_DEPLOYMENT_STATUS, COMPLETED_STATUS,
+    LEGACY_AWAITING_DEPLOYMENT_STATUS, ON_SITE_STATUS, TRAVELLING_STATUS,
+)
 
-    def headers(self, content_type: bool = True) -> dict:
-        token_result = self._app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-        if "access_token" not in token_result:
-            raise RuntimeError(f"Could not get Microsoft token: {token_result}")
-        headers = {"Authorization": f"Bearer {token_result['access_token']}"}
-        if content_type:
-            headers["Content-Type"] = "application/json"
-        return headers
 
-    def site_id(self) -> str:
-        if self._site_id:
-            return self._site_id
-        site = self.config.sharepoint_site
-        site_hostname = site.split("/")[2]
-        site_path = "/" + "/".join(site.split("/")[3:])
-        url = f"https://graph.microsoft.com/v1.0/sites/{site_hostname}:{site_path}"
-        response = requests.get(url, headers=self.headers(), timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(f"Could not get SharePoint site: {response.text}")
-        self._site_id = response.json()["id"]
-        return self._site_id
+def get_assigned_engineer_ids(fields: dict) -> list[str]:
+    assigned, seen = [], set()
 
-    def list_id(self, list_name: str) -> str:
-        if list_name in self._list_ids:
-            return self._list_ids[list_name]
-        site_id = self.site_id()
-        response = requests.get(f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists", headers=self.headers(), timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(f"Could not get lists: {response.text}")
-        for lst in response.json().get("value", []):
-            if lst.get("name") == list_name:
-                self._list_ids[list_name] = lst["id"]
-                return lst["id"]
-        raise RuntimeError(f"List not found: {list_name}")
+    def add(value):
+        value = str(value or "").strip()
+        if value and value.lower() not in {"none", "null"} and value not in seen:
+            assigned.append(value)
+            seen.add(value)
 
-    def list_items(self, list_name_or_id: str, expand_fields: bool = True) -> list[dict]:
-        site_id = self.site_id()
-        list_id = self._list_ids.get(list_name_or_id) or list_name_or_id
-        expand = "?expand=fields" if expand_fields else ""
-        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items{expand}"
-        response = requests.get(url, headers=self.headers(), timeout=30)
-        if response.status_code != 200:
-            # Treat input as a list name if it was not a valid id.
-            list_id = self.list_id(list_name_or_id)
-            url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items{expand}"
-            response = requests.get(url, headers=self.headers(), timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(f"Could not get items: {response.text}")
-        return response.json().get("value", [])
+    engineers = fields.get("Engineer", [])
+    for engineer in engineers if isinstance(engineers, list) else []:
+        add(engineer.get("LookupId") if isinstance(engineer, dict) else engineer)
+    for key in ["EngineerLookupId", "Engineer Lookup Id", "EngineerId", "Engineer ID"]:
+        value = fields.get(key)
+        if isinstance(value, list):
+            for item in value:
+                add(item)
+        else:
+            add(value)
+    return assigned
 
-    def list_columns(self, list_name_or_id: str) -> list[dict]:
-        site_id = self.site_id()
-        list_id = self._list_ids.get(list_name_or_id) or list_name_or_id
-        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns"
-        response = requests.get(url, headers=self.headers(), timeout=30)
-        if response.status_code != 200:
-            list_id = self.list_id(list_name_or_id)
-            url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/columns"
-            response = requests.get(url, headers=self.headers(), timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(f"Could not get list columns: {response.text}")
-        return response.json().get("value", [])
 
-    def build_field_payload(self, list_name_or_id: str, fields: dict) -> dict:
-        columns = self.list_columns(list_name_or_id)
-        lookup = {"title": "Title"}
-        for column in columns:
-            internal_name = column.get("name", "")
-            display_name = column.get("displayName", "")
-            if column.get("readOnly") or internal_name in ["LinkTitle", "LinkTitleNoMenu"]:
-                continue
-            for key in [internal_name, display_name]:
-                normalised = normalise_field_name(key)
-                if normalised and normalised not in lookup:
-                    lookup[normalised] = internal_name
-        payload = {}
-        for desired_name, value in (fields or {}).items():
-            internal_name = "Title" if desired_name == "Title" else lookup.get(normalise_field_name(desired_name))
-            if internal_name:
-                payload[internal_name] = value
-        return payload
+def is_closed_job(fields: dict) -> bool:
+    status = str(fields.get("Status", "") or "").strip()
+    outcome = str(fields.get("JobOutcome", "") or "").strip()
+    open_statuses = {
+        "", AWAITING_DEPLOYMENT_STATUS, LEGACY_AWAITING_DEPLOYMENT_STATUS,
+        ASSIGNED_STATUS, TRAVELLING_STATUS, ON_SITE_STATUS,
+    }
+    if status == COMPLETED_STATUS or outcome == "Completed":
+        return True
+    if status in open_statuses:
+        return False
+    return status in {"No Access", "Revisit Required"} or outcome in {"No Access", "Revisit Required"}
 
-    def update_item_fields(self, list_name_or_id: str, item_id: str, fields_to_update: dict):
-        site_id = self.site_id()
-        list_id = self._list_ids.get(list_name_or_id) or self.list_id(list_name_or_id)
-        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
-        payload = dict(fields_to_update or {})
-        while True:
-            response = requests.patch(url, headers=self.headers(), json=payload, timeout=30)
-            if response.status_code in [200, 204]:
-                return
-            match = re.search(r"Field '([^']+)' is not recognized", response.text or "")
-            if match and match.group(1) in payload:
-                missing = match.group(1)
-                payload.pop(missing, None)
-                payload.pop(f"{missing}@odata.type", None)
-                continue
-            raise RuntimeError(f"Could not update item {item_id}: {response.text}")
+
+def engineer_has_logged(fields: dict, engineer_name: str, action: str) -> bool:
+    return f" - {engineer_name} - {action}" in (fields.get("EngineerVisitLog", "") or "")
+
+
+def validate_job_action(fields: dict, engineer_name: str, action: str):
+    if is_closed_job(fields):
+        return False, "This job has already been closed or returned to the office."
+    has_travelled = engineer_has_logged(fields, engineer_name, "Travelling")
+    has_on_site = engineer_has_logged(fields, engineer_name, "On Site")
+    if action == "Travelling" and has_travelled:
+        return False, "Travelling has already been logged for this job."
+    if action == "On Site":
+        if not has_travelled:
+            return False, "You need to click Travelling before clicking On Site."
+        if has_on_site:
+            return False, "On Site has already been logged for this job."
+    if action in {"No Access", "Revisit Required", "Completed"} and not has_on_site:
+        return False, "You need to click On Site before selecting this option."
+    return True, ""
