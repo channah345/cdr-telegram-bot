@@ -1,0 +1,3 @@
+web: python signature_server.py
+worker: python polling_worker.py
+scheduler: python scheduler_worker.py

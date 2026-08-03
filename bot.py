@@ -9,6 +9,7 @@ import time
 import threading
 import zipfile
 import asyncio
+from html import escape as html_escape
 from io import BytesIO, StringIO
 from urllib.parse import quote, quote_plus, urlparse
 from xml.sax.saxutils import escape as xml_escape
@@ -38,12 +39,18 @@ from cdr_core import (
     engineer_has_logged as core_engineer_has_logged,
     validate_job_action as core_validate_job_action,
 )
+from cdr_core.api_contracts import JobNotification
+from cdr_core.leader import SchedulerLease
+from cdr_core.outbox import NotificationOutbox
+from cdr_core.persistence import PostgresPersistence, ProcessedUpdateStore
+from cdr_core.tokens import create_expiring_token, verify_expiring_token
 print("✅ CDR Core loaded in bot:", now_log_time())
 print("✅ CDR job logic loaded in bot")
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputMediaPhoto, ReplyKeyboardRemove
 try:
     from telegram.warnings import PTBUserWarning
@@ -57,12 +64,14 @@ warnings.filterwarnings(
 )
 from telegram.ext import (
     ApplicationBuilder,
-    PicklePersistence,
+    ApplicationHandlerStop,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    DictPersistence,
+    TypeHandler,
     filters,
 )
 import uvicorn
@@ -88,8 +97,14 @@ TIMETASTIC_URL = os.getenv("TIMETASTIC_URL", "https://timetastic.co.uk/login/").
 EMPLOYEE_DOCUMENTS_BASE_FOLDER = os.getenv("EMPLOYEE_DOCUMENTS_BASE_FOLDER", "20 - EMPLOYEE DOCUMENTS").strip().strip("/")
 PORTAL_BASE_URL = os.getenv("PORTAL_BASE_URL", "").strip().rstrip("/")
 ASSET_API_KEY = os.getenv("ASSET_API_KEY", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SIGNATURE_TOKEN_SECRET = os.getenv("SIGNATURE_TOKEN_SECRET", "").strip()
+SIGNATURE_TOKEN_TTL_SECONDS = int(os.getenv("SIGNATURE_TOKEN_TTL_SECONDS", "86400"))
+BOT_MAX_UPDATE_AGE_SECONDS = int(os.getenv("BOT_MAX_UPDATE_AGE_SECONDS", "21600"))
+BOT_RUN_SIGNATURE_SERVER = os.getenv("BOT_RUN_SIGNATURE_SERVER", "true").strip().lower() in {"1", "true", "yes", "on"}
+BOT_RUN_SCHEDULER = os.getenv("BOT_RUN_SCHEDULER", "true").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "v54-document-picker-policies"
+BUILD_VERSION = "v60-async-security-outbox"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -130,6 +145,7 @@ MENU_CREATE_ASSET = "🏷 Create Asset"
 MENU_ENGINEER_MENU = "👷 Engineer Menu"
 MENU_MONTHLY_OVERTIME = "📊 Monthly Overtime"
 MENU_MY_DOCUMENTS = "👤 My Documents"
+MENU_OPEN_APP = "📱 Open Engineer App"
 
 
 UK_TZ = ZoneInfo("Europe/London")
@@ -243,14 +259,49 @@ VAN_CHECK_QUESTIONS = [
 ]
 
 authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+_msal_app = None
+_msal_lock = threading.RLock()
 
-msal_app = msal.ConfidentialClientApplication(
-    CLIENT_ID,
-    authority=authority,
-    client_credential=CLIENT_SECRET,
-)
+
+def get_msal_app():
+    """Initialise Microsoft authentication only when Graph is first used."""
+    global _msal_app
+    if _msal_app is None:
+        with _msal_lock:
+            if _msal_app is None:
+                _msal_app = msal.ConfidentialClientApplication(
+                    CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET,
+                )
+    return _msal_app
 
 web_app = FastAPI()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+if os.path.isdir(STATIC_DIR):
+    web_app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@web_app.middleware("http")
+async def signature_security_headers(request: Request, call_next):
+    if request.url.path == "/submit-signature":
+        try:
+            if int(request.headers.get("content-length") or 0) > 4 * 1024 * 1024:
+                return HTMLResponse("Signature submission is too large.", status_code=413)
+        except ValueError:
+            return HTMLResponse("Invalid request size.", status_code=400)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; "
+        "img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+    )
+    if (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 class TimeoutSession(requests.Session):
@@ -285,6 +336,8 @@ CACHE_TTL_SECONDS = int(os.getenv("GRAPH_METADATA_CACHE_TTL", "3600"))
 SESSION_DATA_PATH = os.getenv("SESSION_DATA_PATH", "bot_sessions.pkl")
 _CALLBACK_IN_FLIGHT = {}
 _CALLBACK_LOCK = asyncio.Lock()
+NOTIFICATION_OUTBOX = NotificationOutbox(DATABASE_URL)
+PROCESSED_UPDATES = ProcessedUpdateStore(DATABASE_URL)
 
 
 def _cache_get(cache, key=None):
@@ -345,7 +398,7 @@ def is_private_chat(update):
 
 
 def get_headers(content_type=True):
-    token_result = msal_app.acquire_token_for_client(
+    token_result = get_msal_app().acquire_token_for_client(
         scopes=["https://graph.microsoft.com/.default"]
     )
 
@@ -782,9 +835,10 @@ def build_engineer_maps(engineers):
 def get_engineer_menu(include_helpdesk_menu=False):
     rows = [
         [MENU_START_DAY, MENU_MY_JOBS],
-        [MENU_END_DAY, MENU_BUG_IDEA],
+        [MENU_END_DAY, MENU_OPEN_APP],
         [MENU_UPLOAD_RECEIPTS, MENU_MY_DOCUMENTS],
         [MENU_REQUEST_JOB, MENU_CREATE_ASSET],
+        [MENU_BUG_IDEA],
     ]
 
     # Only Admin users should be able to switch from the Engineer menu
@@ -1304,8 +1358,9 @@ async def send_created_job_to_engineers(bot, item_id, fields, assigned_engineers
 
 async def get_role_for_update(update):
     try:
-        site_id = get_site_id()
-        return get_bot_user_role(site_id, update.effective_user.id)
+        return await asyncio.to_thread(
+            lambda: get_bot_user_role(get_site_id(), update.effective_user.id)
+        )
     except Exception as e:
         print(f"Could not determine bot user role: {e}")
         return "Engineer"
@@ -2250,11 +2305,16 @@ def upload_photo_to_sharepoint(site_id, worksheet, file_name, file_bytes):
 
 
 def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url, fields=None):
-    if "," not in signature_data_url:
+    if not str(signature_data_url or "").startswith("data:image/png;base64,"):
         raise Exception("Invalid signature data")
 
     image_base64 = signature_data_url.split(",", 1)[1]
-    image_bytes = base64.b64decode(image_base64)
+    try:
+        image_bytes = base64.b64decode(image_base64, validate=True)
+    except Exception as exc:
+        raise Exception("Invalid signature image") from exc
+    if not image_bytes or len(image_bytes) > 2 * 1024 * 1024:
+        raise Exception("Signature image exceeds the 2 MB limit")
     file_name = f"{cdr_number}_client_signature_{datetime.now(UK_TZ).strftime('%Y%m%d_%H%M%S')}.png"
 
     folder_path = build_completed_job_pack_folder(cdr_number, fields or {}, "02 - Client Signature")
@@ -2268,6 +2328,10 @@ def upload_signature_to_sharepoint(site_id, cdr_number, signature_data_url, fiel
 
 
 def get_job_by_cdr_and_token(cdr_number, token):
+    if not SIGNATURE_TOKEN_SECRET or not verify_expiring_token(
+        token, SIGNATURE_TOKEN_SECRET, "client-signature",
+    ):
+        return None, None, None
     site_id = get_site_id()
     jobs_list_id = get_list_id(site_id, JOBS_LIST)
     jobs_data = get_list_items(site_id, jobs_list_id)
@@ -2288,7 +2352,11 @@ def bool_field(value):
 
 
 def create_signature_token_for_job(site_id, jobs_list_id, item_id):
-    token = secrets.token_urlsafe(24)
+    if not SIGNATURE_TOKEN_SECRET:
+        raise Exception("SIGNATURE_TOKEN_SECRET is not configured")
+    token = create_expiring_token(
+        SIGNATURE_TOKEN_SECRET, "client-signature", SIGNATURE_TOKEN_TTL_SECONDS,
+    )
     update_list_item_fields(
         site_id,
         jobs_list_id,
@@ -2614,6 +2682,11 @@ def bot_health_page():
     return HTMLResponse("CDR Engineer Bot signature portal is online.")
 
 
+@web_app.get("/healthz", include_in_schema=False)
+def bot_health_check():
+    return {"status": "ok", "service": "cdr-engineer-bot-signatures", "build": BUILD_VERSION}
+
+
 @web_app.get("/sign/{cdr_number}", response_class=HTMLResponse)
 def signature_page(cdr_number: str, token: str):
     site_id, jobs_list_id, job = get_job_by_cdr_and_token(cdr_number, token)
@@ -2626,9 +2699,11 @@ def signature_page(cdr_number: str, token: str):
     if bool_field(fields.get("ClientSignatureReceived")):
         return HTMLResponse("This job has already been signed.", status_code=200)
 
-    site = fields.get("SiteName", "")
+    site = html_escape(str(fields.get("SiteName", "") or ""), quote=True)
     address = ""
-    task = fields.get("Task", "")
+    task = html_escape(str(fields.get("Task", "") or ""), quote=True)
+    safe_cdr_number = html_escape(str(cdr_number or ""), quote=True)
+    safe_token = html_escape(str(token or ""), quote=True)
 
     html = f"""
     <!DOCTYPE html>
@@ -2636,7 +2711,7 @@ def signature_page(cdr_number: str, token: str):
     <head>
         <title>Client Signature - CDR M&E Services Ltd</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.6/dist/signature_pad.umd.min.js"></script>
+        <script src="/static/signature-pad.js"></script>
         <style>
             html, body {{ overscroll-behavior: none; }}
             body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; margin: 0; }}
@@ -3030,13 +3105,13 @@ body.signature-page canvas {{
             <img src="/logo.png" alt="CDR M&E Services Ltd" style="display:block; max-width:320px; width:80%; margin:0 auto 20px auto;">
             <h2 style="text-align:center;">Client Signature</h2>
             <div class="job-box">
-                <p><strong>CDR Number:</strong> {cdr_number}</p>
+                <p><strong>CDR Number:</strong> {safe_cdr_number}</p>
                 <p><strong>Site:</strong> {site}</p>
                 <p><strong>Task:</strong> {task}</p>
             </div>
             <form method="post" action="/submit-signature" onsubmit="return submitForm()">
-                <input type="hidden" name="cdr_number" value="{cdr_number}">
-                <input type="hidden" name="token" value="{token}">
+                <input type="hidden" name="cdr_number" value="{safe_cdr_number}">
+                <input type="hidden" name="token" value="{safe_token}">
                 <input type="hidden" name="signature_data" id="signature_data">
 
                 <label>Client name</label>
@@ -3157,6 +3232,9 @@ def submit_signature(
     client_name: str = Form(...),
     signature_data: str = Form(...),
 ):
+    client_name = str(client_name or "").strip()
+    if not client_name or len(client_name) > 120:
+        return HTMLResponse("Please enter a valid client name.", status_code=400)
     site_id, jobs_list_id, job = get_job_by_cdr_and_token(cdr_number, token)
 
     if not job:
@@ -3176,6 +3254,7 @@ def submit_signature(
             "ClientSignatureName": client_name,
             "ClientSignatureDateTime": graph_datetime_now(),
             "ClientSignatureLink": signature_link,
+            "SignatureToken": "",
         },
     )
 
@@ -3326,7 +3405,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_id = str(update.effective_user.id)
-        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+        site_id, _, _, current_engineer = await asyncio.to_thread(get_engineer_for_telegram_id, user_id)
 
         if not current_engineer:
             await update.message.reply_text(
@@ -3335,8 +3414,11 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
-        day_logs = get_list_items(site_id, day_logs_list_id)
+        day_logs_list_id, day_logs = await asyncio.to_thread(
+            lambda: (lambda list_id: (list_id, get_list_items(site_id, list_id)))(
+                get_list_id(site_id, DAY_LOGS_LIST)
+            )
+        )
         active_day = find_active_day_log(day_logs, user_id, get_today_iso())
 
         if active_day:
@@ -3346,7 +3428,7 @@ async def startday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        role = get_bot_user_role(site_id, user_id)
+        role = await asyncio.to_thread(get_bot_user_role, site_id, user_id)
 
         context.user_data["start_day"] = {
             "role": role,
@@ -3599,7 +3681,7 @@ def create_apprentice_start_day_log(start_day):
 async def close_end_day_record(context, end_day, mileage=None, include_mileage=True):
     """Close the active day log. Apprentices can close without mileage prompts."""
     # Re-check assigned jobs before closing the day in case one was added during the end-day flow.
-    site_id, _, _, engineers, jobs_data = get_sharepoint_data()
+    site_id, _, _, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
     open_jobs = get_open_jobs_for_engineer_today(jobs_data, end_day["engineer_lookup_id"])
 
     if open_jobs:
@@ -3689,7 +3771,8 @@ async def close_end_day_record(context, end_day, mileage=None, include_mileage=T
         update_payload,
     )
 
-    update_list_item_fields(
+    await asyncio.to_thread(
+        update_list_item_fields,
         end_day["site_id"],
         end_day["day_logs_list_id"],
         end_day["day_log_item_id"],
@@ -3730,7 +3813,7 @@ async def startday_start_mileage(update: Update, context: ContextTypes.DEFAULT_T
     )
 
     if not needs_check:
-        create_start_day_log(start_day, van_check_completed=False)
+        await asyncio.to_thread(create_start_day_log, start_day, False)
         context.user_data.pop("start_day", None)
 
         await update.message.reply_text(
@@ -3822,7 +3905,7 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "3. Dashboard / mileage"
                 )
                 return START_DAY_VAN_PHOTOS
-            create_start_day_log(start_day, van_check_completed=True)
+            await asyncio.to_thread(create_start_day_log, start_day, True)
 
             context.user_data.pop("start_day", None)
 
@@ -3840,7 +3923,8 @@ async def startday_van_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
             timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
             file_name = f"{safe_folder_name(start_day.get('van_reg', 'VAN'))}_{timestamp}_{photo.file_unique_id}.jpg"
 
-            photo_link = upload_van_check_photo_to_sharepoint(
+            photo_link = await asyncio.to_thread(
+                upload_van_check_photo_to_sharepoint,
                 start_day["site_id"],
                 start_day["work_date"],
                 start_day.get("van_reg", "VAN"),
@@ -3875,7 +3959,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_id = str(update.effective_user.id)
-        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+        site_id, _, _, current_engineer = await asyncio.to_thread(get_engineer_for_telegram_id, user_id)
 
         if not current_engineer:
             await update.message.reply_text(
@@ -3884,7 +3968,9 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        day_logs_list_id, active_day = get_active_day_for_engineer(site_id, user_id, get_today_iso())
+        day_logs_list_id, active_day = await asyncio.to_thread(
+            get_active_day_for_engineer, site_id, user_id, get_today_iso()
+        )
 
         if not active_day:
             await update.message.reply_text(
@@ -3893,7 +3979,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        _, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        _, _, jobs_list_id, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
         open_jobs = get_open_jobs_for_engineer_today(jobs_data, current_engineer["lookup_id"])
 
         if open_jobs:
@@ -3905,7 +3991,7 @@ async def endday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        role = get_bot_user_role(site_id, user_id)
+        role = await asyncio.to_thread(get_bot_user_role, site_id, user_id)
 
         context.user_data["end_day"] = {
             "role": role,
@@ -4121,7 +4207,7 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_id = str(update.effective_user.id)
-        site_id, _, _, current_engineer = get_engineer_for_telegram_id(user_id)
+        site_id, _, _, current_engineer = await asyncio.to_thread(get_engineer_for_telegram_id, user_id)
 
         if not current_engineer:
             await update.message.reply_text(
@@ -4130,7 +4216,7 @@ async def mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        _, active_day = get_active_day_for_engineer(site_id, user_id, get_today_iso())
+        _, active_day = await asyncio.to_thread(get_active_day_for_engineer, site_id, user_id, get_today_iso())
 
         if active_day:
             fields = active_day["fields"]
@@ -4193,8 +4279,8 @@ async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         user_id = str(update.effective_user.id)
-        site_id, engineers_list_id, _, current_engineer = get_engineer_for_telegram_id(user_id)
-        role = get_bot_user_role(site_id, user_id)
+        site_id, engineers_list_id, _, current_engineer = await asyncio.to_thread(get_engineer_for_telegram_id, user_id)
+        role = await asyncio.to_thread(get_bot_user_role, site_id, user_id)
 
         if str(role).lower() not in ["engineer", "admin"]:
             await update.message.reply_text(
@@ -4204,7 +4290,7 @@ async def request_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         engineer_name = current_engineer["name"] if current_engineer else (update.effective_user.full_name or user_id)
-        engineers = get_list_items(site_id, engineers_list_id)
+        engineers = await asyncio.to_thread(get_list_items, site_id, engineers_list_id)
         helpdesk_users = get_active_helpdesk_users(engineers)
 
         if not helpdesk_users:
@@ -4364,7 +4450,7 @@ async def asset_start_from_job(update: Update, context: ContextTypes.DEFAULT_TYP
         if not current_engineer:
             await query.message.reply_text("You are not set up as an engineer.")
             return ConversationHandler.END
-        if not engineer_has_active_day(site_id, user_id):
+        if not await asyncio.to_thread(engineer_has_active_day, site_id, user_id):
             await query.message.reply_text("Please start your day first using 🟢 Start Day before creating a site asset from a job.")
             return ConversationHandler.END
         job = find_job_by_item_id(jobs_data, item_id)
@@ -4548,9 +4634,11 @@ async def monthly_overtime_month(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def send_monthly_overtime_report(update, context, year, month):
-    site_id = get_site_id()
-    list_id = get_list_id(site_id, DAY_LOGS_LIST)
-    logs = await asyncio.to_thread(get_list_items, site_id, list_id)
+    site_id, list_id, logs = await asyncio.to_thread(
+        lambda: (lambda sid: (lambda lid: (sid, lid, get_list_items(sid, lid)))(
+            get_list_id(sid, DAY_LOGS_LIST)
+        ))(get_site_id())
+    )
     totals = {}
     for item in logs:
         fields = item.get("fields", {})
@@ -4611,14 +4699,26 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == MENU_END_DAY:
         return await endday_start(update, context)
 
+    if text == MENU_OPEN_APP:
+        if not PORTAL_BASE_URL:
+            await update.message.reply_text(
+                "The Engineer App URL is not configured yet. Ask an administrator to set PORTAL_BASE_URL.",
+                reply_markup=get_main_menu(await get_role_for_update(update)),
+            )
+            return
+        await update.message.reply_text(
+            "Open the CDR Engineer App for jobs, photos, worksheets and day controls:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📱 Open Engineer App", url=f"{PORTAL_BASE_URL}/engineer-login")
+            ]]),
+        )
+        return
+
     if text == MENU_BUG_IDEA:
         return await bugidea_start(update, context)
 
     if text == MENU_UPLOAD_RECEIPTS:
         return await receipt_start(update, context)
-
-    if text == MENU_CREATE_ASSET:
-        return await asset_start_manual(update, context)
 
     if text == MENU_REQUEST_JOB:
         return await request_job(update, context)
@@ -4921,10 +5021,11 @@ async def logjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (
+                sid, jid, eid, get_list_items(sid, eid)
+            ))(get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)))(get_site_id())
+        )
         assignable_engineers = get_active_assignable_engineers(engineers)
 
         if not assignable_engineers:
@@ -5238,16 +5339,17 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jobs_list_id = job["jobs_list_id"]
 
         initial_fields = build_helpdesk_job_fields(site_id, jobs_list_id, job, telegram_notified=False)
-        created_item = create_list_item_fields(site_id, jobs_list_id, initial_fields)
+        created_item = await asyncio.to_thread(
+            create_list_item_fields, site_id, jobs_list_id, initial_fields
+        )
         item_id = created_item.get("id")
         created_fields = created_item.get("fields", initial_fields)
 
         # Make sure the CDR folder structure exists early, before engineers upload photos or signatures.
         try:
-            drive_id = get_drive_id(site_id, PHOTO_LIBRARY)
-            # Completed evidence is now created only when the job is completed,
-            # under 18 - JOB WORKSHEETS / YYYY / MM - Month / Job Number - First Site Line.
-            ensure_folder(drive_id, WORKSHEET_BASE_FOLDER)
+            await asyncio.to_thread(
+                lambda: ensure_folder(get_drive_id(site_id, PHOTO_LIBRARY), WORKSHEET_BASE_FOLDER)
+            )
         except Exception as folder_error:
             print(f"WARNING: Could not pre-create job folders for {job['cdr_number']}: {folder_error}")
 
@@ -5273,7 +5375,9 @@ async def logjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Engineer Visit Log": f"{now_log_time()} - Helpdesk - Job logged via Telegram and {'sent to engineer(s)' if sent_to_any else 'created but not sent'}",
             },
         )
-        update_list_item_fields(site_id, jobs_list_id, item_id, final_update)
+        await asyncio.to_thread(
+            update_list_item_fields, site_id, jobs_list_id, item_id, final_update
+        )
 
         context.user_data.pop("log_job", None)
 
@@ -5325,10 +5429,11 @@ async def reopenjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (sid, jid, eid, get_list_items(sid, eid)))(
+                get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)
+            ))(get_site_id())
+        )
         assignable_engineers = get_active_assignable_engineers(engineers)
         context.user_data["reopen_job"] = {
             "site_id": site_id,
@@ -5353,7 +5458,7 @@ async def reopenjob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     cdr_number = update.message.text.strip()
     try:
-        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        jobs_data = await asyncio.to_thread(get_list_items, data["site_id"], data["jobs_list_id"])
         job = find_job_by_cdr(jobs_data, cdr_number)
         if not job:
             await update.message.reply_text("I could not find that CDR number. Please check it and try again.")
@@ -5460,14 +5565,14 @@ async def reopenjob_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payload = build_field_payload_for_list(site_id, jobs_list_id, payload_fields)
         payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
         payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in final_engineers]
-        update_list_item_fields(site_id, jobs_list_id, data["item_id"], payload)
+        await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, data["item_id"], payload)
 
         send_fields = dict(fields)
         send_fields.update(payload_fields)
         sent_to_any, failed = await send_created_job_to_engineers(context.bot, data["item_id"], send_fields, final_engineers)
 
         final_payload = build_field_payload_for_list(site_id, jobs_list_id, {"TelegramNotified": bool(sent_to_any), "Telegram Notified": bool(sent_to_any)})
-        update_list_item_fields(site_id, jobs_list_id, data["item_id"], final_payload)
+        await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, data["item_id"], final_payload)
 
         context.user_data.pop("reopen_job", None)
         message = f"Job reopened and resent: {data.get('cdr_number')}\nAssigned to: {', '.join(e['name'] for e in final_engineers)}"
@@ -5497,10 +5602,11 @@ async def reassign_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("You do not have permission to reassign jobs.", reply_markup=get_main_menu(role))
             return ConversationHandler.END
 
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (sid, jid, eid, get_list_items(sid, eid)))(
+                get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)
+            ))(get_site_id())
+        )
         assignable_engineers = get_active_assignable_engineers(engineers)
 
         if not assignable_engineers:
@@ -5546,7 +5652,7 @@ async def reassign_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYPE
         return REASSIGN_CDR_NUMBER
 
     try:
-        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        jobs_data = await asyncio.to_thread(get_list_items, data["site_id"], data["jobs_list_id"])
         job = find_job_by_cdr(jobs_data, cdr_number)
         if not job:
             await update.message.reply_text("I could not find that CDR number. Please check it and try again.")
@@ -5757,7 +5863,7 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         interim_payload["EngineerLookupId@odata.type"] = "Collection(Edm.Int32)"
         interim_payload["EngineerLookupId"] = [int(e["lookup_id"]) for e in final_engineers]
-        update_list_item_fields(site_id, jobs_list_id, item_id, interim_payload)
+        await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, item_id, interim_payload)
 
         # Send the job only to newly selected engineer(s), not engineers who were already left assigned.
         send_fields = dict(fields)
@@ -5783,7 +5889,7 @@ async def reassign_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Telegram Notified": bool(sent_to_any or (final_engineers and not new_engineers)),
             },
         )
-        update_list_item_fields(site_id, jobs_list_id, item_id, final_payload)
+        await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, item_id, final_payload)
 
         context.user_data.pop("reassign_job", None)
 
@@ -6104,10 +6210,11 @@ async def openjobs_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (sid, jid, eid, get_list_items(sid, eid)))(
+                get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)
+            ))(get_site_id())
+        )
 
         context.user_data["open_jobs"] = {
             "site_id": site_id,
@@ -6146,7 +6253,7 @@ async def openjobs_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return OPENJOBS_FILTER
 
     try:
-        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        jobs_data = await asyncio.to_thread(get_list_items, data["site_id"], data["jobs_list_id"])
         jobs = filter_helpdesk_open_jobs(jobs_data, filter_key)
         data["filter_key"] = filter_key
         data["jobs"] = jobs
@@ -6244,11 +6351,11 @@ async def canceljob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYP
         return CANCELJOB_CDR_NUMBER
 
     try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
-        jobs_data = get_list_items(site_id, jobs_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers, jobs_data = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (
+                sid, jid, eid, get_list_items(sid, eid), get_list_items(sid, jid)
+            ))(get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)))(get_site_id())
+        )
         job = find_job_by_cdr(jobs_data, cdr_number)
 
         if not job:
@@ -6321,7 +6428,7 @@ async def canceljob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
         )
         payload.update(clear_engineer_assignment_payload())
-        update_list_item_fields(site_id, jobs_list_id, job["id"], payload)
+        await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, job["id"], payload)
 
         context.user_data.pop("cancel_job", None)
         await update.message.reply_text(
@@ -6387,11 +6494,11 @@ async def deletejob_cdr_number(update: Update, context: ContextTypes.DEFAULT_TYP
         return DELETEJOB_CDR_NUMBER
 
     try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
-        jobs_data = get_list_items(site_id, jobs_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers, jobs_data = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (
+                sid, jid, eid, get_list_items(sid, eid), get_list_items(sid, jid)
+            ))(get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)))(get_site_id())
+        )
         job = find_job_by_cdr(jobs_data, cdr_number)
 
         if not job:
@@ -6451,7 +6558,9 @@ async def deletejob_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return DELETEJOB_CONFIRM
 
     try:
-        delete_list_item(data["site_id"], data["jobs_list_id"], data["job"]["id"])
+        await asyncio.to_thread(
+            delete_list_item, data["site_id"], data["jobs_list_id"], data["job"]["id"]
+        )
         context.user_data.pop("delete_job", None)
         await update.message.reply_text(
             f"Hard deleted SharePoint job item: {cdr_number}\n\nAny files/photos already uploaded to document libraries have not been deleted.",
@@ -6494,10 +6603,11 @@ async def findjob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        engineers = get_list_items(site_id, engineers_list_id)
+        site_id, jobs_list_id, engineers_list_id, engineers = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda jid, eid: (sid, jid, eid, get_list_items(sid, eid)))(
+                get_list_id(sid, JOBS_LIST), get_list_id(sid, ENGINEERS_LIST)
+            ))(get_site_id())
+        )
 
         context.user_data["find_job"] = {
             "site_id": site_id,
@@ -6536,7 +6646,7 @@ async def findjob_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return FINDJOB_SEARCH
 
     try:
-        jobs_data = get_list_items(data["site_id"], data["jobs_list_id"])
+        jobs_data = await asyncio.to_thread(get_list_items, data["site_id"], data["jobs_list_id"])
         matches = search_jobs_for_helpdesk(jobs_data, text, limit=10)
 
         if not matches:
@@ -6632,6 +6742,7 @@ ALL_MENU_TEXTS = {
     MENU_END_DAY,
     MENU_BUG_IDEA,
     MENU_UPLOAD_RECEIPTS,
+    MENU_OPEN_APP,
     *HELPDESK_MENU_TEXTS,
 }
 
@@ -6665,7 +6776,7 @@ async def bugidea_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_id = str(update.effective_user.id)
-        site_id, _, engineers, current_engineer = get_engineer_for_telegram_id(user_id)
+        site_id, _, engineers, current_engineer = await asyncio.to_thread(get_engineer_for_telegram_id, user_id)
 
         if not current_engineer:
             await update.message.reply_text(
@@ -6718,7 +6829,9 @@ async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Please type the bug or idea you want to log.")
             return BUG_IDEA_TEXT
 
-        bug_ideas_list_id = get_list_id(bug_idea["site_id"], BUG_IDEAS_LIST)
+        bug_ideas_list_id = await asyncio.to_thread(
+            get_list_id, bug_idea["site_id"], BUG_IDEAS_LIST
+        )
 
         title = f"{bug_idea['engineer_name']} - {datetime.now(UK_TZ).strftime('%d/%m/%Y %H:%M')}"
 
@@ -6739,7 +6852,8 @@ async def bugidea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
         )
 
-        create_list_item_fields(
+        await asyncio.to_thread(
+            create_list_item_fields,
             bug_idea["site_id"],
             bug_ideas_list_id,
             fields_to_create,
@@ -6787,13 +6901,15 @@ async def receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
         user_id = str(update.effective_user.id)
         engineer_name = ""
 
         try:
-            engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-            engineers = get_list_items(site_id, engineers_list_id)
+            site_id, engineers_list_id, engineers = await asyncio.to_thread(
+                lambda: (lambda sid: (lambda lid: (sid, lid, get_list_items(sid, lid)))(
+                    get_list_id(sid, ENGINEERS_LIST)
+                ))(get_site_id())
+            )
             engineers_by_telegram, _ = build_engineer_maps(engineers)
             current_engineer = engineers_by_telegram.get(user_id)
             if current_engineer:
@@ -6954,7 +7070,8 @@ async def receipt_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
         type_part = "return" if upload_type.lower() == "return" else "receipt"
         file_name = f"{data['receipt_date']}_{engineer_part}_{timestamp}_{data['receipt_count']}_{type_part}_{unique_id}.{extension}"
 
-        receipt_link = upload_receipt_to_sharepoint(
+        receipt_link = await asyncio.to_thread(
+            upload_receipt_to_sharepoint,
             data["site_id"],
             data["receipt_date"],
             data["engineer_name"],
@@ -7038,7 +7155,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         today = datetime.now(UK_TZ).date()
 
-        site_id, _, _, engineers, jobs_data = get_sharepoint_data()
+        site_id, _, _, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
         engineers_by_telegram, _ = build_engineer_maps(engineers)
 
         current_engineer = engineers_by_telegram.get(user_id)
@@ -7051,9 +7168,9 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         role = await get_role_for_update(update)
-        today_tasks = get_today_task_activities_for_user(site_id, user_id)
+        today_tasks = await asyncio.to_thread(get_today_task_activities_for_user, site_id, user_id)
 
-        if not engineer_has_active_day(site_id, user_id):
+        if not await asyncio.to_thread(engineer_has_active_day, site_id, user_id):
             if today_tasks:
                 for task in today_tasks:
                     await update.message.reply_text(
@@ -7107,7 +7224,7 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_engineer_job_for_callback(query, require_active_day=True):
-    site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+    site_id, _, jobs_list_id, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
     engineers_by_telegram, _ = build_engineer_maps(engineers)
 
     user_id = str(query.from_user.id)
@@ -7117,7 +7234,7 @@ async def get_engineer_job_for_callback(query, require_active_day=True):
         await query.message.reply_text("You are not set up as an engineer.")
         return None
 
-    if require_active_day and not engineer_has_active_day(site_id, user_id):
+    if require_active_day and not await asyncio.to_thread(engineer_has_active_day, site_id, user_id):
         await query.message.reply_text(
             "Please start your day first using 🟢 Start Day or /startday. Job buttons are locked until your day has started."
         )
@@ -7253,8 +7370,11 @@ async def abort_job_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             update_fields.update(remove_current_engineer_assignment_payload(fields, engineer_lookup_id))
 
-        update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
-        update_active_day_live_status(site_id, abort_job["user_id"], "Aborted Attendance", get_job_reference(fields))
+        await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, item_id, update_fields)
+        await asyncio.to_thread(
+            update_active_day_live_status, site_id, abort_job["user_id"],
+            "Aborted Attendance", get_job_reference(fields),
+        )
 
         await update.message.reply_text(
             f"Attendance aborted and sent back for reassignment.\n\n"
@@ -7305,7 +7425,7 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
         user = update.callback_query.from_user if is_callback else update.effective_user
         user_id = str(user.id)
 
-        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        site_id, _, jobs_list_id, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
         engineers_by_telegram, _ = build_engineer_maps(engineers)
         current_engineer = engineers_by_telegram.get(user_id)
 
@@ -7316,7 +7436,7 @@ async def begin_worksheet_for_job(update: Update, context: ContextTypes.DEFAULT_
             )
             return ConversationHandler.END
 
-        if not engineer_has_active_day(site_id, user_id):
+        if not await asyncio.to_thread(engineer_has_active_day, site_id, user_id):
             await sender.reply_text(
                 "Please start your day first using 🟢 Start Day or /startday before updating jobs.",
                 reply_markup=get_main_menu(await get_role_for_update(update)),
@@ -7402,7 +7522,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = data[0]
         item_id = data[1]
 
-        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        site_id, _, jobs_list_id, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
         engineers_by_telegram, _ = build_engineer_maps(engineers)
 
         user_id = str(query.from_user.id)
@@ -7412,7 +7532,7 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("You are not set up as an engineer.")
             return
 
-        if not engineer_has_active_day(site_id, user_id):
+        if not await asyncio.to_thread(engineer_has_active_day, site_id, user_id):
             await query.message.reply_text(
                 "Please start your day first using 🟢 Start Day or /startday. Job buttons are locked until your day has started."
             )
@@ -7557,21 +7677,13 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             aggregate_status = get_aggregate_live_job_status(updated_log)
 
-            update_list_item_fields(
-                site_id,
-                jobs_list_id,
-                item_id,
-                {
-                    "Status": aggregate_status,
-                    "EngineerVisitLog": updated_log,
-                    "WorksheetSubmitted": False,
-                },
+            await asyncio.to_thread(
+                update_list_item_fields, site_id, jobs_list_id, item_id,
+                {"Status": aggregate_status, "EngineerVisitLog": updated_log, "WorksheetSubmitted": False},
             )
 
-            update_active_day_live_status(
-                site_id,
-                user_id,
-                ASSIGNED_STATUS,
+            await asyncio.to_thread(
+                update_active_day_live_status, site_id, user_id, ASSIGNED_STATUS,
                 get_job_reference(fields),
             )
 
@@ -7615,21 +7727,13 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_status,
             )
 
-            update_list_item_fields(
-                site_id,
-                jobs_list_id,
-                item_id,
-                {
-                    "Status": selected_status,
-                    "EngineerVisitLog": updated_log,
-                    "WorksheetSubmitted": False,
-                },
+            await asyncio.to_thread(
+                update_list_item_fields, site_id, jobs_list_id, item_id,
+                {"Status": selected_status, "EngineerVisitLog": updated_log, "WorksheetSubmitted": False},
             )
 
-            update_active_day_live_status(
-                site_id,
-                user_id,
-                selected_status,
+            await asyncio.to_thread(
+                update_active_day_live_status, site_id, user_id, selected_status,
                 get_job_reference(fields),
             )
 
@@ -7701,12 +7805,10 @@ async def status_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 )
 
-            update_list_item_fields(site_id, jobs_list_id, item_id, update_fields)
+            await asyncio.to_thread(update_list_item_fields, site_id, jobs_list_id, item_id, update_fields)
 
-            update_active_day_live_status(
-                site_id,
-                user_id,
-                selected_outcome,
+            await asyncio.to_thread(
+                update_active_day_live_status, site_id, user_id, selected_outcome,
                 get_job_reference(fields),
             )
 
@@ -7971,11 +8073,8 @@ async def worksheet_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         timestamp = datetime.now(UK_TZ).strftime("%Y%m%d_%H%M%S")
         file_name = f"{cdr_number}_{timestamp}_{photo.file_unique_id}.jpg"
 
-        photo_link = upload_photo_to_sharepoint(
-            site_id,
-            worksheet,
-            file_name,
-            bytes(file_bytes),
+        photo_link = await asyncio.to_thread(
+            upload_photo_to_sharepoint, site_id, worksheet, file_name, bytes(file_bytes)
         )
 
         worksheet["photo_links"].append(photo_link)
@@ -8165,7 +8264,9 @@ async def worksheet_signature_waiting(update: Update, context: ContextTypes.DEFA
         )
         return SIGNATURE_WAITING
 
-    latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
+    latest_jobs = await asyncio.to_thread(
+        get_list_items, worksheet["site_id"], worksheet["jobs_list_id"]
+    )
     job = find_job_by_item_id(latest_jobs, worksheet["item_id"])
 
     if not job:
@@ -8214,7 +8315,9 @@ async def worksheet_signature_waiting_button(update: Update, context: ContextTyp
         )
         return REVIEW
 
-    latest_jobs = get_list_items(worksheet["site_id"], worksheet["jobs_list_id"])
+    latest_jobs = await asyncio.to_thread(
+        get_list_items, worksheet["site_id"], worksheet["jobs_list_id"]
+    )
     job = find_job_by_item_id(latest_jobs, worksheet["item_id"])
 
     if not job:
@@ -9222,14 +9325,9 @@ async def finalise_worksheet_direct(context, worksheet, fields, item_id, site_id
     # Generate the worksheet when this attendance closes the job. For revisit/no-access
     # the job returns to dispatch, but the visit remains in the EngineerVisitLog.
     if is_final_engineer and outcome == "Completed":
-        worksheet_link = generate_and_upload_worksheet_pdf(
-            site_id,
-            jobs_list_id,
-            item_id,
-            worksheet,
-            fields,
-            updated_log,
-            outcome,
+        worksheet_link = await asyncio.to_thread(
+            generate_and_upload_worksheet_pdf, site_id, jobs_list_id, item_id,
+            worksheet, fields, updated_log, outcome,
         )
 
     update_payload = build_worksheet_update_fields(
@@ -9242,18 +9340,13 @@ async def finalise_worksheet_direct(context, worksheet, fields, item_id, site_id
     )
 
 
-    update_list_item_fields_in_safe_chunks(
-        site_id,
-        jobs_list_id,
-        item_id,
-        update_payload,
-        required_fields={"Status", "JobOutcome", "EngineerVisitLog"},
+    await asyncio.to_thread(
+        update_list_item_fields_in_safe_chunks, site_id, jobs_list_id, item_id,
+        update_payload, {"Status", "JobOutcome", "EngineerVisitLog"},
     )
 
-    update_active_day_live_status(
-        site_id,
-        str(actor_id),
-        outcome,
+    await asyncio.to_thread(
+        update_active_day_live_status, site_id, str(actor_id), outcome,
         get_job_reference(fields),
     )
 
@@ -9276,7 +9369,7 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
     jobs_list_id = worksheet["jobs_list_id"]
     item_id = worksheet["item_id"]
 
-    latest_jobs = get_list_items(site_id, jobs_list_id)
+    latest_jobs = await asyncio.to_thread(get_list_items, site_id, jobs_list_id)
     job = find_job_by_item_id(latest_jobs, item_id)
     fields = job["fields"] if job else worksheet["fields"]
 
@@ -9304,14 +9397,9 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
 
     worksheet_link = ""
     if is_final_engineer and outcome == "Completed":
-        worksheet_link = generate_and_upload_worksheet_pdf(
-            site_id,
-            jobs_list_id,
-            item_id,
-            worksheet,
-            fields,
-            updated_log,
-            outcome,
+        worksheet_link = await asyncio.to_thread(
+            generate_and_upload_worksheet_pdf, site_id, jobs_list_id, item_id,
+            worksheet, fields, updated_log, outcome,
         )
 
     update_payload = build_worksheet_update_fields(
@@ -9327,12 +9415,9 @@ async def submit_worksheet_direct(update: Update, context: ContextTypes.DEFAULT_
     # write the large approval payload here; keeping the direct submission
     # small avoids SharePoint Invalid request issues.
 
-    update_list_item_fields_in_safe_chunks(
-        site_id,
-        jobs_list_id,
-        item_id,
-        update_payload,
-        required_fields={"EngineerVisitLog", "WorksheetSubmitted"},
+    await asyncio.to_thread(
+        update_list_item_fields_in_safe_chunks, site_id, jobs_list_id, item_id,
+        update_payload, {"EngineerVisitLog", "WorksheetSubmitted"},
     )
 
     if outcome in ["Completed", "No Access", "Revisit Required"]:
@@ -9562,42 +9647,55 @@ def debug_job_dispatch_decision(fields):
 
 
 async def send_new_jobs(app):
+    """Queue assignment notifications without blocking the Telegram event loop."""
     try:
-        site_id, _, jobs_list_id, engineers, jobs_data = get_sharepoint_data()
+        site_id, _, jobs_list_id, engineers, jobs_data = await asyncio.to_thread(get_sharepoint_data)
         _, engineers_by_lookup = build_engineer_maps(engineers)
-
         sent_job_ids = set()
-
         for job in jobs_data:
             fields = job["fields"]
             item_id = job["id"]
-
             if not should_auto_send_job(fields):
                 continue
-
             assigned_ids = get_assigned_engineer_ids(fields)
-            sent_to_any_engineer = False
-
             for engineer_id in assigned_ids:
                 engineer = engineers_by_lookup.get(engineer_id)
-
                 if not engineer:
                     print(f"WARNING: No engineer record found for lookup ID {engineer_id} on job {fields.get('CDRNumber', item_id)}")
                     continue
+                notification = JobNotification(
+                    job_item_id=str(item_id),
+                    cdr_number=str(fields.get("CDRNumber", item_id)),
+                    engineer_lookup_id=str(engineer_id),
+                    chat_id=str(engineer["telegram_id"]),
+                    text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
+                    site_name=str(fields.get("SiteName", "")),
+                ).payload()
+                notification.update({"site_id": site_id, "jobs_list_id": jobs_list_id})
+                generation = hashlib.sha256(json.dumps({
+                    "date": fields.get("Date"), "engineers": assigned_ids,
+                    "log": str(fields.get("EngineerVisitLog", ""))[-500:],
+                }, sort_keys=True, default=str).encode()).hexdigest()[:16]
+                event_key = f"job:{item_id}:engineer:{engineer_id}:{generation}"
 
+                if NOTIFICATION_OUTBOX.enabled:
+                    await asyncio.to_thread(
+                        NOTIFICATION_OUTBOX.enqueue, event_key, "telegram_job_assignment", notification
+                    )
+                    continue
+
+                # Safe compatibility path for installations before DATABASE_URL
+                # is added. Network loading is still offloaded and the log makes
+                # the missing durable queue visible to the administrator.
                 try:
                     await app.bot.send_message(
                         chat_id=engineer["telegram_id"],
-                        text="New job assigned:\n\n" + format_job(fields, engineer["name"]),
+                        text=notification["text"],
                         reply_markup=get_job_buttons(item_id, fields.get("SiteName", "")),
                     )
-                    sent_to_any_engineer = True
+                    sent_job_ids.add(item_id)
                 except Exception as e:
                     print(f"WARNING: Could not send job {fields.get('CDRNumber', item_id)} to engineer {engineer_id}: {e}")
-
-            if sent_to_any_engineer:
-                sent_job_ids.add(item_id)
-
         for item_id in sent_job_ids:
             try:
                 await asyncio.to_thread(
@@ -9615,6 +9713,33 @@ async def send_new_jobs(app):
 
     except Exception as e:
         print(f"ERROR sending new jobs: {e}")
+
+
+async def dispatch_notification_outbox(app):
+    """Deliver durable notifications and retry transient Telegram/Graph errors."""
+    if not NOTIFICATION_OUTBOX.enabled:
+        return
+    events = await asyncio.to_thread(NOTIFICATION_OUTBOX.claim, 20)
+    for event in events:
+        payload = event.get("payload") or {}
+        try:
+            if event.get("event_type") != "telegram_job_assignment":
+                raise RuntimeError(f"Unsupported outbox event: {event.get('event_type')}")
+            await app.bot.send_message(
+                chat_id=payload["chat_id"],
+                text=payload["text"],
+                reply_markup=get_job_buttons(payload["job_item_id"], payload.get("site_name", "")),
+            )
+            await asyncio.to_thread(
+                update_list_item_fields, payload["site_id"], payload["jobs_list_id"],
+                payload["job_item_id"], {"TelegramNotified": True, "Status": ASSIGNED_STATUS},
+            )
+            await asyncio.to_thread(NOTIFICATION_OUTBOX.mark_sent, event["id"])
+        except Exception as exc:
+            print(f"WARNING: Outbox delivery failed for {event.get('event_key')}: {exc}")
+            await asyncio.to_thread(
+                NOTIFICATION_OUTBOX.mark_failed, event["id"], str(exc), event.get("attempts", 1)
+            )
 
 
 async def remind_engineers_to_start_day(app):
@@ -9713,14 +9838,14 @@ async def check_engineer_idle_alerts(app):
         return
 
     try:
-        site_id = get_site_id()
-        engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-        jobs_list_id = get_list_id(site_id, JOBS_LIST)
-        day_logs_list_id = get_list_id(site_id, DAY_LOGS_LIST)
-
-        engineers = get_list_items(site_id, engineers_list_id)
-        jobs_data = get_list_items(site_id, jobs_list_id)
-        day_logs = get_list_items(site_id, day_logs_list_id)
+        site_id, engineers, jobs_data, day_logs = await asyncio.to_thread(
+            lambda: (lambda sid: (
+                sid,
+                get_list_items(sid, get_list_id(sid, ENGINEERS_LIST)),
+                get_list_items(sid, get_list_id(sid, JOBS_LIST)),
+                get_list_items(sid, get_list_id(sid, DAY_LOGS_LIST)),
+            ))(get_site_id())
+        )
         rows = dashboard_engineer_rows(engineers, day_logs, jobs_data)
         now = datetime.now(UK_TZ)
 
@@ -9809,9 +9934,9 @@ async def start_message_engineer(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("This option is only available to Helpdesk/Admin users.")
         return ConversationHandler.END
 
-    site_id = get_site_id()
-    engineers_list_id = get_list_id(site_id, ENGINEERS_LIST)
-    engineers = get_list_items(site_id, engineers_list_id)
+    site_id, engineers = await asyncio.to_thread(
+        lambda: (lambda sid: (sid, get_list_items(sid, get_list_id(sid, ENGINEERS_LIST))))(get_site_id())
+    )
     assignable = get_active_assignable_engineers(engineers)
     context.user_data["message_engineers"] = assignable
 
@@ -9925,9 +10050,11 @@ async def send_due_task_activity_reminders(app):
         return
 
     try:
-        site_id = get_site_id()
-        tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
-        tasks = get_list_items(site_id, tasks_list_id)
+        site_id, tasks_list_id, tasks = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda lid: (sid, lid, get_list_items(sid, lid)))(
+                get_list_id(sid, TASK_ACTIVITIES_LIST)
+            ))(get_site_id())
+        )
         today = get_today_iso()
 
         for task in tasks:
@@ -9969,10 +10096,8 @@ async def send_due_task_activity_reminders(app):
                 except Exception as e:
                     print(f"WARNING: Could not send task/activity reminder to {telegram_id}: {e}")
 
-            update_list_item_fields(
-                site_id,
-                tasks_list_id,
-                task.get("id"),
+            await asyncio.to_thread(
+                update_list_item_fields, site_id, tasks_list_id, task.get("id"),
                 build_field_payload_for_list(site_id, tasks_list_id, {"ReminderSent": True, "Reminder Sent": True}),
             )
 
@@ -10056,9 +10181,11 @@ async def start_cancel_task_activity(update: Update, context: ContextTypes.DEFAU
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
-        tasks_list_id = get_list_id(site_id, TASK_ACTIVITIES_LIST)
-        tasks = get_list_items(site_id, tasks_list_id)
+        site_id, tasks_list_id, tasks = await asyncio.to_thread(
+            lambda: (lambda sid: (lambda lid: (sid, lid, get_list_items(sid, lid)))(
+                get_list_id(sid, TASK_ACTIVITIES_LIST)
+            ))(get_site_id())
+        )
     except Exception as e:
         await update.message.reply_text(
             "I could not open the Task Activities list. Check the SharePoint list exists and is named exactly: Task Activities"
@@ -10172,7 +10299,7 @@ async def cancel_task_review(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Cancelled Date Time": graph_datetime_now(),
             },
         )
-        update_list_item_fields(site_id, tasks_list_id, task_id, payload)
+        await asyncio.to_thread(update_list_item_fields, site_id, tasks_list_id, task_id, payload)
     except Exception as e:
         await update.message.reply_text(f"I could not update the task to Cancelled in SharePoint: {e}")
         return ConversationHandler.END
@@ -10468,53 +10595,118 @@ async def global_error_handler(update, context):
         print(f"Could not send friendly error message: {reply_error}")
 
 
+async def update_idempotency_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reject already-completed or genuinely stale updates without dropping queues."""
+    if PROCESSED_UPDATES.enabled and await asyncio.to_thread(PROCESSED_UPDATES.contains, update.update_id):
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("This action was already processed.")
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
+
+    # Callback buttons can validly be pressed on older job messages, so their
+    # live SharePoint state is validated by the action handler instead. Only
+    # stale queued messages/commands are rejected here.
+    message = update.effective_message
+    if message and not update.callback_query and getattr(message, "date", None):
+        now = datetime.now(message.date.tzinfo or UK_TZ)
+        age = (now - message.date).total_seconds()
+        if age > BOT_MAX_UPDATE_AGE_SECONDS:
+            try:
+                await message.reply_text(
+                    "That message arrived after its safe processing window, so no action was taken. "
+                    "Please use the current menu and try again."
+                )
+            finally:
+                if PROCESSED_UPDATES.enabled:
+                    await asyncio.to_thread(PROCESSED_UPDATES.mark, update.update_id)
+            raise ApplicationHandlerStop
+
+
+async def mark_update_processed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if PROCESSED_UPDATES.enabled:
+        await asyncio.to_thread(PROCESSED_UPDATES.mark, update.update_id)
+
+
 async def post_init(app):
     try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
+        await app.bot.delete_webhook(drop_pending_updates=False)
         print("Webhook removed.")
     except Exception as e:
         print(f"Could not remove webhook: {e}")
 
-    global GLOBAL_SCHEDULER
-    scheduler = AsyncIOScheduler(timezone=UK_TZ)
+    if BOT_RUN_SCHEDULER:
+        start_scheduler(app)
 
+
+async def run_scheduled_once(name, function, *args):
+    lease = await asyncio.to_thread(SchedulerLease.acquire, name, DATABASE_URL)
+    if lease is None:
+        return
+    try:
+        await function(*args)
+    finally:
+        await asyncio.to_thread(lease.release)
+
+
+def start_scheduler(app):
+    """Start one guarded scheduler; database leases protect multi-replica runs."""
+    global GLOBAL_SCHEDULER
+    if GLOBAL_SCHEDULER and GLOBAL_SCHEDULER.running:
+        return GLOBAL_SCHEDULER
+
+    scheduler = AsyncIOScheduler(timezone=UK_TZ)
     scheduler.add_job(
-        send_new_jobs,
+        run_scheduled_once,
         trigger="interval",
         seconds=30,
-        args=[app],
+        args=["scan-new-jobs", send_new_jobs, app],
+        id="scan-new-jobs", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=20,
     )
-
     scheduler.add_job(
-        remind_engineers_to_start_day,
+        run_scheduled_once,
+        trigger="interval",
+        seconds=10,
+        args=["dispatch-notification-outbox", dispatch_notification_outbox, app],
+        id="dispatch-notification-outbox", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=10,
+    )
+    scheduler.add_job(
+        run_scheduled_once,
         trigger="cron",
         day_of_week="mon-fri",
         hour=7,
         minute=40,
-        args=[app],
+        args=["start-day-reminders", remind_engineers_to_start_day, app],
+        id="start-day-reminders", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=900,
     )
-
     scheduler.add_job(
-        remind_active_engineers_to_end_day,
+        run_scheduled_once,
         trigger="cron",
         day_of_week="mon-fri",
         hour=16,
         minute=45,
-        args=[app],
+        args=["end-day-reminders", remind_active_engineers_to_end_day, app],
+        id="end-day-reminders", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=900,
     )
-
     scheduler.add_job(
-        send_due_task_activity_reminders,
+        run_scheduled_once,
         trigger="cron",
         day_of_week="mon-fri",
         hour=8,
         minute=0,
-        args=[app],
+        args=["task-reminders", send_due_task_activity_reminders, app],
+        id="task-reminders", replace_existing=True, max_instances=1, coalesce=True,
+        misfire_grace_time=900,
     )
-
     scheduler.start()
     GLOBAL_SCHEDULER = scheduler
-    print("Scheduler started.")
+    print("Scheduler started with replica-safe advisory leases.")
+    return scheduler
 
 
 # Protect all inline actions from repeated taps while the first request is running.
@@ -10529,9 +10721,16 @@ for _callback_name in (
     if _callback_name in globals():
         globals()[_callback_name] = callback_spam_guard(globals()[_callback_name])
 
-_persistence_dir = os.path.dirname(os.path.abspath(SESSION_DATA_PATH))
-os.makedirs(_persistence_dir, exist_ok=True)
-SESSION_PERSISTENCE = PicklePersistence(filepath=SESSION_DATA_PATH)
+if DATABASE_URL:
+    try:
+        SESSION_PERSISTENCE = PostgresPersistence(DATABASE_URL)
+        print("Bot conversation persistence: PostgreSQL")
+    except Exception as persistence_error:
+        print(f"WARNING: PostgreSQL bot persistence unavailable; using memory only: {persistence_error}")
+        SESSION_PERSISTENCE = DictPersistence()
+else:
+    print("WARNING: DATABASE_URL is missing; bot conversations will not survive a restart.")
+    SESSION_PERSISTENCE = DictPersistence()
 
 telegram_app = (
     ApplicationBuilder()
@@ -10545,6 +10744,8 @@ telegram_app = (
     .build()
 )
 telegram_app.add_error_handler(global_error_handler)
+telegram_app.add_handler(TypeHandler(Update, update_idempotency_gate), group=-100)
+telegram_app.add_handler(TypeHandler(Update, mark_update_processed), group=999)
 
 startday_handler = ConversationHandler(
     name="startday_handler",
@@ -10834,8 +11035,9 @@ async def quote_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     try:
-        site_id = get_site_id()
-        recipients = get_quote_reminder_recipients(site_id)
+        site_id, recipients = await asyncio.to_thread(
+            lambda: (lambda sid: (sid, get_quote_reminder_recipients(sid)))(get_site_id())
+        )
         if not recipients:
             await update.message.reply_text(
                 "No active Telegram users were found to send the task / activity to.",
@@ -11021,8 +11223,9 @@ async def quote_reminder_review(update: Update, context: ContextTypes.DEFAULT_TY
         reminder["set_by"] = update.effective_user.full_name or "Helpdesk"
 
         try:
-            site_id = get_site_id()
-            create_task_activity_record(site_id, reminder)
+            await asyncio.to_thread(
+                lambda: create_task_activity_record(get_site_id(), reminder)
+            )
         except Exception as store_error:
             print(f"WARNING: Task / Activity was sent but could not be stored for reminder/cancellation: {store_error}")
 
@@ -11222,7 +11425,7 @@ monthly_overtime_handler = ConversationHandler(
 
 telegram_app.add_handler(
     MessageHandler(
-        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|📊 Monthly Overtime|👤 My Documents|/start|/my_id|/id|/jobs|/requestjob|/documents|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder|/overtime)$")),
+        filters.ChatType.GROUPS & (filters.COMMAND | filters.Regex(r"^(🟢 Start Day|📋 My Jobs|🏁 End Day|📱 Open Engineer App|🐞 Bug / Ideas|🧾 Receipts / Returns|📣 Request Job|🧰 Helpdesk|➕ Log Job|🔁 Reassign Job|♻️ Reopen Job|📋 Open Jobs|❌ Cancel Job|🗑 Delete Job|🏷 Create Asset|👷 Engineer Menu|📌 Task / Activity|📢 Message Engineer|❌ Cancel Task / Activity|📊 Monthly Overtime|👤 My Documents|/start|/my_id|/id|/jobs|/requestjob|/documents|/helpdesk|/startday|/endday|/receipts|/uploadreceipts|/logjob|/reassign|/reopenjob|/openjobs|/canceljob|/deletejob|/quotereminder|/overtime)$")),
         group_chat_cleanup,
     ),
     group=0,
@@ -11252,18 +11455,19 @@ telegram_app.add_handler(openjobs_handler)
 telegram_app.add_handler(canceljob_handler)
 telegram_app.add_handler(deletejob_handler)
 telegram_app.add_handler(abortjob_handler)
-telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_MY_DOCUMENTS}|{MENU_CREATE_ASSET}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_MONTHLY_OVERTIME}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
+telegram_app.add_handler(MessageHandler(filters.Regex(f"^({MENU_MY_JOBS}|{MENU_BUG_IDEA}|{MENU_UPLOAD_RECEIPTS}|{MENU_REQUEST_JOB}|{MENU_MY_DOCUMENTS}|{MENU_CREATE_ASSET}|{MENU_OPEN_APP}|{MENU_QUOTE_REMINDER}|{MENU_MESSAGE_ENGINEER}|{MENU_CANCEL_TASK_ACTIVITY}|{MENU_MONTHLY_OVERTIME}|{MENU_HELPDESK}|{MENU_LOG_JOB}|{MENU_REASSIGN_JOB}|{MENU_REOPEN_JOB}|{MENU_OPEN_JOBS}|{MENU_CANCEL_JOB}|{MENU_DELETE_JOB}|{MENU_ENGINEER_MENU})$"), menu_button))
 telegram_app.add_handler(CallbackQueryHandler(my_documents_callback, pattern=r"^mydocs\|"))
 telegram_app.add_handler(CallbackQueryHandler(my_document_file_callback, pattern=r"^mydocfile\|"))
 telegram_app.add_handler(CallbackQueryHandler(status_button))
 
 if __name__ == "__main__":
-    threading.Thread(target=run_signature_web_server, daemon=True).start()
-    print(f"Signature web server running on port {PORT}")
+    if BOT_RUN_SIGNATURE_SERVER:
+        threading.Thread(target=run_signature_web_server, daemon=True).start()
+        print(f"Signature web server running on port {PORT}")
     print(f"Bot running... PID={os.getpid()} | Build={BUILD_VERSION}")
 
     telegram_app.run_polling(
-        drop_pending_updates=True,
+        drop_pending_updates=False,
         close_loop=False,
         allowed_updates=Update.ALL_TYPES,
     )
