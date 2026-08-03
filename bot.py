@@ -44,6 +44,11 @@ from cdr_core.leader import SchedulerLease
 from cdr_core.outbox import NotificationOutbox
 from cdr_core.persistence import PostgresPersistence, ProcessedUpdateStore
 from cdr_core.tokens import create_expiring_token, verify_expiring_token
+from cdr_core.workflows import (
+    aggregate_live_status as core_aggregate_live_job_status,
+    current_visit_lines as core_current_visit_lines,
+    validate_action as core_validate_workflow_action,
+)
 print("✅ CDR Core loaded in bot:", now_log_time())
 print("✅ CDR job logic loaded in bot")
 
@@ -104,7 +109,7 @@ BOT_MAX_UPDATE_AGE_SECONDS = int(os.getenv("BOT_MAX_UPDATE_AGE_SECONDS", "21600"
 BOT_RUN_SIGNATURE_SERVER = os.getenv("BOT_RUN_SIGNATURE_SERVER", "true").strip().lower() in {"1", "true", "yes", "on"}
 BOT_RUN_SCHEDULER = os.getenv("BOT_RUN_SCHEDULER", "true").strip().lower() in {"1", "true", "yes", "on"}
 PORT = int(os.getenv("PORT", "8000"))
-BUILD_VERSION = "v60-async-security-outbox"
+BUILD_VERSION = "v61-shared-engineer-workflows"
 
 JOBS_LIST = "Engineer Jobs"
 ENGINEERS_LIST = "Engineers"
@@ -738,22 +743,7 @@ def get_current_engineer_visit_log_lines(fields, engineer_name):
     stay in SharePoint for audit, but it must not block the engineer from
     clicking Travelling / On Site again on the new visit.
     """
-    log = fields.get("EngineerVisitLog", "") or ""
-    lines = [line for line in log.splitlines() if line.strip()]
-
-    reset_actions = ["Completed", "No Access", "Revisit Required", "Aborted Attendance", "Travelling Reverted"]
-    last_reset_index = -1
-
-    for index, line in enumerate(lines):
-        if f" - {engineer_name} - " not in line:
-            continue
-
-        for reset_action in reset_actions:
-            if f" - {engineer_name} - {reset_action}" in line:
-                last_reset_index = index
-                break
-
-    return lines[last_reset_index + 1:]
+    return core_current_visit_lines(fields, engineer_name)
 
 
 def engineer_has_logged(fields, engineer_name, action):
@@ -764,32 +754,7 @@ def engineer_has_logged(fields, engineer_name, action):
 
 def get_aggregate_live_job_status(engineer_visit_log):
     """Work out the shared job status from each engineer's latest open visit."""
-    states = {}
-    terminal_actions = {
-        "Completed", "No Access", "Revisit Required", "Aborted Attendance",
-        "Travelling Reverted",
-    }
-
-    for raw_line in str(engineer_visit_log or "").splitlines():
-        parts = raw_line.strip().split(" - ", 3)
-        if len(parts) < 3:
-            continue
-        engineer = parts[1].strip().lower()
-        action = parts[2].strip()
-        if not engineer:
-            continue
-        if action == "Travelling":
-            states[engineer] = TRAVELLING_STATUS
-        elif action == "On Site":
-            states[engineer] = ON_SITE_STATUS
-        elif action in terminal_actions or action.startswith("Submitted for Helpdesk Review - "):
-            states.pop(engineer, None)
-
-    if ON_SITE_STATUS in states.values():
-        return ON_SITE_STATUS
-    if TRAVELLING_STATUS in states.values():
-        return TRAVELLING_STATUS
-    return ASSIGNED_STATUS
+    return core_aggregate_live_job_status(engineer_visit_log)
 
 
 def can_click_action(fields, engineer_name, action):
@@ -2069,30 +2034,7 @@ def validate_job_action(fields, engineer_name, action):
     Hard gate for all job button actions.
     Prevents duplicate clicks, old-button actions, and out-of-order progress.
     """
-    if is_closed_job(fields):
-        return False, "This job has already been closed or returned to the office. No further action is required."
-
-    has_travelled = has_engineer_action(fields, engineer_name, "Travelling")
-    has_on_site = has_engineer_action(fields, engineer_name, "On Site")
-
-    if action == "Travelling":
-        if has_travelled:
-            return False, "Travelling has already been logged for this job."
-        return True, ""
-
-    if action == "On Site":
-        if not has_travelled:
-            return False, "You need to click Travelling before clicking On Site."
-        if has_on_site:
-            return False, "On Site has already been logged for this job."
-        return True, ""
-
-    if action in ["No Access", "Revisit Required", "Completed"]:
-        if not has_on_site:
-            return False, "You need to click On Site before selecting this option."
-        return True, ""
-
-    return True, ""
+    return core_validate_workflow_action(fields, engineer_name, action)
 
 
 def should_auto_send_job(fields):
